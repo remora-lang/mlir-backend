@@ -1,0 +1,36 @@
+fun
+  add (x_45 : i32,
+       y_46 : i32)
+  : {i32} = {
+  let {v_0 : i32} =
+    add32(x_45, y_46)
+  in {v_0}
+}
+
+fun
+  mul (x_48 : i32,
+       y_49 : i32)
+  : {i32} = {
+  let {v_1 : i32} =
+    apply *(x_48, y_49)
+    : {i32}
+  in {v_1}
+}
+
+entry("main",
+      {},
+      {i32})
+  entry_main ()
+  : {i32} = {
+  let {x_51 : i32} =
+    1i32
+  let {y_52 : i32} =
+    2i32
+  let {v_2 : i32} =
+    apply add(x_51, y_52)
+    : {i32}
+  let {v_3 : i32} =
+    apply mul(v_2, 5i32)
+    : {i32}
+  in {v_3}
+}

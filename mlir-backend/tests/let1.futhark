@@ -1,0 +1,17 @@
+entry("main",
+      {},
+      {i32})
+  entry_main ()
+  : {i32} = {
+  let {x_45 : i32} =
+    5i32
+  let {y_46 : i32} =
+    10i32
+  let {z_47 : i32} =
+    15i32
+  let {a_48 : i32} =
+    20i32
+  let {v_0 : i32} =
+    add32(z_47, a_48)
+  in {v_0}
+}

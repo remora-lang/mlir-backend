@@ -1,0 +1,9 @@
+entry("main",
+      {},
+      {i32})
+  entry_main ()
+  : {i32} = {
+  let {v_0 : i32} =
+    add32(1i32, 2i32)
+  in {v_0}
+}

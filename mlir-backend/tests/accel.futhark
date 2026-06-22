@@ -1,0 +1,111 @@
+fun
+  dot (x_55 : [3i64]f32,
+       y_56 : [3i64]f32)
+  : {f32} = {
+  let {v_3 : [3i64]f32} =
+    map(3i64,
+        {x_55, y_56},
+        \ {v_0 : f32,
+           v_1 : f32}
+          : {f32} ->
+          let {v_2 : f32} =
+            fmul32(v_0, v_1)
+          in {v_2})
+  let {v_8 : f32} =
+    redomap(3i64,
+            {v_3},
+            \ {v_4 : f32}
+              : {f32} ->
+              {v_4},
+            {commutative \ {v_5 : f32,
+                            v_6 : f32}
+              : {f32} ->
+              let {v_7 : f32} =       
+                fadd32(v_5, v_6)      
+              in {v_7},
+            {0.0f32}})
+  in {v_8}
+}
+
+fun
+  sqrt (x_58 : f32)
+  : {f32} = {
+  let {v_9 : f32} =
+    fdiv32(1.0f32, 2.0f32)
+  let {v_10 : f32} =
+    fpow32(x_58, v_9)
+  in {v_10}
+}
+
+fun
+  accel (epsilon_60 : f32,
+         x_pos_61 : [3i64]f32,
+         x_mass_62 : f32,
+         y_pos_63 : [3i64]f32,
+         y_mass_64 : f32)
+  : {[3i64]f32} = {
+  let {v_14 : [3i64]f32} =
+    map(3i64,
+        {x_pos_61, y_pos_63},
+        \ {v_11 : f32,
+           v_12 : f32}
+          : {f32} ->
+          let {v_13 : f32} =
+            fsub32(v_11, v_12)
+          in {v_13})
+  let {r_65 : [3i64]f32} =
+    v_14
+  let {v_15 : f32} =
+    apply dot(r_65, r_65)
+    : {f32}
+  let {v_16 : f32} =
+    fmul32(epsilon_60, epsilon_60)
+  let {v_17 : f32} =
+    fadd32(v_15, v_16)
+  let {rsqr_66 : f32} =
+    v_17
+  let {v_18 : f32} =
+    apply sqrt(rsqr_66)
+    : {f32}
+  let {v_19 : f32} =
+    fdiv32(1.0f32, v_18)
+  let {invr_67 : f32} =
+    v_19
+  let {v_20 : f32} =
+    fmul32(invr_67, invr_67)
+  let {v_21 : f32} =
+    fmul32(v_20, invr_67)
+  let {invr3_68 : f32} =
+    v_21
+  let {v_22 : f32} =
+    fmul32(y_mass_64, invr3_68)
+  let {s_69 : f32} =
+    v_22
+  let {v_23 : [3i64]f32} =
+    replicate([3i64], s_69)
+  let {v_27 : [3i64]f32} =
+    map(3i64,
+        {v_23, r_65},
+        \ {v_24 : f32,
+           v_25 : f32}
+          : {f32} ->
+          let {v_26 : f32} =
+            fmul32(v_24, v_25)
+          in {v_26})
+  in {v_27}
+}
+
+entry("main",
+      {},
+      {[]f32})
+  entry_main ()
+  : {[3i64]f32} = {
+  let {v_28 : [3i64]f32} =
+    [12.0f32, 2.2f32, 8.0f32] : []f32
+  let {v_29 : [3i64]f32} =
+    [1.0f32, 2.0f32, 3.0f32] : []f32
+  let {v_30 : [3i64]f32} =
+    apply accel(1.0f32, v_28, 5.0f32, v_29, 12.0f32)
+    : {[3i64]f32}
+  in {v_30}
+}
