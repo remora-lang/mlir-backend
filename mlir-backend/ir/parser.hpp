@@ -229,8 +229,14 @@ struct FutharkTranslationVisitor {
       return {BinOpFSub{floatTy}};
     if (name == "mul")
       return {BinOpMul{intTy}};
+    if (name == "smod")
+      return {BinOpSMod{intTy}};
+    if (name == "srem")
+      return {BinOpSRem{intTy}};
     if (name == "fmul")
       return {BinOpFMul{floatTy}};
+    if (name == "fdiv")
+      return {BinOpFDiv{floatTy}};
 
     Unreachable();
   }

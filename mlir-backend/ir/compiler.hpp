@@ -550,6 +550,24 @@ struct FutharkCompiler {
 
       return mlir::arith::MulFOp::create(builder, {op0, op1}).getResult();
     }
+    
+    if (auto *fdiv = std::get_if<BinOpFDiv>(&binOp.v)) {
+      assert(!isTensor);
+
+      return mlir::arith::DivFOp::create(builder, {op0, op1}).getResult();
+    }
+
+    if (auto *smod = std::get_if<BinOpSMod>(&binOp.v)) {
+      assert(!isTensor);
+
+      return mlir::arith::RemFOp::create(builder, {op0, op1}).getResult();
+    }
+        
+    if (auto *srem = std::get_if<BinOpSRem>(&binOp.v)) {
+      assert(!isTensor);
+
+      return mlir::arith::RemSIOp::create(builder, {op0, op1}).getResult();
+    }
 
     Unreachable();
   }
