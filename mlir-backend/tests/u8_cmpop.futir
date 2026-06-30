@@ -1,0 +1,38 @@
+name_source {5328}
+types {}
+
+entry("lt",
+      {x: u8,
+       y: u8},
+      {bool})
+  entry_lt (x_5310 : i8,
+            y_5311 : i8)
+  : {bool} = {
+  let {lt_res_5327 : bool} =
+    ult8(x_5310, y_5311)
+  in {lt_res_5327}
+}
+
+entry("eq",
+      {x: u8,
+       y: u8},
+      {bool})
+  entry_eq (x_5316 : i8,
+            y_5317 : i8)
+  : {bool} = {
+  let {eq_res_5327 : bool} =
+    eq_i8(x_5316, y_5317)
+  in {eq_res_5327}
+}
+
+entry("lte",
+      {x: u8,
+       y: u8},
+      {bool})
+  entry_lte (x_5322 : i8,
+             y_5323 : i8)
+  : {bool} = {
+  let {lte_res_5327 : bool} =
+    ule8(x_5322, y_5323)
+  in {lte_res_5327}
+}

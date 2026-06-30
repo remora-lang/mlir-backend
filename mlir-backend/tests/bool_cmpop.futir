@@ -1,0 +1,718 @@
+name_source {5823}
+
+types {
+
+}
+
+
+
+fun
+  zip_5346 (n_5563 : i64,
+            as_5564 : [n_5563]bool,
+            bs_5565 : [n_5563]bool)
+  : {*[n_5563]bool,
+     *[n_5563]bool} = {
+  let {zip_copy_5566 : [n_5563]bool} =
+    copy(as_5564)
+  let {zip_copy_5567 : [n_5563]bool} =
+    copy(bs_5565)
+  in {zip_copy_5566, zip_copy_5567}
+}
+
+fun
+  zip2_5347 (n_5568 : i64,
+             as_5569 : [n_5568]bool,
+             bs_5570 : [n_5568]bool)
+  : {*[n_5568]bool,
+     *[n_5568]bool} = {
+  let {zip2_res_5571 : [n_5568]bool,
+       zip2_res_5572 : [n_5568]bool} =
+    apply zip_5346(n_5568, as_5569, bs_5570)
+    : {*[n_5568]bool, *[n_5568]bool}
+  in {zip2_res_5571, zip2_res_5572}
+}
+
+fun
+  defunc_0_map2_5359 (nameless_5573 : unit,
+                      f_5574 : unit)
+  : {unit} = {
+  {f_5574}
+}
+
+fun
+  defunc_0_map2_5360 (d₁_5575 : i64,
+                      f_5576 : unit,
+                      as_5577 : [d₁_5575]bool)
+  : {[d₁_5575]bool#([2], [0]),
+     unit} = {
+  {as_5577, f_5576}
+}
+
+fun
+  defunc_0_lifted_lambda_5362 (nameless_5578 : unit,
+                               f_5579 : unit)
+  : {unit} = {
+  {f_5579}
+}
+
+fun
+  defunc_0_map_5364 (nameless_5580 : unit,
+                     f_5581 : unit)
+  : {unit} = {
+  {f_5581}
+}
+
+fun
+  defunc_0_f_5366 (nameless_5582 : unit,
+                   eta_p_5583 : bool)
+  : {bool} = {
+  {eta_p_5583}
+}
+
+fun
+  defunc_0_f_5367 (eta_p_5584 : bool,
+                   eta_p_5585 : bool)
+  : {bool} = {
+  "bool_cmpop.fut:28:41-44"
+  let {defunc_0_f_res_5586 : bool} =
+    llt(eta_p_5584, eta_p_5585)
+  in {defunc_0_f_res_5586}
+}
+
+fun
+  defunc_0_f_5368 (f_5587 : unit,
+                   a_5588 : bool,
+                   b_5589 : bool)
+  : {bool} = {
+  let {defunc_0_f_arg_5590 : bool} =
+    apply defunc_0_f_5366(f_5587, a_5588)
+    : {bool}
+  let {defunc_0_f_res_5591 : bool} =
+    apply defunc_0_f_5367(defunc_0_f_arg_5590, b_5589)
+    : {bool}
+  in {defunc_0_f_res_5591}
+}
+
+fun
+  defunc_0_map_5369 (d₁_5592 : i64,
+                     f_5593 : unit,
+                     as_5594 : [d₁_5592]bool,
+                     as_5595 : [d₁_5592]bool)
+  : {*[d₁_5592]bool} = {
+  let {defunc_0_map_res_5596 : [d₁_5592]bool} =
+    map(d₁_5592,
+        {as_5594, as_5595},
+        \ {eta_p_5597 : bool,
+           eta_p_5598 : bool}
+          : {bool} ->
+          let {lam_res_5599 : bool} =
+            apply defunc_0_f_5368(f_5593, eta_p_5597, eta_p_5598)
+            : {bool}
+          in {lam_res_5599})
+  in {defunc_0_map_res_5596}
+}
+
+fun
+  defunc_0_map2_5370 (d₁_5600 : i64,
+                      as_5601 : [d₁_5600]bool,
+                      f_5602 : unit,
+                      bs_5603 : [d₁_5600]bool)
+  : {*[d₁_5600]bool} = {
+  let {map_arg1_5604 : [d₁_5600]bool,
+       map_arg1_5605 : [d₁_5600]bool} =
+    apply zip2_5347(d₁_5600, as_5601, bs_5603)
+    : {*[d₁_5600]bool, *[d₁_5600]bool}
+  let {map_arg0_5608 : unit} =
+    apply defunc_0_lifted_lambda_5362((), f_5602)
+    : {unit}
+  let {defunc_0_map_arg_5610 : unit} =
+    apply defunc_0_map_5364((), map_arg0_5608)
+    : {unit}
+  let {defunc_0_map2_res_5611 : [d₁_5600]bool} =
+    apply defunc_0_map_5369(d₁_5600, defunc_0_map_arg_5610, map_arg1_5604, map_arg1_5605)
+    : {*[d₁_5600]bool}
+  in {defunc_0_map2_res_5611}
+}
+
+fun
+  lt_5350 (d₁_5612 : i64,
+           x_5613 : [d₁_5612]bool,
+           y_5614 : [d₁_5612]bool)
+  : {*[d₁_5612]bool} = {
+  "bool_cmpop.fut:28:36-48"
+  let {defunc_0_map2_arg_5615 : unit} =
+    apply defunc_0_map2_5359((), ())
+    : {unit}
+  "bool_cmpop.fut:28:36-48"
+  let {defunc_0_map2_arg_5616 : [d₁_5612]bool,
+       defunc_0_map2_arg_5617 : unit} =
+    apply defunc_0_map2_5360(d₁_5612, defunc_0_map2_arg_5615, x_5613)
+    : {[d₁_5612]bool#([2], [0]), unit}
+  "bool_cmpop.fut:28:36-48"
+  let {lt_res_5618 : [d₁_5612]bool} =
+    apply defunc_0_map2_5370(d₁_5612, defunc_0_map2_arg_5616, defunc_0_map2_arg_5617, y_5614)
+    : {*[d₁_5612]bool}
+  in {lt_res_5618}
+}
+
+entry("lt",
+      {x: []bool,
+       y: []bool},
+      {*[]bool})
+  entry_lt (d₁_5619 : i64,
+            x_5620 : [d₁_5619]bool,
+            y_5621 : [d₁_5619]bool)
+  : {*[d₁_5619]bool} = {
+  let {entry_result_5622 : [d₁_5619]bool} =
+    apply lt_5350(d₁_5619, x_5620, y_5621)
+    : {*[d₁_5619]bool}
+  in {entry_result_5622}
+}
+
+fun
+  defunc_0_map2_5374 (nameless_5623 : unit,
+                      f_5624 : unit)
+  : {unit} = {
+  {f_5624}
+}
+
+fun
+  defunc_0_map2_5375 (d₁_5625 : i64,
+                      f_5626 : unit,
+                      as_5627 : [d₁_5625]bool)
+  : {[d₁_5625]bool#([2], [0]),
+     unit} = {
+  {as_5627, f_5626}
+}
+
+fun
+  defunc_0_lifted_lambda_5377 (nameless_5628 : unit,
+                               f_5629 : unit)
+  : {unit} = {
+  {f_5629}
+}
+
+fun
+  defunc_0_map_5379 (nameless_5630 : unit,
+                     f_5631 : unit)
+  : {unit} = {
+  {f_5631}
+}
+
+fun
+  defunc_0_f_5381 (nameless_5632 : unit,
+                   eta_p_5633 : bool)
+  : {bool} = {
+  {eta_p_5633}
+}
+
+fun
+  defunc_0_f_5382 (eta_p_5634 : bool,
+                   eta_p_5635 : bool)
+  : {bool} = {
+  "bool_cmpop.fut:29:41-44"
+  let {defunc_0_f_res_5636 : bool} =
+    llt(eta_p_5635, eta_p_5634)
+  in {defunc_0_f_res_5636}
+}
+
+fun
+  defunc_0_f_5383 (f_5637 : unit,
+                   a_5638 : bool,
+                   b_5639 : bool)
+  : {bool} = {
+  let {defunc_0_f_arg_5640 : bool} =
+    apply defunc_0_f_5381(f_5637, a_5638)
+    : {bool}
+  let {defunc_0_f_res_5641 : bool} =
+    apply defunc_0_f_5382(defunc_0_f_arg_5640, b_5639)
+    : {bool}
+  in {defunc_0_f_res_5641}
+}
+
+fun
+  defunc_0_map_5384 (d₁_5642 : i64,
+                     f_5643 : unit,
+                     as_5644 : [d₁_5642]bool,
+                     as_5645 : [d₁_5642]bool)
+  : {*[d₁_5642]bool} = {
+  let {defunc_0_map_res_5646 : [d₁_5642]bool} =
+    map(d₁_5642,
+        {as_5644, as_5645},
+        \ {eta_p_5647 : bool,
+           eta_p_5648 : bool}
+          : {bool} ->
+          let {lam_res_5649 : bool} =
+            apply defunc_0_f_5383(f_5643, eta_p_5647, eta_p_5648)
+            : {bool}
+          in {lam_res_5649})
+  in {defunc_0_map_res_5646}
+}
+
+fun
+  defunc_0_map2_5385 (d₁_5650 : i64,
+                      as_5651 : [d₁_5650]bool,
+                      f_5652 : unit,
+                      bs_5653 : [d₁_5650]bool)
+  : {*[d₁_5650]bool} = {
+  let {map_arg1_5654 : [d₁_5650]bool,
+       map_arg1_5655 : [d₁_5650]bool} =
+    apply zip2_5347(d₁_5650, as_5651, bs_5653)
+    : {*[d₁_5650]bool, *[d₁_5650]bool}
+  let {map_arg0_5658 : unit} =
+    apply defunc_0_lifted_lambda_5377((), f_5652)
+    : {unit}
+  let {defunc_0_map_arg_5660 : unit} =
+    apply defunc_0_map_5379((), map_arg0_5658)
+    : {unit}
+  let {defunc_0_map2_res_5661 : [d₁_5650]bool} =
+    apply defunc_0_map_5384(d₁_5650, defunc_0_map_arg_5660, map_arg1_5654, map_arg1_5655)
+    : {*[d₁_5650]bool}
+  in {defunc_0_map2_res_5661}
+}
+
+fun
+  gt_5351 (d₁_5662 : i64,
+           x_5663 : [d₁_5662]bool,
+           y_5664 : [d₁_5662]bool)
+  : {*[d₁_5662]bool} = {
+  "bool_cmpop.fut:29:36-48"
+  let {defunc_0_map2_arg_5665 : unit} =
+    apply defunc_0_map2_5374((), ())
+    : {unit}
+  "bool_cmpop.fut:29:36-48"
+  let {defunc_0_map2_arg_5666 : [d₁_5662]bool,
+       defunc_0_map2_arg_5667 : unit} =
+    apply defunc_0_map2_5375(d₁_5662, defunc_0_map2_arg_5665, x_5663)
+    : {[d₁_5662]bool#([2], [0]), unit}
+  "bool_cmpop.fut:29:36-48"
+  let {gt_res_5668 : [d₁_5662]bool} =
+    apply defunc_0_map2_5385(d₁_5662, defunc_0_map2_arg_5666, defunc_0_map2_arg_5667, y_5664)
+    : {*[d₁_5662]bool}
+  in {gt_res_5668}
+}
+
+entry("gt",
+      {x: []bool,
+       y: []bool},
+      {*[]bool})
+  entry_gt (d₁_5669 : i64,
+            x_5670 : [d₁_5669]bool,
+            y_5671 : [d₁_5669]bool)
+  : {*[d₁_5669]bool} = {
+  let {entry_result_5672 : [d₁_5669]bool} =
+    apply gt_5351(d₁_5669, x_5670, y_5671)
+    : {*[d₁_5669]bool}
+  in {entry_result_5672}
+}
+
+fun
+  defunc_0_map2_5389 (nameless_5673 : unit,
+                      f_5674 : unit)
+  : {unit} = {
+  {f_5674}
+}
+
+fun
+  defunc_0_map2_5390 (d₁_5675 : i64,
+                      f_5676 : unit,
+                      as_5677 : [d₁_5675]bool)
+  : {[d₁_5675]bool#([2], [0]),
+     unit} = {
+  {as_5677, f_5676}
+}
+
+fun
+  defunc_0_lifted_lambda_5392 (nameless_5678 : unit,
+                               f_5679 : unit)
+  : {unit} = {
+  {f_5679}
+}
+
+fun
+  defunc_0_map_5394 (nameless_5680 : unit,
+                     f_5681 : unit)
+  : {unit} = {
+  {f_5681}
+}
+
+fun
+  defunc_0_f_5396 (nameless_5682 : unit,
+                   eta_p_5683 : bool)
+  : {bool} = {
+  {eta_p_5683}
+}
+
+fun
+  defunc_0_f_5397 (eta_p_5684 : bool,
+                   eta_p_5685 : bool)
+  : {bool} = {
+  "bool_cmpop.fut:30:41-45"
+  let {defunc_0_f_res_5686 : bool} =
+    eq_bool(eta_p_5684, eta_p_5685)
+  in {defunc_0_f_res_5686}
+}
+
+fun
+  defunc_0_f_5398 (f_5687 : unit,
+                   a_5688 : bool,
+                   b_5689 : bool)
+  : {bool} = {
+  let {defunc_0_f_arg_5690 : bool} =
+    apply defunc_0_f_5396(f_5687, a_5688)
+    : {bool}
+  let {defunc_0_f_res_5691 : bool} =
+    apply defunc_0_f_5397(defunc_0_f_arg_5690, b_5689)
+    : {bool}
+  in {defunc_0_f_res_5691}
+}
+
+fun
+  defunc_0_map_5399 (d₁_5692 : i64,
+                     f_5693 : unit,
+                     as_5694 : [d₁_5692]bool,
+                     as_5695 : [d₁_5692]bool)
+  : {*[d₁_5692]bool} = {
+  let {defunc_0_map_res_5696 : [d₁_5692]bool} =
+    map(d₁_5692,
+        {as_5694, as_5695},
+        \ {eta_p_5697 : bool,
+           eta_p_5698 : bool}
+          : {bool} ->
+          let {lam_res_5699 : bool} =
+            apply defunc_0_f_5398(f_5693, eta_p_5697, eta_p_5698)
+            : {bool}
+          in {lam_res_5699})
+  in {defunc_0_map_res_5696}
+}
+
+fun
+  defunc_0_map2_5400 (d₁_5700 : i64,
+                      as_5701 : [d₁_5700]bool,
+                      f_5702 : unit,
+                      bs_5703 : [d₁_5700]bool)
+  : {*[d₁_5700]bool} = {
+  let {map_arg1_5704 : [d₁_5700]bool,
+       map_arg1_5705 : [d₁_5700]bool} =
+    apply zip2_5347(d₁_5700, as_5701, bs_5703)
+    : {*[d₁_5700]bool, *[d₁_5700]bool}
+  let {map_arg0_5708 : unit} =
+    apply defunc_0_lifted_lambda_5392((), f_5702)
+    : {unit}
+  let {defunc_0_map_arg_5710 : unit} =
+    apply defunc_0_map_5394((), map_arg0_5708)
+    : {unit}
+  let {defunc_0_map2_res_5711 : [d₁_5700]bool} =
+    apply defunc_0_map_5399(d₁_5700, defunc_0_map_arg_5710, map_arg1_5704, map_arg1_5705)
+    : {*[d₁_5700]bool}
+  in {defunc_0_map2_res_5711}
+}
+
+fun
+  eq_5352 (d₁_5712 : i64,
+           x_5713 : [d₁_5712]bool,
+           y_5714 : [d₁_5712]bool)
+  : {*[d₁_5712]bool} = {
+  "bool_cmpop.fut:30:36-49"
+  let {defunc_0_map2_arg_5715 : unit} =
+    apply defunc_0_map2_5389((), ())
+    : {unit}
+  "bool_cmpop.fut:30:36-49"
+  let {defunc_0_map2_arg_5716 : [d₁_5712]bool,
+       defunc_0_map2_arg_5717 : unit} =
+    apply defunc_0_map2_5390(d₁_5712, defunc_0_map2_arg_5715, x_5713)
+    : {[d₁_5712]bool#([2], [0]), unit}
+  "bool_cmpop.fut:30:36-49"
+  let {eq_res_5718 : [d₁_5712]bool} =
+    apply defunc_0_map2_5400(d₁_5712, defunc_0_map2_arg_5716, defunc_0_map2_arg_5717, y_5714)
+    : {*[d₁_5712]bool}
+  in {eq_res_5718}
+}
+
+entry("eq",
+      {x: []bool,
+       y: []bool},
+      {*[]bool})
+  entry_eq (d₁_5719 : i64,
+            x_5720 : [d₁_5719]bool,
+            y_5721 : [d₁_5719]bool)
+  : {*[d₁_5719]bool} = {
+  let {entry_result_5722 : [d₁_5719]bool} =
+    apply eq_5352(d₁_5719, x_5720, y_5721)
+    : {*[d₁_5719]bool}
+  in {entry_result_5722}
+}
+
+fun
+  defunc_0_map2_5404 (nameless_5723 : unit,
+                      f_5724 : unit)
+  : {unit} = {
+  {f_5724}
+}
+
+fun
+  defunc_0_map2_5405 (d₁_5725 : i64,
+                      f_5726 : unit,
+                      as_5727 : [d₁_5725]bool)
+  : {[d₁_5725]bool#([2], [0]),
+     unit} = {
+  {as_5727, f_5726}
+}
+
+fun
+  defunc_0_lifted_lambda_5407 (nameless_5728 : unit,
+                               f_5729 : unit)
+  : {unit} = {
+  {f_5729}
+}
+
+fun
+  defunc_0_map_5409 (nameless_5730 : unit,
+                     f_5731 : unit)
+  : {unit} = {
+  {f_5731}
+}
+
+fun
+  defunc_0_f_5411 (nameless_5732 : unit,
+                   eta_p_5733 : bool)
+  : {bool} = {
+  {eta_p_5733}
+}
+
+fun
+  defunc_0_f_5412 (eta_p_5734 : bool,
+                   eta_p_5735 : bool)
+  : {bool} = {
+  "bool_cmpop.fut:31:42-46"
+  let {defunc_0_f_res_5736 : bool} =
+    lle(eta_p_5734, eta_p_5735)
+  in {defunc_0_f_res_5736}
+}
+
+fun
+  defunc_0_f_5413 (f_5737 : unit,
+                   a_5738 : bool,
+                   b_5739 : bool)
+  : {bool} = {
+  let {defunc_0_f_arg_5740 : bool} =
+    apply defunc_0_f_5411(f_5737, a_5738)
+    : {bool}
+  let {defunc_0_f_res_5741 : bool} =
+    apply defunc_0_f_5412(defunc_0_f_arg_5740, b_5739)
+    : {bool}
+  in {defunc_0_f_res_5741}
+}
+
+fun
+  defunc_0_map_5414 (d₁_5742 : i64,
+                     f_5743 : unit,
+                     as_5744 : [d₁_5742]bool,
+                     as_5745 : [d₁_5742]bool)
+  : {*[d₁_5742]bool} = {
+  let {defunc_0_map_res_5746 : [d₁_5742]bool} =
+    map(d₁_5742,
+        {as_5744, as_5745},
+        \ {eta_p_5747 : bool,
+           eta_p_5748 : bool}
+          : {bool} ->
+          let {lam_res_5749 : bool} =
+            apply defunc_0_f_5413(f_5743, eta_p_5747, eta_p_5748)
+            : {bool}
+          in {lam_res_5749})
+  in {defunc_0_map_res_5746}
+}
+
+fun
+  defunc_0_map2_5415 (d₁_5750 : i64,
+                      as_5751 : [d₁_5750]bool,
+                      f_5752 : unit,
+                      bs_5753 : [d₁_5750]bool)
+  : {*[d₁_5750]bool} = {
+  let {map_arg1_5754 : [d₁_5750]bool,
+       map_arg1_5755 : [d₁_5750]bool} =
+    apply zip2_5347(d₁_5750, as_5751, bs_5753)
+    : {*[d₁_5750]bool, *[d₁_5750]bool}
+  let {map_arg0_5758 : unit} =
+    apply defunc_0_lifted_lambda_5407((), f_5752)
+    : {unit}
+  let {defunc_0_map_arg_5760 : unit} =
+    apply defunc_0_map_5409((), map_arg0_5758)
+    : {unit}
+  let {defunc_0_map2_res_5761 : [d₁_5750]bool} =
+    apply defunc_0_map_5414(d₁_5750, defunc_0_map_arg_5760, map_arg1_5754, map_arg1_5755)
+    : {*[d₁_5750]bool}
+  in {defunc_0_map2_res_5761}
+}
+
+fun
+  lte_5353 (d₁_5762 : i64,
+            x_5763 : [d₁_5762]bool,
+            y_5764 : [d₁_5762]bool)
+  : {*[d₁_5762]bool} = {
+  "bool_cmpop.fut:31:37-50"
+  let {defunc_0_map2_arg_5765 : unit} =
+    apply defunc_0_map2_5404((), ())
+    : {unit}
+  "bool_cmpop.fut:31:37-50"
+  let {defunc_0_map2_arg_5766 : [d₁_5762]bool,
+       defunc_0_map2_arg_5767 : unit} =
+    apply defunc_0_map2_5405(d₁_5762, defunc_0_map2_arg_5765, x_5763)
+    : {[d₁_5762]bool#([2], [0]), unit}
+  "bool_cmpop.fut:31:37-50"
+  let {lte_res_5768 : [d₁_5762]bool} =
+    apply defunc_0_map2_5415(d₁_5762, defunc_0_map2_arg_5766, defunc_0_map2_arg_5767, y_5764)
+    : {*[d₁_5762]bool}
+  in {lte_res_5768}
+}
+
+entry("lte",
+      {x: []bool,
+       y: []bool},
+      {*[]bool})
+  entry_lte (d₁_5769 : i64,
+             x_5770 : [d₁_5769]bool,
+             y_5771 : [d₁_5769]bool)
+  : {*[d₁_5769]bool} = {
+  let {entry_result_5772 : [d₁_5769]bool} =
+    apply lte_5353(d₁_5769, x_5770, y_5771)
+    : {*[d₁_5769]bool}
+  in {entry_result_5772}
+}
+
+fun
+  defunc_0_map2_5419 (nameless_5773 : unit,
+                      f_5774 : unit)
+  : {unit} = {
+  {f_5774}
+}
+
+fun
+  defunc_0_map2_5420 (d₁_5775 : i64,
+                      f_5776 : unit,
+                      as_5777 : [d₁_5775]bool)
+  : {[d₁_5775]bool#([2], [0]),
+     unit} = {
+  {as_5777, f_5776}
+}
+
+fun
+  defunc_0_lifted_lambda_5422 (nameless_5778 : unit,
+                               f_5779 : unit)
+  : {unit} = {
+  {f_5779}
+}
+
+fun
+  defunc_0_map_5424 (nameless_5780 : unit,
+                     f_5781 : unit)
+  : {unit} = {
+  {f_5781}
+}
+
+fun
+  defunc_0_f_5426 (nameless_5782 : unit,
+                   eta_p_5783 : bool)
+  : {bool} = {
+  {eta_p_5783}
+}
+
+fun
+  defunc_0_f_5427 (eta_p_5784 : bool,
+                   eta_p_5785 : bool)
+  : {bool} = {
+  "bool_cmpop.fut:32:42-46"
+  let {defunc_0_f_res_5786 : bool} =
+    lle(eta_p_5785, eta_p_5784)
+  in {defunc_0_f_res_5786}
+}
+
+fun
+  defunc_0_f_5428 (f_5787 : unit,
+                   a_5788 : bool,
+                   b_5789 : bool)
+  : {bool} = {
+  let {defunc_0_f_arg_5790 : bool} =
+    apply defunc_0_f_5426(f_5787, a_5788)
+    : {bool}
+  let {defunc_0_f_res_5791 : bool} =
+    apply defunc_0_f_5427(defunc_0_f_arg_5790, b_5789)
+    : {bool}
+  in {defunc_0_f_res_5791}
+}
+
+fun
+  defunc_0_map_5429 (d₁_5792 : i64,
+                     f_5793 : unit,
+                     as_5794 : [d₁_5792]bool,
+                     as_5795 : [d₁_5792]bool)
+  : {*[d₁_5792]bool} = {
+  let {defunc_0_map_res_5796 : [d₁_5792]bool} =
+    map(d₁_5792,
+        {as_5794, as_5795},
+        \ {eta_p_5797 : bool,
+           eta_p_5798 : bool}
+          : {bool} ->
+          let {lam_res_5799 : bool} =
+            apply defunc_0_f_5428(f_5793, eta_p_5797, eta_p_5798)
+            : {bool}
+          in {lam_res_5799})
+  in {defunc_0_map_res_5796}
+}
+
+fun
+  defunc_0_map2_5430 (d₁_5800 : i64,
+                      as_5801 : [d₁_5800]bool,
+                      f_5802 : unit,
+                      bs_5803 : [d₁_5800]bool)
+  : {*[d₁_5800]bool} = {
+  let {map_arg1_5804 : [d₁_5800]bool,
+       map_arg1_5805 : [d₁_5800]bool} =
+    apply zip2_5347(d₁_5800, as_5801, bs_5803)
+    : {*[d₁_5800]bool, *[d₁_5800]bool}
+  let {map_arg0_5808 : unit} =
+    apply defunc_0_lifted_lambda_5422((), f_5802)
+    : {unit}
+  let {defunc_0_map_arg_5810 : unit} =
+    apply defunc_0_map_5424((), map_arg0_5808)
+    : {unit}
+  let {defunc_0_map2_res_5811 : [d₁_5800]bool} =
+    apply defunc_0_map_5429(d₁_5800, defunc_0_map_arg_5810, map_arg1_5804, map_arg1_5805)
+    : {*[d₁_5800]bool}
+  in {defunc_0_map2_res_5811}
+}
+
+fun
+  gte_5354 (d₁_5812 : i64,
+            x_5813 : [d₁_5812]bool,
+            y_5814 : [d₁_5812]bool)
+  : {*[d₁_5812]bool} = {
+  "bool_cmpop.fut:32:37-50"
+  let {defunc_0_map2_arg_5815 : unit} =
+    apply defunc_0_map2_5419((), ())
+    : {unit}
+  "bool_cmpop.fut:32:37-50"
+  let {defunc_0_map2_arg_5816 : [d₁_5812]bool,
+       defunc_0_map2_arg_5817 : unit} =
+    apply defunc_0_map2_5420(d₁_5812, defunc_0_map2_arg_5815, x_5813)
+    : {[d₁_5812]bool#([2], [0]), unit}
+  "bool_cmpop.fut:32:37-50"
+  let {gte_res_5818 : [d₁_5812]bool} =
+    apply defunc_0_map2_5430(d₁_5812, defunc_0_map2_arg_5816, defunc_0_map2_arg_5817, y_5814)
+    : {*[d₁_5812]bool}
+  in {gte_res_5818}
+}
+
+entry("gte",
+      {x: []bool,
+       y: []bool},
+      {*[]bool})
+  entry_gte (d₁_5819 : i64,
+             x_5820 : [d₁_5819]bool,
+             y_5821 : [d₁_5819]bool)
+  : {*[d₁_5819]bool} = {
+  let {entry_result_5822 : [d₁_5819]bool} =
+    apply gte_5354(d₁_5819, x_5820, y_5821)
+    : {*[d₁_5819]bool}
+  in {entry_result_5822}
+}

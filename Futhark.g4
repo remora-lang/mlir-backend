@@ -68,6 +68,8 @@ pBasicOp: 'replicate' '(' pExtShape ',' pSubExp ')' #BasicOpReplicate
     | IOTA '(' pSubExp ',' pSubExp ',' pSubExp ')' #BasicOpIota
     | pBinOp #BasicOpBinary
     | pConvOp #BasicOpConv
+    | pCmpOp #BasicOpCompare
+    | pUnOp #BasicOpUnary
     | 'reshape' '(' pSubExp ',' '(' (NUMBER '::' NUMBER '=>' pExtShape ';') pExtShape ')' ')'  #BasicOpReshape
     | 'rearrange' '(' pSubExp ',' '(' NUMBER (',' NUMBER)* ')' ')' #BasicOpRearrange
     ;
@@ -76,7 +78,27 @@ pBinOp: binaryOpcode LPARAM pSubExp ',' pSubExp RPARAM;
 
 binaryOpcode: ADD | FADD | SUB | FSUB | MUL | FMUL | UDIV | UDIVUP | SDIV | SDIVUP | FDIV | FMOD | UMOD | SMOD | SQUOT | SREM | SMIN | UMIN | FMIN | SMAX | UMAX | FMAX | SHL | LSHR | ASHR | AND | OR | XOR | POW | FPOW | LOGAND | LOGOR;
 
-pConvOp: 'sext' pPrimType pSubExp 'to' pPrimType;
+pCmpOp: compareOpcode LPARAM pSubExp ',' pSubExp RPARAM;
+compareOpcode: CMPEQ | CMPULT | CMPULE | CMPSLT | CMPSLE | FCMPLT | FCMPLE | CMPLLT | CMPLLE;
+
+pConvOp
+  : CONV_EXT INTEGER_TYPE pSubExp 'to' INTEGER_TYPE
+  | CONV_FPCONV FLOAT_TYPE pSubExp 'to' FLOAT_TYPE
+  | CONV_F2I FLOAT_TYPE pSubExp 'to' INTEGER_TYPE
+  | CONV_I2F INTEGER_TYPE pSubExp 'to' FLOAT_TYPE
+  ;
+
+pUnOp: unaryOpcode pSubExp;
+unaryOpcode
+  : NEGI
+  | NEGF
+  | COMPLEMENT
+  | ABS
+  | FABS
+  | SSIGNUM
+  | USIGNUM
+  | FSIGNUM
+  ;
 
 pSubExp: pPrimValue #ConstantSubExpression
     | ID #VarSubExp;
@@ -128,6 +150,31 @@ POW: 'pow' NUMBER;
 FPOW: 'fpow' NUMBER;
 LOGAND: 'logand' NUMBER;
 LOGOR: 'logor' NUMBER;
+// Comparison Operators
+CMPEQ: 'eq_i' NUMBER;
+FCMPEQ: 'eq_f' NUMBER;
+CMPULT: 'ult' NUMBER;
+CMPULE: 'ule' NUMBER;
+CMPSLT: 'slt' NUMBER;
+CMPSLE: 'sle' NUMBER;
+FCMPLT: 'flt' NUMBER;
+FCMPLE: 'fle' NUMBER;
+CMPLLT: 'llt' NUMBER;
+CMPLLE: 'lle' NUMBER;
+// Coversion Operators
+CONV_EXT: 'zext' | 'sext';
+CONV_FPCONV: 'fpconv';
+CONV_F2I: 'fptoui' | 'fptosi' | 'uitofp' | 'sitofp';
+CONV_I2F: 'fptobits' | 'bitstofp';
+// Unary Operators
+NEGI: 'neg_i' NUMBER;
+NEGF: 'neg_f' NUMBER;
+COMPLEMENT: 'complement' NUMBER;
+ABS: 'abs' NUMBER;
+FABS: 'fabs' NUMBER;
+SSIGNUM: 'ssignum' NUMBER;
+USIGNUM: 'usignum' NUMBER;
+FSIGNUM: 'fsignum' NUMBER;
 
 FLOAT   : (DIGIT+ '.' DIGIT+) ;
 fragment DIGIT  : [0-9];

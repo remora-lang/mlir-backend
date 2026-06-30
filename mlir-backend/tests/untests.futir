@@ -1,0 +1,49 @@
+name_source {5727}
+
+types {
+}
+
+fun negateTest (n : i32) : {i32} = {
+  let {res : i32} =
+    neg_i32 n
+  in {res}
+}
+
+fun absTest (n : i32) : {i32} = {
+  let {res : i32} =
+    abs32 n
+  in {res}
+}
+
+fun sgnTest (n : i32) : {i32} = {
+  let {res : i32} =
+    ssignum32 n
+  in {res}
+}
+
+fun set_bit_2722 (bit_6457 : i32,
+                x_6458 : i16,
+                b_6459 : i32)
+  : {i16} = {
+  let {i32_arg0_6460 : i32} =
+    shl32(1i32, bit_6457)
+  let {i32_arg_6462 : i32} =
+    complement32 i32_arg0_6460
+  let {unsign_arg0_7071 : i16} =
+    zext i32 i32_arg_6462 to i16
+  let {unsign_arg0_7145 : i16} =
+    and16(x_6458, unsign_arg0_7071)
+  let {i32_arg0_6467 : i32} =
+    shl32(b_6459, bit_6457)
+  let {unsign_arg0_7073 : i16} =
+    zext i32 i32_arg0_6467 to i16
+  let {unsign_arg0_7076 : i16} =
+    or16(unsign_arg0_7073, unsign_arg0_7145)
+  in {unsign_arg0_7076}
+}
+
+fun fabsTest (n : f16) : {f16} = {
+  let {res : f16} =
+    fabs16 n
+  in {res}
+}

@@ -1,0 +1,28 @@
+name_source {5727}
+
+types {
+}
+
+fun convzextTest (n : i8) : {i16} = {
+  let {res : i16} =
+    zext i8 n to i16
+  in {res}
+}
+
+fun convfptosiTest (n : f64) : {i32} = {
+  let {res : i32} =
+    fptosi f64 n to i32
+  in {res}
+}
+
+fun convfptouiTest (n : f64) : {i32} = {
+  let {res : i32} =
+    fptoui f64 n to i32
+  in {res}
+}
+
+fun convfpconvTest (n : f16) : {f32} = {
+  let {res : f32} =
+    fpconv f16 n to f32
+  in {res}
+}

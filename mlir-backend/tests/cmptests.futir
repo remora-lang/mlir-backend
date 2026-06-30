@@ -1,0 +1,27 @@
+name_source {1157}
+types {
+}
+
+fun addTen (a: i32) : {f32} = {
+  let {x : i32} =
+    add32(a, 10i32)
+  in {x}
+}
+
+fun uleTest (x: i32) : {i32} = {
+  let {a : i32} =
+    ule32(x, 8i32)
+  in {a}
+ }
+
+fun ultTest (x: i8, y: i8) : {i8} = {
+  let {a : i8} =
+    ult8(x, y)
+  in {a}
+}
+
+fun eqTest (x : i8, y : i8) : {i8} = {
+  let {a : i8} =
+    eq_i8(x, y)
+  in {a}
+}
