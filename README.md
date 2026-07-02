@@ -3,6 +3,20 @@
 `mlir-backend` is an MLIR based backend for the Remora programming language.
 
 # Building
+
+## With nix
+
+```
+nix develop
+build
+```
+
+The shell also includes scripts to compile programs (`run`) and clean up the build (`clean`).
+
+Pins latest release of LLVM 22 that's available in nixpkgs-unstable.
+
+## Without nix
+
 ### Build LLVM `22.x` from source:
 
 ```
