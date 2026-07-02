@@ -1,5 +1,9 @@
 #pragma once
 // Represents the state of a Futhark function
+#include "error.hpp"
+#include "soac.hpp"
+#include "syntax.hpp"
+
 struct Ctx {
   std::unordered_map<std::string, mlir::Value> subexps;
 };

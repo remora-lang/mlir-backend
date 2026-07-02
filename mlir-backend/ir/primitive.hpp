@@ -1,4 +1,5 @@
 #pragma once
+#include <variant>
 
 enum IntType {
   Int8 = 8,
