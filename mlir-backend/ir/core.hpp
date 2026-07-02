@@ -19,7 +19,23 @@ template <typename D> struct ShapeBase {
   std::vector<D> dims;
 };
 
-struct SubExp;
+struct ConstantSubExp {
+  PrimValue v;
+};
+
+struct VarSubExp {
+  VName v;
+};
+
+struct SubExp {
+  std::variant<ConstantSubExp, VarSubExp> v;
+
+  int64_t GetIntValue() {
+    auto constExp = std::get<ConstantSubExp>(v);
+    auto iv = std::get<IntValue>(constExp.v.v);
+    return GetValue(iv);
+  }
+};
 
 template <typename D> struct DimFix {
   D i;
@@ -124,24 +140,6 @@ enum class Diet {
 
 struct Certs {
   std::vector<VName> vnames;
-};
-
-struct ConstantSubExp {
-  PrimValue v;
-};
-
-struct VarSubExp {
-  VName v;
-};
-
-struct SubExp {
-  std::variant<ConstantSubExp, VarSubExp> v;
-
-  int64_t GetIntValue() {
-    auto constExp = std::get<ConstantSubExp>(v);
-    auto iv = std::get<IntValue>(constExp.v.v);
-    return GetValue(iv);
-  }
 };
 
 template <typename Dec> struct PatElem {
