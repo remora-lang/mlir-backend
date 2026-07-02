@@ -1,5 +1,7 @@
 #pragma once
 
+#include "core.hpp"
+
 enum class Rep {
   SOACS,
   Seq,

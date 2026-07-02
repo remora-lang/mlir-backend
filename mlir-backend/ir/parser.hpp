@@ -1,7 +1,11 @@
 #pragma once
-using namespace antlr4;
+#include "error.hpp"
+#include "soac.hpp"
+#include "syntax.hpp"
+#include "FutharkParser.h"
+#include "FutharkLexer.h"
 
-void Unreachable() { throw std::runtime_error("unreachable"); }
+using namespace antlr4;
 
 struct FutharkTranslationVisitor {
   Prog VisitProg(FutharkParser::RootContext *ctx) {
@@ -440,7 +444,7 @@ struct FutharkTranslationVisitor {
   std::string VisitId(antlr4::tree::TerminalNode *ctx) { return ctx->getText(); }
 };
 
-Prog ParseFuthark(std::ifstream &file) {
+inline Prog ParseFuthark(std::ifstream &file) {
   ANTLRInputStream input(file);
   FutharkLexer lexer(&input);
   CommonTokenStream tokens(&lexer);
