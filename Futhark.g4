@@ -42,7 +42,7 @@ pSoacOp: 'map' '('  pScrema pMapForm ')' #SoacOpMap
 
 pScrema: pSubExp ',' '{' ID? (',' ID)* '}' ',';
 
-pMapForm: pLambda;
+pMapForm: pLambda ',' pLambda;
 
 pRedomapForm: pLambda ',' '{' pReduce? (',' pReduce)* '}';
 

@@ -301,6 +301,12 @@ struct FutharkCompiler {
       throw std::runtime_error("TODO: Multiple return types");
     }
 
+    if (screma.form.scremaPostLambda.params.size() !=
+        screma.form.scremaPostLambda.ret.size() ||
+        screma.form.scremaPostLambda.body.stms.size() != 0) {
+      throw std::runtime_error("TODO: non-identity postlambda");
+    }
+
     // Compute the dimensions of the return type
     mlir::Type baseTy;
     std::vector<int64_t> dimensions;

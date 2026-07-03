@@ -346,7 +346,8 @@ struct FutharkTranslationVisitor {
 
   ScremaForm VisitMapForm(FutharkParser::PMapFormContext *ctx) {
     ScremaForm form;
-    form.scremaLambda = VisitLambda(ctx->pLambda());
+    form.scremaLambda = VisitLambda(ctx->pLambda()[0]);
+    form.scremaPostLambda = VisitLambda(ctx->pLambda()[1]);
     return form;
   }
 

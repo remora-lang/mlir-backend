@@ -24,6 +24,7 @@ struct ScremaForm {
   Lambda scremaLambda;
   std::vector<Scan> scremaScans;
   std::vector<Reduce> scremaReduces;
+  Lambda scremaPostLambda;
 };
 
 struct SoacStream {
