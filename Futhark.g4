@@ -6,7 +6,7 @@ header: 'name_source' '{' NUMBER '}' 'types' '{' '}';
 
 pFunDef: (pEntry? | 'fun') ID LPARAM fParam? (',' fParam)* RPARAM ':' OPEN_BRACKET pType CLOSE_BRACKET '=' OPEN_BRACKET pBody CLOSE_BRACKET;
 
-pEntry: ('entry') LPARAM STRING_LITERAL COMMA OPEN_BRACKET CLOSE_BRACKET COMMA OPEN_BRACKET pType CLOSE_BRACKET RPARAM;
+pEntry: ('entry') LPARAM STRING_LITERAL COMMA OPEN_BRACKET CLOSE_BRACKET COMMA pType RPARAM;
 
 // Empty for now
 pEntryPointInput: ;
