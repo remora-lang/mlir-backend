@@ -35,10 +35,20 @@ pPatElem: ID ':' pType;
 pExp: pApply #ExpApply
     | pBasicOp #ExpBasicOp
     | pSoacOp #ExpSoacOp
+    | pSegOp #ExpSegOp
     | pSubExp #ExpSubExp;
 
 pSoacOp: 'map' '('  pScrema pMapForm ')' #SoacOpMap
 | 'redomap' '('  pScrema pRedomapForm ')' #SoacOpRedomap;
+
+// This is specialised to a certain form of segmaps.
+pSegOp : 'segmap' '(' 'thread' ';' ';' ')' pSegSpace ':' pTypes '{' pKernelBody '}' #SegMap;
+
+pKernelBody: pStm* 'return' '{' 'returns' pSubExp (',' 'returns' pSubExp)* '}' #KernelBody
+    | '{' 'return' pSubExp (',' 'returns' pSubExp)* '}' #EmptyKernelBody;
+
+
+pSegSpace: '(' ID '<' pSubExp (',' ID '<' pSubExp)* ')' '(' '~' ID ')';
 
 pScrema: pSubExp ',' '{' ID? (',' ID)* '}' ',';
 
@@ -103,9 +113,9 @@ FSUB: 'fsub' NUMBER;
 MUL: 'mul' NUMBER;
 FMUL: 'fmul' NUMBER;
 UDIV: 'udiv' NUMBER;
-UDIVUP: 'udivup' NUMBER;
+UDIVUP: 'udiv_up' NUMBER;
 SDIV: 'sdiv' NUMBER;
-SDIVUP: 'sdivup' NUMBER;
+SDIVUP: 'sdiv_up' NUMBER;
 FDIV: 'fdiv' NUMBER;
 FMOD: 'fmod' NUMBER;
 UMOD: 'umod' NUMBER;
@@ -134,7 +144,7 @@ fragment DIGIT  : [0-9];
 
 STRING_LITERAL: '"' ID '"';
 
-ID : ( [a-zA-Z_+'-'*/%=!<>|&^.#] ) ([a-zA-Z0-9_+\-*/%=!<>|&^.#])*;
+ID : ( [a-zA-Z_+'-'*/%!<>|&^.#] ) ([a-zA-Z0-9_+\-*/%!<>|&^.#])*;
 
 LPARAM      : '(';
 RPARAM      : ')';
@@ -144,7 +154,6 @@ CLOSE_BRACKET: '}';
 
 COMMA       : ',';
 BUILTIN     : 'builtin';
-RETURN      : 'return';
 FUNCTIONS      : 'FUNCTIONS';
 RULES      : 'RULES';
 

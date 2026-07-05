@@ -32,7 +32,6 @@ int main(int argc, char *argv[]) {
   }
 
   auto prog = ParseFuthark(file);
-
   mlir::MLIRContext ctx;
   mlir::ImplicitLocOpBuilder builder(mlir::UnknownLoc::get(&ctx), &ctx);
   FutharkCompiler compiler(prog, ctx, builder);

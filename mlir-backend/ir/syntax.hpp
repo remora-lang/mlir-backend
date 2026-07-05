@@ -19,6 +19,7 @@ struct Lambda;
 struct FunDef;
 struct Prog;
 struct Soac;
+struct SegOp;
 struct HostOp;
 struct MCOp;
 struct MemInfoLet;
@@ -234,12 +235,16 @@ struct ExpSoacOp {
   std::shared_ptr<Soac> soac;
 };
 
+struct ExpSegOp {
+  std::shared_ptr<SegOp> segop;
+};
+
 struct ExpSubExp {
   SubExp subExp;
 };
 
 struct Exp {
-  std::variant<ExpBasicOp, ExpApply, ExpSoacOp, ExpSubExp> v;
+  std::variant<ExpBasicOp, ExpApply, ExpSoacOp, ExpSegOp, ExpSubExp> v;
 };
 
 struct Stm {

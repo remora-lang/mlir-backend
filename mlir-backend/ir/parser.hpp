@@ -1,6 +1,7 @@
 #pragma once
 #include "error.hpp"
 #include "soac.hpp"
+#include "segop.hpp"
 #include "syntax.hpp"
 #include "FutharkParser.h"
 #include "FutharkLexer.h"
@@ -136,6 +137,8 @@ struct FutharkTranslationVisitor {
   Exp VisitExp(FutharkParser::PExpContext *ctx) {
     if (auto *pSoac = dynamic_cast<FutharkParser::ExpSoacOpContext *>(ctx))
       return {VisitExpSoacOp(pSoac)};
+    if (auto *pSegOp = dynamic_cast<FutharkParser::ExpSegOpContext *>(ctx))
+      return {VisitExpSegOp(pSegOp)};
     if (auto *pApply = dynamic_cast<FutharkParser::ExpApplyContext *>(ctx))
       return {VisitApply(pApply->pApply())};
     if (auto *pBasicOp = dynamic_cast<FutharkParser::ExpBasicOpContext *>(ctx))
@@ -211,14 +214,14 @@ struct FutharkTranslationVisitor {
     IntType intTy = IntType::Int8;
     FloatType floatTy = FloatType::Float16;
     if (width == 16) {
-      intTy == IntType::Int16;
+      intTy = IntType::Int16;
     }
     if (width == 32) {
-      intTy == IntType::Int32;
+      intTy = IntType::Int32;
       floatTy = FloatType::Float32;
     }
     if (width == 64) {
-      intTy == IntType::Int64;
+      intTy = IntType::Int64;
       floatTy = FloatType::Float64;
     }
 
@@ -229,6 +232,8 @@ struct FutharkTranslationVisitor {
       return {BinOpFAdd{floatTy}};
     if (name == "sub")
       return {BinOpSub{intTy}};
+    if (name == "sdiv_up")
+      return {BinOpSDivUp{intTy}};
     if (name == "fsub")
       return {BinOpFSub{floatTy}};
     if (name == "mul")
@@ -394,6 +399,63 @@ struct FutharkTranslationVisitor {
       reduce.neutral.push_back(VisitSubExp(subExp));
 
     return reduce;
+  }
+
+  Exp VisitExpSegOp(FutharkParser::ExpSegOpContext *ctx) {
+    auto segop = ctx->pSegOp();
+    if (auto *pSegMap = dynamic_cast<FutharkParser::SegMapContext *>(segop))
+      return {ExpSegOp{std::make_shared<SegOp>(VisitSegMap(pSegMap))}};
+    Unreachable();
+  }
+
+  SegOp VisitSegMap(FutharkParser::SegMapContext *ctx) {
+    SegMap segmap;
+
+    segmap.lvl = SegThread{};
+    segmap.space = VisitSegSpace(ctx->pSegSpace());
+    for (auto t : ctx->pTypes()->pType()) {
+      segmap.ret.push_back(VisitType(t));
+    }
+    segmap.body = VisitKernelBody(ctx->pKernelBody());
+
+    return {segmap};
+  }
+
+  KernelBody VisitKernelBody(FutharkParser::PKernelBodyContext *ctx) {
+    if (auto *pKernelBody = dynamic_cast<FutharkParser::KernelBodyContext *>(ctx))
+      return {VisitNormalKernelBody(pKernelBody)};
+    if (auto *pEmptyKernelBody = dynamic_cast<FutharkParser::EmptyKernelBodyContext *>(ctx))
+      return {VisitEmptyKernelBody(pEmptyKernelBody)};
+
+    Unreachable();
+  }
+
+  KernelBody VisitNormalKernelBody(FutharkParser::KernelBodyContext *ctx) {
+    KernelBody b;
+    for (auto stm : ctx->pStm())
+      b.stms.push_back(VisitStm(stm));
+    for (auto subExp : ctx->pSubExp())
+      b.result.push_back(KernelResult{VisitSubExp(subExp)});
+    return b;
+  }
+
+  KernelBody VisitEmptyKernelBody(FutharkParser::EmptyKernelBodyContext *ctx) {
+    KernelBody b;
+    for (auto subExp : ctx->pSubExp())
+      b.result.push_back(KernelResult{VisitSubExp(subExp)});
+    return b;
+  }
+
+  SegSpace VisitSegSpace(FutharkParser::PSegSpaceContext *ctx) {
+    SegSpace space;
+    size_t n = ctx->pSubExp().size();
+    for (size_t i = 0; i < n; i++) {
+      std::string name = ctx->ID()[i]->getText();
+      SubExp size = VisitSubExp(ctx->pSubExp()[i]);
+      space.dims.push_back(std::make_tuple(name, size));
+    }
+    space.flat_id = ctx->ID()[n]->getText();
+    return space;
   }
 
   SubExp VisitSubExp(FutharkParser::PSubExpContext *ctx) {

@@ -94,6 +94,10 @@ struct FutharkCompiler {
       return LowerSoac(val->soac, ctx);
     }
 
+    if (auto *val = std::get_if<ExpSegOp>(&exp.v)) {
+      return LowerSegOp(val->segop, ctx);
+    }
+
     if (auto *val = std::get_if<ExpApply>(&exp.v)) {
       auto func = GetFunction(prog, val->fname);
       auto llvmFunc = LowerFunction(func);
@@ -511,6 +515,57 @@ struct FutharkCompiler {
     return forOp.getResult(0);
   }
 
+  mlir::Value LowerSegOp(std::shared_ptr<SegOp> pSegOp, Ctx &ctx) {
+    if (auto *val = std::get_if<SegMap>(&pSegOp->v)) {
+      return LowerSegMap(*val, ctx);
+    }
+
+    Unreachable();
+  }
+
+  mlir::Value LowerSegMap(SegMap pSegMap, Ctx &ctx) {
+    // Find iteration space.
+    std::vector<mlir::Value> dims;
+    for (const auto& [id,dim] : pSegMap.space.dims) {
+      dims.push_back(LowerSubExp(dim, ctx));
+    }
+
+    if (pSegMap.ret.size() != 1) {
+      throw std::runtime_error("TODO: Multiple SegMap return types");
+    }
+
+    // Compute the dimensions of the return type
+    mlir::Type baseTy;
+    std::vector<int64_t> dimensions;
+    for (const auto& [id,dim] : pSegMap.space.dims) {
+      dimensions.push_back(dim.GetIntValue());
+    }
+
+    if (auto *val = std::get_if<TypeArray<Shape, NoUniqueness>>(&pSegMap.ret[0].t.v)) {
+      baseTy = LowerPrimType(val->elem);
+      for (auto d : val->shape.dims)
+        dimensions.push_back(d.GetIntValue());
+    }
+
+    else if (auto *val = std::get_if<TypePrim<Shape, NoUniqueness>>(&pSegMap.ret[0].t.v)) {
+      baseTy = LowerPrimType(val->t);
+    }
+
+    else {
+      throw std::runtime_error("Unsupported SegMap return type");
+    }
+
+    auto rvalueTy = mlir::RankedTensorType::get(dimensions, baseTy);
+
+    mlir::Value carry = mlir::tensor::EmptyOp::create(builder, rvalueTy, {});
+
+    auto idxTy = mlir::IntegerType::get(&context, 64);
+
+    auto getIdx = [this](unsigned long long x) { return mlir::arith::ConstantIndexOp::create(builder, x).getResult(); };
+
+    Unreachable();
+  }
+
   mlir::Value LowerPrimValue(PrimValue value, Ctx &ctx) {
     auto v = value.v;
     if (auto *val = std::get_if<IntValue>(&v)) {
@@ -547,6 +602,12 @@ struct FutharkCompiler {
       }
 
       return mlir::arith::MulIOp::create(builder, {op0, op1}).getResult();
+    }
+
+    if (auto *div = std::get_if<BinOpSDivUp>(&binOp.v)) {
+      assert(!isTensor);
+
+      return mlir::arith::CeilDivSIOp::create(builder, {op0, op1}).getResult();
     }
 
     if (auto *fadd = std::get_if<BinOpFAdd>(&binOp.v)) {

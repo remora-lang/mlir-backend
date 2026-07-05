@@ -30,7 +30,7 @@ struct VarSubExp {
 struct SubExp {
   std::variant<ConstantSubExp, VarSubExp> v;
 
-  int64_t GetIntValue() {
+  int64_t GetIntValue() const {
     auto constExp = std::get<ConstantSubExp>(v);
     auto iv = std::get<IntValue>(constExp.v.v);
     return GetValue(iv);
