@@ -3,9 +3,17 @@
 #include "error.hpp"
 #include "soac.hpp"
 #include "syntax.hpp"
+#include "segop.hpp"
+#include "debug.hpp"
 
 struct Ctx {
   std::unordered_map<std::string, mlir::Value> subexps;
+};
+
+struct AffineLoad {
+  VName boundName;
+  VName array;
+  // std::vector<int> dimToLoopDim;
 };
 
 struct FutharkCompiler {
@@ -562,6 +570,47 @@ struct FutharkCompiler {
     auto idxTy = mlir::IntegerType::get(&context, 64);
 
     auto getIdx = [this](unsigned long long x) { return mlir::arith::ConstantIndexOp::create(builder, x).getResult(); };
+
+    // Only handles affine indexing for now.
+    // TODO: check that all loads are affine
+    //   - array name bound outside the body
+    //   - index SubExp is a var name in ids (can support affine ops on it?)
+    // TODO: record affine loads
+    //   - names become an input to linalg generic
+    //   - build indexing_map using ids
+    // TODO: map load from array to block argument
+    //   - i.e., let-bound eta_p_... becomes the block argument
+    std::vector<std::string> ids;
+    for (const auto& [id,dim] : pSegMap.space.dims)
+      ids.push_back(id);
+
+    std::unordered_map<std::string, int> dimPosition;
+    for (int i = 0; i < ids.size(); i++)
+      dimPosition[ids[i]] = i;
+
+    std::vector<AffineLoad> loads;
+    for (const auto &stm : pSegMap.body.stms) {
+      if (auto basic = std::get_if<ExpBasicOp>(&stm.exp.v)) {
+        if (auto *idx = std::get_if<BasicOpFlatIndex>(&basic->op.v)) {
+          // TODO check every index expression is an id in the index space.
+          if (auto *array = std::get_if<VarSubExp>(&idx->base.v)) {
+            auto name = array->v;
+            PrintValue(array->v);
+          }
+        }
+      }
+      continue;
+    }
+
+
+    llvm::errs() << "\nLowerSegMap:\n";
+    PrintValue(dims);
+    PrintValue(ids);
+    PrintValue(dimensions);
+    PrintValue(baseTy);
+    PrintValue(rvalueTy);
+    PrintValue(carry);
+    PrintValue(idxTy);
 
     Unreachable();
   }

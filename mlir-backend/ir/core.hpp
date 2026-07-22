@@ -6,6 +6,10 @@ struct VName {
   int64_t tag = 0;
 };
 
+inline llvm::raw_ostream &operator<<(llvm::raw_ostream &os, const VName &v) {
+  return os << v.name << "_" << v.tag;
+}
+
 enum Commutativity {
   Noncommutative,
   Commutative,
