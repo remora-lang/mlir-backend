@@ -10,11 +10,27 @@ struct Ctx {
   std::unordered_map<std::string, mlir::Value> subexps;
 };
 
-struct AffineLoad {
+struct AffineRead {
   VName boundName;
   VName array;
-  // std::vector<int> dimToLoopDim;
+  std::vector<int> dimToLoopDim;
 };
+
+inline void PrintValue(const AffineRead &x) {
+  llvm::errs() << "AffineRead { " << x.boundName << ", " << x.array << ", ";
+  for (auto i : x.dimToLoopDim) {
+    llvm::errs() << "d" << i << " ";
+  }
+  llvm::errs() << "}\n";
+}
+
+template <typename T, typename F>
+auto map(const std::vector<T> &xs, F f) {
+    std::vector<decltype(f(xs[0]))> out;
+    out.reserve(xs.size());
+    for (const auto &x : xs) out.push_back(f(x));
+    return out;
+}
 
 struct FutharkCompiler {
   Prog &prog;
@@ -565,54 +581,93 @@ struct FutharkCompiler {
 
     auto rvalueTy = mlir::RankedTensorType::get(dimensions, baseTy);
 
-    mlir::Value carry = mlir::tensor::EmptyOp::create(builder, rvalueTy, {});
+    mlir::Value output = mlir::tensor::EmptyOp::create(builder, rvalueTy, {});
 
     auto idxTy = mlir::IntegerType::get(&context, 64);
 
     auto getIdx = [this](unsigned long long x) { return mlir::arith::ConstantIndexOp::create(builder, x).getResult(); };
 
     // Only handles affine indexing for now.
-    // TODO: check that all loads are affine
-    //   - array name bound outside the body
-    //   - index SubExp is a var name in ids (can support affine ops on it?)
-    // TODO: record affine loads
-    //   - names become an input to linalg generic
-    //   - build indexing_map using ids
-    // TODO: map load from array to block argument
-    //   - i.e., let-bound eta_p_... becomes the block argument
     std::vector<std::string> ids;
     for (const auto& [id,dim] : pSegMap.space.dims)
       ids.push_back(id);
+    // TODO ^ shouldn't segspace use VName instead of string? (i know the string includes the tag and the tag is always 0)
 
     std::unordered_map<std::string, int> dimPosition;
     for (int i = 0; i < ids.size(); i++)
       dimPosition[ids[i]] = i;
 
-    std::vector<AffineLoad> loads;
+    std::vector<AffineRead> reads;
     for (const auto &stm : pSegMap.body.stms) {
+      // TODO support let-bindings with more than one name.
+      assert(stm.pat.elems.size() == 1);
+      VName vnBound = stm.pat.elems[0].name;
+
       if (auto basic = std::get_if<ExpBasicOp>(&stm.exp.v)) {
         if (auto *idx = std::get_if<BasicOpFlatIndex>(&basic->op.v)) {
-          // TODO check every index expression is an id in the index space.
-          if (auto *array = std::get_if<VarSubExp>(&idx->base.v)) {
-            auto name = array->v;
-            PrintValue(array->v);
+          auto *array = std::get_if<VarSubExp>(&idx->base.v);
+          if (!array) {
+            throw std::runtime_error("TODO: non-VName array");
           }
+          VName vnArray = array->v;
+
+          if (idx->operands.size() != 1) {
+            throw std::runtime_error("TODO: support multiple indices (fix BasicOpFlatIndex TODOs first)");
+          }
+          auto *dim = std::get_if<VarSubExp>(&idx->operands[0].v);
+          if (!dim) {
+            throw std::runtime_error("TODO: non-VName index");
+          }
+          VName vnDim = dim->v;
+          auto pos = dimPosition.find(vnDim.name);
+          if (pos == dimPosition.end()) {
+            throw std::runtime_error("TODO: support affine indexing with things other than just seg space ids?");
+          }
+          auto i = pos->second;
+          reads.push_back({vnBound, vnArray, {i}});
         }
       }
       continue;
     }
 
+    // TODO: map affine loads to block arguments
+    //   - array names become inputs to linalg generic
+    //   - build indexing_map using ids
+    //   - let-bound names becomes the block arguments
+    //
+    auto rank = pSegMap.space.dims.size();
+    mlir::SmallVector<mlir::AffineMap> indexingMaps;
+    for (auto read : reads) {
+      std::vector<mlir::AffineExpr> usedDims;
+      for (auto i : read.dimToLoopDim) {
+        usedDims.push_back(mlir::getAffineDimExpr(i, &context));
+      }
+      // e.g., we have a 3D segmap and this input is indexed by the second dimension only:
+      //   (d0,d1,d2) -> (d1)
+      indexingMaps.push_back(mlir::AffineMap::get(rank, 0, usedDims, &context));
+    }
 
-    llvm::errs() << "\nLowerSegMap:\n";
-    PrintValue(dims);
-    PrintValue(ids);
-    PrintValue(dimensions);
-    PrintValue(baseTy);
-    PrintValue(rvalueTy);
-    PrintValue(carry);
-    PrintValue(idxTy);
+    auto op = mlir::linalg::GenericOp::create(
+      builder,
+      mlir::TypeRange{rvalueTy},
+      mlir::ValueRange{/* input arrays TODO */},
+      mlir::ValueRange{output},
+      indexingMaps,
+      map(dims, [](auto){ return mlir::utils::IteratorType::parallel; }),
+      [&](mlir::OpBuilder &b, mlir::Location loc, mlir::ValueRange args) {
+          // args are one scalar per input
+          // TODO map AffineRead.array -> arg names?
+          auto results = args; // TODO lower body without affine reads in `reads` (these should now be in args).
+          mlir::linalg::YieldOp::create(b, loc, results);
+      }
+      );
 
-    Unreachable();
+    llvm::errs() << "\nLowerSegMap\n===========\n";
+    Print("reads: "); PrintValue(reads);
+    Print("indexing map: "); PrintValue(indexingMaps[0]);
+    Print("output tensor: "); PrintValue(output);
+
+    Undefined();
   }
 
   mlir::Value LowerPrimValue(PrimValue value, Ctx &ctx) {

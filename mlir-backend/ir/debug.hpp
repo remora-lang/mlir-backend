@@ -3,6 +3,10 @@
 
 #include <vector>
 
+inline void Print(std::string msg) {
+  llvm::errs() << msg;
+}
+
 inline void PrintValue(mlir::Value value) {
   mlir::OpPrintingFlags flags;
   flags.assumeVerified();
