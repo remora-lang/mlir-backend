@@ -5,6 +5,7 @@
 #include "syntax.hpp"
 #include "segop.hpp"
 #include "debug.hpp"
+#include <ranges>
 
 struct Ctx {
   std::unordered_map<std::string, mlir::Value> subexps;
@@ -16,12 +17,13 @@ struct AffineRead {
   std::vector<int> dimToLoopDim;
 };
 
-inline void PrintValue(const AffineRead &x) {
-  llvm::errs() << "AffineRead { " << x.boundName << ", " << x.array << ", ";
+inline llvm::raw_ostream &operator<<(llvm::raw_ostream &os, const AffineRead &x) {
+  os << "AffineRead { " << x.boundName << ", " << x.array << ", ";
   for (auto i : x.dimToLoopDim) {
-    llvm::errs() << "d" << i << " ";
+    os << "d" << i << " ";
   }
-  llvm::errs() << "}\n";
+  os << "}\n";
+  return os;
 }
 
 template <typename T, typename F>
@@ -547,13 +549,14 @@ struct FutharkCompiler {
     Unreachable();
   }
 
-  mlir::Value LowerSegMap(SegMap pSegMap, Ctx &ctx) {
+  mlir::Value LowerSegMap(SegMap pSegMap, Ctx& ctx) {
     // Find iteration space.
     std::vector<mlir::Value> dims;
     for (const auto& [id,dim] : pSegMap.space.dims) {
       dims.push_back(LowerSubExp(dim, ctx));
     }
 
+    // TODO the rest of this function assumes a single result and that dims are static.
     if (pSegMap.ret.size() != 1) {
       throw std::runtime_error("TODO: Multiple SegMap return types");
     }
@@ -562,13 +565,20 @@ struct FutharkCompiler {
     mlir::Type baseTy;
     std::vector<int64_t> dimensions;
     for (const auto& [id,dim] : pSegMap.space.dims) {
+      if (!std::get_if<ConstantSubExp>(&dim.v))
+        throw std::runtime_error("TODO: dynamic SegMap dimension not yet supported");
       dimensions.push_back(dim.GetIntValue());
     }
 
     if (auto *val = std::get_if<TypeArray<Shape, NoUniqueness>>(&pSegMap.ret[0].t.v)) {
+      throw std::runtime_error("TODO: array return type from SegMap not yet supported");
+
       baseTy = LowerPrimType(val->elem);
-      for (auto d : val->shape.dims)
+      for (auto d : val->shape.dims) {
+        if (!std::get_if<ConstantSubExp>(&d.v))
+          throw std::runtime_error("TODO: dynamic return size not yet supported");
         dimensions.push_back(d.GetIntValue());
+      }
     }
 
     else if (auto *val = std::get_if<TypePrim<Shape, NoUniqueness>>(&pSegMap.ret[0].t.v)) {
@@ -597,24 +607,23 @@ struct FutharkCompiler {
     for (int i = 0; i < ids.size(); i++)
       dimPosition[ids[i]] = i;
 
+    // Extract reads of the map's input arrays.
     std::vector<AffineRead> reads;
-    for (const auto &stm : pSegMap.body.stms) {
-      // TODO support let-bindings with more than one name.
-      assert(stm.pat.elems.size() == 1);
+    for (const auto& stm : pSegMap.body.stms) {
+      if (stm.pat.elems.size() != 1)
+        throw std::runtime_error("Only let-bindings with one name are suppported.");
       VName vnBound = stm.pat.elems[0].name;
 
       if (auto basic = std::get_if<ExpBasicOp>(&stm.exp.v)) {
-        if (auto *idx = std::get_if<BasicOpFlatIndex>(&basic->op.v)) {
-          auto *array = std::get_if<VarSubExp>(&idx->base.v);
-          if (!array) {
+        if (auto* idx = std::get_if<BasicOpFlatIndex>(&basic->op.v)) {
+          auto* array = std::get_if<VarSubExp>(&idx->base.v);
+          if (!array)
             throw std::runtime_error("TODO: non-VName array");
-          }
           VName vnArray = array->v;
 
-          if (idx->operands.size() != 1) {
+          if (idx->operands.size() != 1)
             throw std::runtime_error("TODO: support multiple indices (fix BasicOpFlatIndex TODOs first)");
-          }
-          auto *dim = std::get_if<VarSubExp>(&idx->operands[0].v);
+          auto* dim = std::get_if<VarSubExp>(&idx->operands[0].v);
           if (!dim) {
             throw std::runtime_error("TODO: non-VName index");
           }
@@ -635,39 +644,71 @@ struct FutharkCompiler {
     //   - build indexing_map using ids
     //   - let-bound names becomes the block arguments
     //
-    auto rank = pSegMap.space.dims.size();
+    auto rank = dimensions.size();
     mlir::SmallVector<mlir::AffineMap> indexingMaps;
-    for (auto read : reads) {
+    for (const auto& read : reads) {
       std::vector<mlir::AffineExpr> usedDims;
-      for (auto i : read.dimToLoopDim) {
+      for (auto i : read.dimToLoopDim)
         usedDims.push_back(mlir::getAffineDimExpr(i, &context));
-      }
       // e.g., we have a 3D segmap and this input is indexed by the second dimension only:
       //   (d0,d1,d2) -> (d1)
       indexingMaps.push_back(mlir::AffineMap::get(rank, 0, usedDims, &context));
     }
 
+    // Describe how the input dimensions are mapped to the output's dimensions.
+    indexingMaps.push_back(mlir::AffineMap::getMultiDimIdentityMap(rank, &context));
+
+    mlir::SmallVector<mlir::Value> inputs;
+    for (auto& read : reads)
+      inputs.push_back(ctx.subexps[read.array.name]);
+
+    std::unordered_set<std::string> skip;
+    for (auto& read : reads) skip.insert(read.boundName.name);
+
     auto op = mlir::linalg::GenericOp::create(
       builder,
       mlir::TypeRange{rvalueTy},
-      mlir::ValueRange{/* input arrays TODO */},
+      inputs,
       mlir::ValueRange{output},
       indexingMaps,
-      map(dims, [](auto){ return mlir::utils::IteratorType::parallel; }),
-      [&](mlir::OpBuilder &b, mlir::Location loc, mlir::ValueRange args) {
-          // args are one scalar per input
-          // TODO map AffineRead.array -> arg names?
-          auto results = args; // TODO lower body without affine reads in `reads` (these should now be in args).
+      map(dimensions, [](auto){ return mlir::utils::IteratorType::parallel; }),
+      [&](mlir::OpBuilder& b, mlir::Location loc, mlir::ValueRange args) {
+          // Extend the context locally.
+          Ctx local = ctx;
+          for (auto i = 0; i < reads.size(); i++) {
+            local.subexps[reads[i].boundName.name] = args[i];
+          }
+          // Move the insertion point for the compiler's builder (LowerStm etc).
+          auto before = builder.saveInsertionPoint();
+          builder.setInsertionPointToStart(b.getInsertionBlock());
+
+          // Lower the body, skipping the reads which are now block arguments.
+          for (Stm& stm : pSegMap.body.stms) {
+            assert(stm.pat.elems.size() == 1);
+            if (skip.contains(stm.pat.elems[0].name.name)) continue;
+            LowerStm(stm, local);
+          }
+
+          mlir::SmallVector<mlir::Value> results;
+          for (auto& r : pSegMap.body.result)
+            results.push_back(LowerSubExp(r.result, local));
+
+          builder.restoreInsertionPoint(before);
+
           mlir::linalg::YieldOp::create(b, loc, results);
       }
       );
 
-    llvm::errs() << "\nLowerSegMap\n===========\n";
+    Print("\nLowerSegMap\n===========\n");
     Print("reads: "); PrintValue(reads);
-    Print("indexing map: "); PrintValue(indexingMaps[0]);
+    Print("indexing maps:\n");
+    for (auto m : indexingMaps) { Print("  "); PrintValue(m); };
+    Print("input tensors: "); PrintValue(inputs);
     Print("output tensor: "); PrintValue(output);
+    Print("mlir:\n"); PrintValue(op);
+    Print("\n===========\n");
 
-    Undefined();
+    return op.getResult(0);
   }
 
   mlir::Value LowerPrimValue(PrimValue value, Ctx &ctx) {

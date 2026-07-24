@@ -54,9 +54,9 @@
       ln -sf build/compile_commands.json compile_commands.json
     '';
 
-    run = pkgs.writeShellScriptBin "run" ''
+    compile = pkgs.writeShellScriptBin "compile" ''
       set -euo pipefail
-      build
+      build >&2
       exec ./build/mlir-backend/mlir-backend "$@"
     '';
 
@@ -82,7 +82,7 @@
         openjdk
         clang
         build
-        run
+        compile
         clean
       ];
     };

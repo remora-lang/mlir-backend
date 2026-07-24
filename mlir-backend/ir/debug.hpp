@@ -22,3 +22,8 @@ template <typename T> inline void PrintValue(const std::vector<T> &values) {
   for (const auto &value : values)
     PrintValue(value);
 }
+
+template <typename T> inline void PrintValue(const mlir::SmallVector<T> &values) {
+  for (const auto &value : values)
+    PrintValue(value);
+}
