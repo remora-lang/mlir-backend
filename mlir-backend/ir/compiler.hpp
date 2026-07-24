@@ -639,19 +639,12 @@ struct FutharkCompiler {
       continue;
     }
 
-    // TODO: map affine loads to block arguments
-    //   - array names become inputs to linalg generic
-    //   - build indexing_map using ids
-    //   - let-bound names becomes the block arguments
-    //
     auto rank = dimensions.size();
     mlir::SmallVector<mlir::AffineMap> indexingMaps;
     for (const auto& read : reads) {
       std::vector<mlir::AffineExpr> usedDims;
       for (auto i : read.dimToLoopDim)
         usedDims.push_back(mlir::getAffineDimExpr(i, &context));
-      // e.g., we have a 3D segmap and this input is indexed by the second dimension only:
-      //   (d0,d1,d2) -> (d1)
       indexingMaps.push_back(mlir::AffineMap::get(rank, 0, usedDims, &context));
     }
 
