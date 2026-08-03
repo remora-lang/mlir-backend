@@ -7,10 +7,13 @@
 
   outputs = { self, nixpkgs }:
   let
-    system = "x86_64-linux";
-    pkgs = import nixpkgs { inherit system; };
+    systems = [ "x86_64-linux" "aarch64-darwin" ];
+    forAllSystems = f: nixpkgs.lib.genAttrs systems (system:
+      f (import nixpkgs { inherit system; }));
 
-    mlir-backend = pkgs.stdenv.mkDerivation {
+    perSystem = pkgs:
+    let
+      mlir-backend = pkgs.stdenv.mkDerivation {
       pname = "futhark-mlir-backend";
       version = "dev";
 
@@ -70,21 +73,29 @@
         --query-driver='**' "$@"
     '';
 
-  in {
-    packages.${system}.default = mlir-backend;
+    in {
+      package = mlir-backend;
 
-    devShells.${system}.default = pkgs.mkShell {
-      inputsFrom = [ mlir-backend ];
+      devShell = pkgs.mkShell {
+        inputsFrom = [ mlir-backend ];
 
-      packages = with pkgs; [
-        clangd
-        antlr4
-        openjdk
-        clang
-        build
-        compile
-        clean
-      ];
+        packages = with pkgs; [
+          clangd
+          antlr4
+          openjdk
+          build
+          compile
+          clean
+        ] ++ pkgs.lib.optionals (!pkgs.stdenv.isDarwin) [
+          # Linux stdenv is gcc-based, so add clang for an LLVM toolchain.
+          # On Darwin the stdenv is already clang-based; a second clang here
+          # is redundant and can clash with the stdenv/llvmPackages_22 clang.
+          clang
+        ];
+      };
     };
+  in {
+    packages = forAllSystems (pkgs: { default = (perSystem pkgs).package; });
+    devShells = forAllSystems (pkgs: { default = (perSystem pkgs).devShell; });
   };
 }
