@@ -6,6 +6,7 @@
 #include "segop.hpp"
 #include "debug.hpp"
 #include <ranges>
+#include <variant>
 
 struct Ctx {
   std::unordered_map<std::string, mlir::Value> subexps;
@@ -567,6 +568,7 @@ struct FutharkCompiler {
     for (const auto& [id,dim] : pSegMap.space.dims) {
       if (!std::get_if<ConstantSubExp>(&dim.v))
         throw std::runtime_error("TODO: dynamic SegMap dimension not yet supported");
+      //TODO remember to map kDynamics to shape variable names
       dimensions.push_back(dim.GetIntValue());
     }
 
@@ -833,7 +835,12 @@ struct FutharkCompiler {
     auto baseType = LowerPrimType(typeArray.elem);
     std::vector<int64_t> dims;
     for (auto d : typeArray.shape.dims) {
-      dims.push_back(d.GetIntValue());
+      if (std::holds_alternative<ConstantSubExp>(d.v))
+        dims.push_back(d.GetIntValue());
+      if (std::holds_alternative<VarSubExp>(d.v))
+        dims.push_back(mlir::ShapedType::kDynamic);
+      else
+        Unreachable();
     }
 
     return mlir::RankedTensorType::get(dims, baseType);
