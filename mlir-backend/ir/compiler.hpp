@@ -708,13 +708,14 @@ struct FutharkCompiler {
     auto v = value.v;
     if (auto *val = std::get_if<IntValue>(&v)) {
       auto t = builder.getIntegerType(GetWidth(*val));
-      return mlir::arith::ConstantOp::create(builder, builder.getUnknownLoc(),
+      return mlir::arith::ConstantOp::create(builder,
                                              builder.getIntegerAttr(t, GetValue(*val)));
     }
 
     if (auto *val = std::get_if<FloatValue>(&v)) {
       auto t = GetFloatType(builder, GetWidth(*val));
-      return mlir::arith::ConstantOp::create(builder, builder.getFloatAttr(t, GetValue(*val)));
+      return mlir::arith::ConstantOp::create(builder,
+                                             builder.getFloatAttr(t, GetValue(*val)));
     }
 
     Unreachable();
