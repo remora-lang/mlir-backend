@@ -14,16 +14,16 @@ inline void PrintValue(mlir::Value value) {
   llvm::errs() << "\n";
 }
 
-template <typename T> inline void PrintValue(const T &value) {
+template <typename T> inline void PrintValue(const T& value) {
   llvm::errs() << value << "\n";
 }
 
-template <typename T> inline void PrintValue(const std::vector<T> &values) {
+template <typename T> inline void PrintValue(const std::vector<T>& values) {
   for (const auto &value : values)
     PrintValue(value);
 }
 
-template <typename T> inline void PrintValue(const mlir::SmallVector<T> &values) {
+template <typename T> inline void PrintValue(const mlir::SmallVector<T>& values) {
   for (const auto &value : values)
     PrintValue(value);
 }
