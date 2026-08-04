@@ -1,5 +1,6 @@
 #pragma once
 #include "primitive.hpp"
+#include "match.hpp"
 
 struct VName {
   std::string name;
@@ -25,6 +26,8 @@ template <typename D> struct ShapeBase {
 
 struct ConstantSubExp {
   PrimValue v;
+
+  int64_t GetIntValue() const { return v.GetIntValue(); }
 };
 
 struct VarSubExp {
@@ -35,9 +38,12 @@ struct SubExp {
   std::variant<ConstantSubExp, VarSubExp> v;
 
   int64_t GetIntValue() const {
-    auto constExp = std::get<ConstantSubExp>(v);
-    auto iv = std::get<IntValue>(constExp.v.v);
-    return GetValue(iv);
+    return match(v,
+      [&](const ConstantSubExp& c) { return c.GetIntValue(); },
+      [](const VarSubExp& x) -> int64_t {
+        throw std::runtime_error("GetIntValue on non-constant SubExp");
+      }
+    );
   }
 };
 

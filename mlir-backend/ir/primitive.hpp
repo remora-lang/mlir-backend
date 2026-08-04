@@ -1,5 +1,6 @@
 #pragma once
 #include <variant>
+#include "match.hpp"
 
 enum IntType {
   Int8 = 8,
@@ -235,6 +236,17 @@ struct PrimValue {
     if (width == 32)
       return {IntValue::CreateInt32(value)};
     return {IntValue::CreateInt64(value)};
+  }
+
+  int64_t GetIntValue() const {
+    return match(v,
+      [&](const IntValue& c) {
+        return GetValue(c);
+      },
+      [](const auto&) -> uint64_t {
+        throw std::runtime_error("GetIntValue on non-integer PrimValue");
+      }
+    );
   }
 };
 

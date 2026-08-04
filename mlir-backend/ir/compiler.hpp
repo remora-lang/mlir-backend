@@ -5,6 +5,7 @@
 #include "syntax.hpp"
 #include "segop.hpp"
 #include "debug.hpp"
+#include "match.hpp"
 #include <ranges>
 #include <variant>
 
@@ -33,6 +34,20 @@ auto map(const std::vector<T> &xs, F f) {
     out.reserve(xs.size());
     for (const auto &x : xs) out.push_back(f(x));
     return out;
+}
+
+template <std::ranges::range R>
+  requires std::same_as<std::ranges::range_value_t<R>, SubExp>
+inline std::vector<int64_t> dimsToType(const R& dims) {
+    std::vector<int64_t> dimsTy;
+    for (auto& d : dims) {
+      dimsTy.push_back(match(d.v,
+        [&](const ConstantSubExp& c) { return c.GetIntValue(); },
+        [&](const VarSubExp& _) { return mlir::ShapedType::kDynamic; }
+      ));
+    }
+
+    return dimsTy;
 }
 
 struct FutharkCompiler {
@@ -551,77 +566,57 @@ struct FutharkCompiler {
   }
 
   mlir::Value LowerSegMap(SegMap pSegMap, Ctx& ctx) {
+    // TODO the rest of this function assumes a single result.
+    if (pSegMap.ret.size() != 1) {
+      throw std::runtime_error("SegMap has multiple returns");
+    }
+
+    // Compute the (outer) dimensions of the return type
+    mlir::Type baseTy = match(pSegMap.ret[0].t.v,
+      [&](const TypePrim<Shape, NoUniqueness>& val) {
+        return LowerPrimType(val.t);
+      },
+      [&](const TypeArray<Shape, NoUniqueness>& val) -> mlir::Type {
+        throw std::runtime_error("array return type from SegMap not yet supported");
+      },
+      [](const auto&) -> mlir::Type {
+        throw std::runtime_error("Unsupported SegMap return type");
+      }
+    );
+
+    std::vector<int64_t> dimsTy = dimsToType(std::views::values(pSegMap.space.dims));
+    auto rvalueTy = mlir::RankedTensorType::get(dimsTy, baseTy);
+
+    mlir::Value output = mlir::tensor::EmptyOp::create(builder, rvalueTy, {});
+
     // Find iteration space.
     std::vector<mlir::Value> dims;
     for (const auto& [id,dim] : pSegMap.space.dims) {
       dims.push_back(LowerSubExp(dim, ctx));
     }
 
-    // TODO the rest of this function assumes a single result and that dims are static.
-    if (pSegMap.ret.size() != 1) {
-      throw std::runtime_error("TODO: Multiple SegMap return types");
-    }
-
-    // Compute the dimensions of the return type
-    mlir::Type baseTy;
-    std::vector<int64_t> dimensions;
-    for (const auto& [id,dim] : pSegMap.space.dims) {
-      if (!std::get_if<ConstantSubExp>(&dim.v))
-        throw std::runtime_error("TODO: dynamic SegMap dimension not yet supported");
-      //TODO remember to map kDynamics to shape variable names
-      dimensions.push_back(dim.GetIntValue());
-    }
-
-    if (auto *val = std::get_if<TypeArray<Shape, NoUniqueness>>(&pSegMap.ret[0].t.v)) {
-      throw std::runtime_error("TODO: array return type from SegMap not yet supported");
-
-      baseTy = LowerPrimType(val->elem);
-      for (auto d : val->shape.dims) {
-        if (!std::get_if<ConstantSubExp>(&d.v))
-          throw std::runtime_error("TODO: dynamic return size not yet supported");
-        dimensions.push_back(d.GetIntValue());
-      }
-    }
-
-    else if (auto *val = std::get_if<TypePrim<Shape, NoUniqueness>>(&pSegMap.ret[0].t.v)) {
-      baseTy = LowerPrimType(val->t);
-    }
-
-    else {
-      throw std::runtime_error("Unsupported SegMap return type");
-    }
-
-    auto rvalueTy = mlir::RankedTensorType::get(dimensions, baseTy);
-
-    mlir::Value output = mlir::tensor::EmptyOp::create(builder, rvalueTy, {});
-
-    auto idxTy = mlir::IntegerType::get(&context, 64);
-
-    auto getIdx = [this](unsigned long long x) { return mlir::arith::ConstantIndexOp::create(builder, x).getResult(); };
-
     // Only handles affine indexing for now.
     std::vector<std::string> ids;
     for (const auto& [id,dim] : pSegMap.space.dims)
       ids.push_back(id);
-    // TODO ^ shouldn't segspace use VName instead of string? (i know the string includes the tag and the tag is always 0)
 
     std::unordered_map<std::string, int> dimPosition;
     for (int i = 0; i < ids.size(); i++)
       dimPosition[ids[i]] = i;
 
-    // Extract reads of the map's input arrays.
+    // Extract reads of the map's input arrays from the kernel body.
     std::vector<AffineRead> reads;
     for (const auto& stm : pSegMap.body.stms) {
       if (stm.pat.elems.size() != 1)
         throw std::runtime_error("Only let-bindings with one name are suppported.");
-      VName vnBound = stm.pat.elems[0].name;
+      auto vnBound = stm.pat.elems[0].name;
 
-      if (auto basic = std::get_if<ExpBasicOp>(&stm.exp.v)) {
-        if (auto* idx = std::get_if<BasicOpFlatIndex>(&basic->op.v)) {
+      if (auto e = std::get_if<ExpBasicOp>(&stm.exp.v)) {
+        if (auto* idx = std::get_if<BasicOpFlatIndex>(&e->op.v)) {
           auto* array = std::get_if<VarSubExp>(&idx->base.v);
           if (!array)
             throw std::runtime_error("TODO: non-VName array");
-          VName vnArray = array->v;
+          auto vnArray = array->v;
 
           if (idx->operands.size() != 1)
             throw std::runtime_error("TODO: support multiple indices (fix BasicOpFlatIndex TODOs first)");
@@ -629,7 +624,7 @@ struct FutharkCompiler {
           if (!dim) {
             throw std::runtime_error("TODO: non-VName index");
           }
-          VName vnDim = dim->v;
+          auto vnDim = dim->v;
           auto pos = dimPosition.find(vnDim.name);
           if (pos == dimPosition.end()) {
             throw std::runtime_error("TODO: support affine indexing with things other than just seg space ids?");
@@ -641,7 +636,7 @@ struct FutharkCompiler {
       continue;
     }
 
-    auto rank = dimensions.size();
+    auto rank = dimsTy.size();
     mlir::SmallVector<mlir::AffineMap> indexingMaps;
     for (const auto& read : reads) {
       std::vector<mlir::AffineExpr> usedDims;
@@ -666,7 +661,7 @@ struct FutharkCompiler {
       inputs,
       mlir::ValueRange{output},
       indexingMaps,
-      map(dimensions, [](auto){ return mlir::utils::IteratorType::parallel; }),
+      map(dimsTy, [](auto){ return mlir::utils::IteratorType::parallel; }),
       [&](mlir::OpBuilder& b, mlir::Location loc, mlir::ValueRange args) {
           // Extend the context locally.
           Ctx local = ctx;
@@ -832,18 +827,8 @@ struct FutharkCompiler {
   mlir::Type LowerPrimTypeBool(PrimTypeBool primTypeBool) { return builder.getIntegerType(1); }
 
   mlir::Type LowerTypeArray(TypeArray<Shape, NoUniqueness> typeArray) {
-    auto baseType = LowerPrimType(typeArray.elem);
-    std::vector<int64_t> dims;
-    for (auto d : typeArray.shape.dims) {
-      if (std::holds_alternative<ConstantSubExp>(d.v))
-        dims.push_back(d.GetIntValue());
-      else if (std::holds_alternative<VarSubExp>(d.v))
-        dims.push_back(mlir::ShapedType::kDynamic);
-      else
-        Unreachable();
-    }
-
-    return mlir::RankedTensorType::get(dims, baseType);
+    return mlir::RankedTensorType::get(dimsToType(typeArray.shape.dims),
+                                       LowerPrimType(typeArray.elem));
   }
 
   static mlir::Type GetFloatType(mlir::Builder &builder, uint64_t width) {
