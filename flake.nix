@@ -86,6 +86,7 @@
           build
           compile
           clean
+          llvmPackages_22.lldb
         ] ++ pkgs.lib.optionals (!pkgs.stdenv.isDarwin) [
           # Linux stdenv is gcc-based, so add clang for an LLVM toolchain.
           # On Darwin the stdenv is already clang-based; a second clang here
