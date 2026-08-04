@@ -837,7 +837,7 @@ struct FutharkCompiler {
     for (auto d : typeArray.shape.dims) {
       if (std::holds_alternative<ConstantSubExp>(d.v))
         dims.push_back(d.GetIntValue());
-      if (std::holds_alternative<VarSubExp>(d.v))
+      else if (std::holds_alternative<VarSubExp>(d.v))
         dims.push_back(mlir::ShapedType::kDynamic);
       else
         Unreachable();
