@@ -6,11 +6,29 @@
 #include "segop.hpp"
 #include "debug.hpp"
 #include "match.hpp"
+#include <format>
 #include <ranges>
 #include <variant>
 
+template<typename K, typename V>
+class Env {
+  std::unordered_map<K, V> env;
+
+  public:
+    void insert(const K& name, V v) {
+      env.insert_or_assign(name, v);
+    }
+
+    V lookup(const K& name) const {
+      auto v = env.find(name);
+      if (v == env.end())
+        throw std::runtime_error(std::format("env lookup: unbound variable '{}'", name));
+      return v->second;
+    }
+};
+
 struct Ctx {
-  std::unordered_map<std::string, mlir::Value> subexps;
+  Env<std::string, mlir::Value> subexps;
 };
 
 struct AffineRead {
@@ -100,7 +118,7 @@ struct FutharkCompiler {
     builder.setInsertionPointToStart(entry);
 
     for (auto i = 0; i < fun.params.size(); i++) {
-      ctx.subexps[fun.params[i].name] = func.getArgument(i);
+      ctx.subexps.insert(fun.params[i].name, func.getArgument(i));
     }
 
     auto retValue = LowerBody(fun.body, ctx);
@@ -120,7 +138,7 @@ struct FutharkCompiler {
   void LowerStm(Stm stm, Ctx &ctx) {
     auto v = LowerExp(stm.exp, ctx);
     assert(stm.pat.elems.size() == 1);
-    ctx.subexps[stm.pat.elems[0].name.name] = v;
+    ctx.subexps.insert(stm.pat.elems[0].name.name, v);
   }
 
   mlir::Value LowerExp(Exp exp, Ctx &ctx) {
@@ -313,7 +331,7 @@ struct FutharkCompiler {
 
   mlir::Value LowerSubExp(SubExp subExp, Ctx &ctx) {
     if (auto *val = std::get_if<VarSubExp>(&subExp.v)) {
-      return ctx.subexps[val->v.name];
+      return ctx.subexps.lookup(val->v.name);
     }
 
     if (auto *val = std::get_if<ConstantSubExp>(&subExp.v)) {
@@ -323,7 +341,9 @@ struct FutharkCompiler {
     Unreachable();
   }
 
-  mlir::Value LowerSubExp(std::string vname, Ctx &ctx) { return ctx.subexps[vname]; }
+  mlir::Value LowerSubExp(std::string vname, Ctx &ctx) {
+    return ctx.subexps.lookup(vname);
+  }
 
   mlir::Value LowerSoac(std::shared_ptr<Soac> pSoac, Ctx &ctx) {
     if (auto *val = std::get_if<SoacScrema>(&pSoac->v)) {
@@ -398,7 +418,7 @@ struct FutharkCompiler {
 
     Ctx scremaCtx = ctx;
     for (auto varIdx = 0; varIdx < screma.form.scremaLambda.params.size(); varIdx++) {
-      auto value = ctx.subexps[screma.arrs[varIdx].name];
+      auto value = scremaCtx.subexps.lookup(screma.arrs[varIdx].name);
 
       auto t = value.getType();
 
@@ -457,7 +477,7 @@ struct FutharkCompiler {
         slice = reshaped;
       }
 
-      scremaCtx.subexps[screma.form.scremaLambda.params[varIdx].name] = slice;
+      scremaCtx.subexps.insert(screma.form.scremaLambda.params[varIdx].name, slice);
     }
 
     auto execution = LowerBody(screma.form.scremaLambda.body, scremaCtx);
@@ -545,9 +565,9 @@ struct FutharkCompiler {
     auto zero = getIdx(0);
     auto one = getIdx(1);
 
-    scremaCtx.subexps[red.lambda.params[0].name] = carry;
+    scremaCtx.subexps.insert(red.lambda.params[0].name, carry);
     auto slice = mlir::tensor::ExtractOp::create(builder, src, indVar);
-    scremaCtx.subexps[red.lambda.params[1].name] = slice;
+    scremaCtx.subexps.insert(red.lambda.params[1].name, slice);
 
     auto execution = LowerBody(red.lambda.body, scremaCtx);
 
@@ -640,7 +660,7 @@ struct FutharkCompiler {
 
     mlir::SmallVector<mlir::Value> inputs;
     for (auto& read : reads)
-      inputs.push_back(ctx.subexps[read.array.name]);
+      inputs.push_back(ctx.subexps.lookup(read.array.name));
 
     // Used to skip reads of the input arrays when lowering the body.
     std::unordered_set<std::string> skip;
@@ -659,7 +679,7 @@ struct FutharkCompiler {
           // Extend the context locally.
           Ctx local = ctx;
           for (auto i = 0; i < reads.size(); i++) {
-            local.subexps[reads[i].boundName.name] = args[i];
+            local.subexps.insert(reads[i].boundName.name, args[i]);
           }
           // Move the insertion point for the compiler's builder (LowerStm etc).
           auto before = builder.saveInsertionPoint();
