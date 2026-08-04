@@ -582,13 +582,13 @@ struct FutharkCompiler {
       return LowerSegMap(*val, ctx);
     }
 
-    Unreachable();
+    Undefined();
   }
 
   mlir::Value LowerSegMap(SegMap pSegMap, Ctx& ctx) {
     // TODO the rest of this function assumes a single result.
     if (pSegMap.ret.size() != 1) {
-      throw std::runtime_error("SegMap has multiple returns");
+      Undefined();
     }
 
     // Compute the (outer) dimensions of the return type
@@ -597,11 +597,9 @@ struct FutharkCompiler {
         return LowerPrimType(val.t);
       },
       [&](const TypeArray<Shape, NoUniqueness>& val) -> mlir::Type {
-        throw std::runtime_error("array return type from SegMap not yet supported");
+        Undefined();
       },
-      [](const auto&) -> mlir::Type {
-        throw std::runtime_error("Unsupported SegMap return type");
-      }
+      [](const auto&) -> mlir::Type { Undefined(); }
     );
     auto dimsTy = dimsToType(std::views::values(pSegMap.space.dims));
     auto rvalueTy = mlir::RankedTensorType::get(dimsTy, baseTy);
