@@ -1,6 +1,6 @@
 #pragma once
-#include <variant>
 #include "match.hpp"
+#include <variant>
 
 enum IntType {
   Int8 = 8,
@@ -239,14 +239,12 @@ struct PrimValue {
   }
 
   int64_t GetIntValue() const {
-    return match(v,
-      [&](const IntValue& c) {
-        return GetValue(c);
-      },
-      [](const auto&) -> uint64_t {
-        throw std::runtime_error("GetIntValue on non-integer PrimValue");
-      }
-    );
+    return match(
+        v,
+        [&](const IntValue &c) { return GetValue(c); },
+        [](const auto &) -> uint64_t {
+          throw std::runtime_error("GetIntValue on non-integer PrimValue");
+        });
   }
 };
 
@@ -289,7 +287,9 @@ struct UnOpFSignum {
 };
 
 struct UnOp {
-  std::variant<UnOpNeg, UnOpComplement, UnOpAbs, UnOpFAbs, UnOpSSignum, UnOpUSignum, UnOpFSignum> v;
+  std::variant<UnOpNeg, UnOpComplement, UnOpAbs, UnOpFAbs, UnOpSSignum,
+               UnOpUSignum, UnOpFSignum>
+      v;
 };
 
 struct BinOpAdd {
@@ -424,9 +424,11 @@ struct BinOpLogOr {};
 
 // TODO: Implement rest of operators
 struct BinOp {
-  std::variant<BinOpAdd, BinOpFAdd, BinOpSub, BinOpFSub, BinOpMul, BinOpFMul, BinOpUDiv, BinOpUDiv, BinOpSDiv,
-               BinOpSDivUp, BinOpFDiv, BinOpFMod, BinOpUMod, BinOpSMod, BinOpSQuot, BinOpSRem, BinOpSMin, BinOpUMin,
-               BinOpFMin, BinOpSMax, BinOpUMax, BinOpFMax, BinOpShl, BinOpLShr, BinOpAShr, BinOpAnd, BinOpOr, BinOpXor,
+  std::variant<BinOpAdd, BinOpFAdd, BinOpSub, BinOpFSub, BinOpMul, BinOpFMul,
+               BinOpUDiv, BinOpUDiv, BinOpSDiv, BinOpSDivUp, BinOpFDiv,
+               BinOpFMod, BinOpUMod, BinOpSMod, BinOpSQuot, BinOpSRem,
+               BinOpSMin, BinOpUMin, BinOpFMin, BinOpSMax, BinOpUMax, BinOpFMax,
+               BinOpShl, BinOpLShr, BinOpAShr, BinOpAnd, BinOpOr, BinOpXor,
                BinOpPow, BinOpFPow, BinOpLogAnd, BinOpLogOr>
       v;
 };
@@ -463,7 +465,9 @@ struct CmpOpLLt {};
 struct CmpOpLLe {};
 
 struct CmpOp {
-  std::variant<CmpOpEq, CmpOpUlt, CmpOpUle, CmpOpSlt, CmpOpSle, CmpOpFlt, CmpOpFle, CmpOpLLt, CmpOpLLe> v;
+  std::variant<CmpOpEq, CmpOpUlt, CmpOpUle, CmpOpSlt, CmpOpSle, CmpOpFlt,
+               CmpOpFle, CmpOpLLt, CmpOpLLe>
+      v;
 };
 
 struct ConvOpZExt {

@@ -9,7 +9,7 @@ struct SegThreadInBlock {};
 
 struct SegSpace {
   std::string flat_id;
-  std::vector<std::tuple<std::string,SubExp>> dims;
+  std::vector<std::tuple<std::string, SubExp>> dims;
 };
 
 struct KernelResult {

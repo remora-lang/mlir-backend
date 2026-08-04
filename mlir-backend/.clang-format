@@ -1,4 +1,6 @@
 BasedOnStyle: LLVM
 NamespaceIndentation: All
-ColumnLimit: 120
-SortIncludes: false
+ColumnLimit: 80
+BinPackArguments: false
+AllowAllArgumentsOnNextLine: true
+AllowShortLambdasOnASingleLine: All

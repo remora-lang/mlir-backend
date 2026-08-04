@@ -188,9 +188,11 @@ struct BasicOpUpdateAcc {
 };
 
 struct BasicOp {
-  std::variant<BasicOpSubExp, BasicOpOpaque, BasicOpArrayLit, BasicOpArrayVal, BasicOpUnOp, BasicOpBinOp, BasicOpCmpOp,
-               BasicOpConvOp, BasicOpAssert, BasicOpIndex, BasicOpUpdate, BasicOpFlatIndex, BasicOpFlatUpdate,
-               BasicOpConcat, BasicOpManifest, BasicOpIota, BasicOpReplicate, BasicOpScratch, BasicOpReshape,
+  std::variant<BasicOpSubExp, BasicOpOpaque, BasicOpArrayLit, BasicOpArrayVal,
+               BasicOpUnOp, BasicOpBinOp, BasicOpCmpOp, BasicOpConvOp,
+               BasicOpAssert, BasicOpIndex, BasicOpUpdate, BasicOpFlatIndex,
+               BasicOpFlatUpdate, BasicOpConcat, BasicOpManifest, BasicOpIota,
+               BasicOpReplicate, BasicOpScratch, BasicOpReshape,
                BasicOpRearrange, BasicOpUpdate>
       v;
 };
@@ -295,7 +297,9 @@ struct FunDef {
 };
 
 struct FunDefHasher {
-  size_t operator()(const FunDef &fun) const { return std::hash<std::string>{}(fun.name); }
+  size_t operator()(const FunDef &fun) const {
+    return std::hash<std::string>{}(fun.name);
+  }
 };
 
 struct Prog {

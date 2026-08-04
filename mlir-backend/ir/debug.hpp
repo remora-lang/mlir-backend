@@ -5,9 +5,7 @@
 #include <type_traits>
 #include <vector>
 
-inline void Print(std::string msg) {
-  llvm::errs() << msg;
-}
+inline void Print(std::string msg) { llvm::errs() << msg; }
 
 inline void PrintValue(mlir::Value value) {
   mlir::OpPrintingFlags flags;
@@ -18,7 +16,7 @@ inline void PrintValue(mlir::Value value) {
 
 template <typename T>
   requires std::is_base_of_v<mlir::OpState, T>
-inline void PrintValue(T& value) {
+inline void PrintValue(T &value) {
   mlir::OpPrintingFlags flags;
   flags.assumeVerified();
   auto op = value.getOperation();
@@ -26,16 +24,17 @@ inline void PrintValue(T& value) {
   llvm::errs() << "\n";
 }
 
-template <typename T> inline void PrintValue(const T& value) {
+template <typename T> inline void PrintValue(const T &value) {
   llvm::errs() << value << "\n";
 }
 
-template <typename T> inline void PrintValue(const std::vector<T>& values) {
+template <typename T> inline void PrintValue(const std::vector<T> &values) {
   for (const auto &value : values)
     PrintValue(value);
 }
 
-template <typename T> inline void PrintValue(const mlir::SmallVector<T>& values) {
+template <typename T>
+inline void PrintValue(const mlir::SmallVector<T> &values) {
   for (const auto &value : values)
     PrintValue(value);
 }

@@ -1,10 +1,10 @@
 #pragma once
-#include "error.hpp"
-#include "soac.hpp"
-#include "segop.hpp"
-#include "syntax.hpp"
-#include "FutharkParser.h"
 #include "FutharkLexer.h"
+#include "FutharkParser.h"
+#include "error.hpp"
+#include "segop.hpp"
+#include "soac.hpp"
+#include "syntax.hpp"
 
 using namespace antlr4;
 
@@ -20,7 +20,9 @@ struct FutharkTranslationVisitor {
 
   FunDef VisitFunDef(FutharkParser::PFunDefContext *ctx) {
     FunDef fun;
-    fun.entry = ctx->pEntry() == nullptr ? std::nullopt : std::make_optional(VisitEntry(ctx->pEntry()));
+    fun.entry = ctx->pEntry() == nullptr
+                    ? std::nullopt
+                    : std::make_optional(VisitEntry(ctx->pEntry()));
     fun.name = VisitId(ctx->ID());
     fun.retType.push_back({RetType{VisitType(ctx->pType())}, {}});
     for (auto param : ctx->fParam())
@@ -159,12 +161,16 @@ struct FutharkTranslationVisitor {
     return {apply};
   }
 
-  Exp VisitExpBasicOp(FutharkParser::ExpBasicOpContext *ctx) { return {ExpBasicOp{VisitBasicOp(ctx->pBasicOp())}}; }
+  Exp VisitExpBasicOp(FutharkParser::ExpBasicOpContext *ctx) {
+    return {ExpBasicOp{VisitBasicOp(ctx->pBasicOp())}};
+  }
 
   BasicOp VisitBasicOp(FutharkParser::PBasicOpContext *ctx) {
-    if (auto *pArrayLit = dynamic_cast<FutharkParser::BasicOpArrayLitContext *>(ctx))
+    if (auto *pArrayLit =
+            dynamic_cast<FutharkParser::BasicOpArrayLitContext *>(ctx))
       return {VisitBasicOpArrayLit(pArrayLit)};
-    if (auto *pBinary = dynamic_cast<FutharkParser::BasicOpBinaryContext *>(ctx)) {
+    if (auto *pBinary =
+            dynamic_cast<FutharkParser::BasicOpBinaryContext *>(ctx)) {
       auto pb = pBinary->pBinOp();
       auto op0 = VisitSubExp(pb->pSubExp(0));
       auto op1 = VisitSubExp(pb->pSubExp(1));
@@ -174,21 +180,27 @@ struct FutharkTranslationVisitor {
       return {VisitBasicOpIota(pIota)};
     if (auto *pConv = dynamic_cast<FutharkParser::BasicOpConvContext *>(ctx))
       return {VisitBasicOpConvOp(pConv)};
-    if (auto *pConcat = dynamic_cast<FutharkParser::BasicOpConcatContext *>(ctx))
+    if (auto *pConcat =
+            dynamic_cast<FutharkParser::BasicOpConcatContext *>(ctx))
       return {VisitBasicOpConcat(pConcat)};
-    if (auto *pFlatIndex = dynamic_cast<FutharkParser::BasicOpFlatIndexContext *>(ctx))
+    if (auto *pFlatIndex =
+            dynamic_cast<FutharkParser::BasicOpFlatIndexContext *>(ctx))
       return {VisitBasicOpFlatIndex(pFlatIndex)};
-    if (auto *pFlatIndex = dynamic_cast<FutharkParser::BasicOpReshapeContext *>(ctx))
+    if (auto *pFlatIndex =
+            dynamic_cast<FutharkParser::BasicOpReshapeContext *>(ctx))
       return {VisitBasicOpReshape(pFlatIndex)};
-    if (auto *pFlatIndex = dynamic_cast<FutharkParser::BasicOpReplicateContext *>(ctx))
+    if (auto *pFlatIndex =
+            dynamic_cast<FutharkParser::BasicOpReplicateContext *>(ctx))
       return {VisitBasicOpReplicate(pFlatIndex)};
-    if (auto *pFlatIndex = dynamic_cast<FutharkParser::BasicOpRearrangeContext *>(ctx))
+    if (auto *pFlatIndex =
+            dynamic_cast<FutharkParser::BasicOpRearrangeContext *>(ctx))
       return {VisitBasicOpRearrange(pFlatIndex)};
 
     Unreachable();
   }
 
-  BasicOpArrayLit VisitBasicOpArrayLit(FutharkParser::BasicOpArrayLitContext *ctx) {
+  BasicOpArrayLit
+  VisitBasicOpArrayLit(FutharkParser::BasicOpArrayLitContext *ctx) {
     BasicOpArrayLit arr;
     for (auto elem : ctx->pArrayLit()->pSubExp()) {
       arr.values.push_back(VisitSubExp(elem));
@@ -260,7 +272,8 @@ struct FutharkTranslationVisitor {
     return concat;
   }
 
-  BasicOpFlatIndex VisitBasicOpFlatIndex(FutharkParser::BasicOpFlatIndexContext *ctx) {
+  BasicOpFlatIndex
+  VisitBasicOpFlatIndex(FutharkParser::BasicOpFlatIndexContext *ctx) {
     BasicOpFlatIndex flatIndex{};
     for (auto subexp : ctx->pSubExp()) {
       flatIndex.operands.push_back(VisitSubExp(subexp));
@@ -271,7 +284,8 @@ struct FutharkTranslationVisitor {
     return flatIndex;
   }
 
-  BasicOpReshape VisitBasicOpReshape(FutharkParser::BasicOpReshapeContext *ctx) {
+  BasicOpReshape
+  VisitBasicOpReshape(FutharkParser::BasicOpReshapeContext *ctx) {
     BasicOpReshape reshape{};
     reshape.op0 = VisitSubExp(ctx->pSubExp());
     reshape.dimBegin = std::stoull(ctx->NUMBER(0)->getText());
@@ -281,14 +295,16 @@ struct FutharkTranslationVisitor {
     return reshape;
   }
 
-  BasicOpReplicate VisitBasicOpReplicate(FutharkParser::BasicOpReplicateContext *ctx) {
+  BasicOpReplicate
+  VisitBasicOpReplicate(FutharkParser::BasicOpReplicateContext *ctx) {
     BasicOpReplicate replicate;
     replicate.shape = VisitExtShape(ctx->pExtShape());
     replicate.val = VisitSubExp(ctx->pSubExp());
     return replicate;
   }
 
-  BasicOpRearrange VisitBasicOpRearrange(FutharkParser::BasicOpRearrangeContext *ctx) {
+  BasicOpRearrange
+  VisitBasicOpRearrange(FutharkParser::BasicOpRearrangeContext *ctx) {
     BasicOpRearrange rearrange;
     rearrange.arr = std::get<VarSubExp>(VisitSubExp(ctx->pSubExp()).v).v;
     for (auto number : ctx->NUMBER()) {
@@ -326,13 +342,16 @@ struct FutharkTranslationVisitor {
     return {op, subExp};
   }
 
-  Exp VisitExpSubExp(FutharkParser::ExpSubExpContext *ctx) { return {ExpSubExp{VisitSubExp(ctx->pSubExp())}}; }
+  Exp VisitExpSubExp(FutharkParser::ExpSubExpContext *ctx) {
+    return {ExpSubExp{VisitSubExp(ctx->pSubExp())}};
+  }
 
   Exp VisitExpSoacOp(FutharkParser::ExpSoacOpContext *ctx) {
     auto soac = ctx->pSoacOp();
     if (auto *pMap = dynamic_cast<FutharkParser::SoacOpMapContext *>(soac))
       return {ExpSoacOp{std::make_shared<Soac>(VisitSoacOpMap(pMap))}};
-    if (auto *pRedomap = dynamic_cast<FutharkParser::SoacOpRedomapContext *>(soac))
+    if (auto *pRedomap =
+            dynamic_cast<FutharkParser::SoacOpRedomapContext *>(soac))
       return {ExpSoacOp{std::make_shared<Soac>(VisitSoacOpRedomap(pRedomap))}};
 
     Unreachable();
@@ -422,9 +441,11 @@ struct FutharkTranslationVisitor {
   }
 
   KernelBody VisitKernelBody(FutharkParser::PKernelBodyContext *ctx) {
-    if (auto *pKernelBody = dynamic_cast<FutharkParser::KernelBodyContext *>(ctx))
+    if (auto *pKernelBody =
+            dynamic_cast<FutharkParser::KernelBodyContext *>(ctx))
       return {VisitNormalKernelBody(pKernelBody)};
-    if (auto *pEmptyKernelBody = dynamic_cast<FutharkParser::EmptyKernelBodyContext *>(ctx))
+    if (auto *pEmptyKernelBody =
+            dynamic_cast<FutharkParser::EmptyKernelBodyContext *>(ctx))
       return {VisitEmptyKernelBody(pEmptyKernelBody)};
 
     Unreachable();
@@ -459,7 +480,8 @@ struct FutharkTranslationVisitor {
   }
 
   SubExp VisitSubExp(FutharkParser::PSubExpContext *ctx) {
-    if (auto *pConst = dynamic_cast<FutharkParser::ConstantSubExpressionContext *>(ctx))
+    if (auto *pConst =
+            dynamic_cast<FutharkParser::ConstantSubExpressionContext *>(ctx))
       return {ConstantSubExp{VisitPrimValue(pConst->pPrimValue())}};
     if (auto *pVar = dynamic_cast<FutharkParser::VarSubExpContext *>(ctx))
       return {VarSubExp{VisitId(pVar->ID())}};
@@ -468,9 +490,11 @@ struct FutharkTranslationVisitor {
   }
 
   PrimValue VisitPrimValue(FutharkParser::PPrimValueContext *ctx) {
-    if (auto *pInt = dynamic_cast<FutharkParser::PrimValueIntegerContext *>(ctx))
+    if (auto *pInt =
+            dynamic_cast<FutharkParser::PrimValueIntegerContext *>(ctx))
       return {VisitPrimValueInteger(pInt)};
-    if (auto *pFloat = dynamic_cast<FutharkParser::PrimValueFloatContext *>(ctx))
+    if (auto *pFloat =
+            dynamic_cast<FutharkParser::PrimValueFloatContext *>(ctx))
       return {VisitPrimValueFloat(pFloat)};
 
     Unreachable();
@@ -504,7 +528,9 @@ struct FutharkTranslationVisitor {
     Unreachable();
   }
 
-  std::string VisitId(antlr4::tree::TerminalNode *ctx) { return ctx->getText(); }
+  std::string VisitId(antlr4::tree::TerminalNode *ctx) {
+    return ctx->getText();
+  }
 };
 
 inline Prog ParseFuthark(std::ifstream &file) {
