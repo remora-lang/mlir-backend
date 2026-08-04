@@ -40,8 +40,17 @@ struct SubExp {
   int64_t GetIntValue() const {
     return match(v,
       [&](const ConstantSubExp& c) { return c.GetIntValue(); },
-      [](const VarSubExp& x) -> int64_t {
+      [](const auto&) -> int64_t {
         throw std::runtime_error("GetIntValue on non-constant SubExp");
+      }
+    );
+  }
+
+  VName GetVName() const {
+    return match(v,
+      [&](const VarSubExp& v) { return v.v; },
+      [](const auto&) -> VName {
+        throw std::runtime_error("GetVName on non-VName SubExp");
       }
     );
   }
