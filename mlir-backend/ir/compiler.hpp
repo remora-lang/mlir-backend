@@ -7,7 +7,10 @@
 #include "soac.hpp"
 #include "syntax.hpp"
 #include <format>
+#include <mlir/Dialect/Arith/IR/Arith.h>
+#include <mlir/IR/BuiltinTypeInterfaces.h>
 #include <ranges>
+#include <source_location>
 #include <variant>
 
 template <typename K, typename V> class Env {
@@ -16,11 +19,15 @@ template <typename K, typename V> class Env {
 public:
   void insert(const K &name, V v) { env.insert_or_assign(name, v); }
 
-  V lookup(const K &name) const {
+  V lookup(const K &name,
+           std::source_location loc = std::source_location::current()) const {
     auto v = env.find(name);
     if (v == env.end())
       throw std::runtime_error(
-          std::format("env lookup: unbound variable '{}'", name));
+          std::format("env lookup at {}:{}: unbound variable '{}'",
+                      loc.file_name(),
+                      loc.line(),
+                      name));
     return v->second;
   }
 };
@@ -29,10 +36,17 @@ struct Ctx {
   Env<std::string, mlir::Value> subexps;
 };
 
+struct Dim {
+  std::string id;    // For example, gtid in a kernel.
+  mlir::Value value; // Lowered dimension bound.
+  bool isDynamic;
+  long index; // Position in the iteration space.
+};
+
 struct AffineRead {
   VName boundName;
   VName array;
-  std::vector<int> dimToLoopDim;
+  std::vector<long> dimToLoopDim;
 };
 
 inline llvm::raw_ostream &operator<<(llvm::raw_ostream &os,
@@ -53,17 +67,19 @@ template <typename T, typename F> auto map(const std::vector<T> &xs, F f) {
   return out;
 }
 
+inline int64_t toShapeType(SubExp dim) {
+  return match(
+      dim.v,
+      [&](const ConstantSubExp &c) { return c.GetIntValue(); },
+      [&](const VarSubExp &) { return mlir::ShapedType::kDynamic; });
+}
+
 template <std::ranges::range R>
   requires std::same_as<std::ranges::range_value_t<R>, SubExp>
-inline std::vector<int64_t> dimsToType(const R &dims) {
+inline std::vector<int64_t> toShapeType(const R &dims) {
   std::vector<int64_t> dimsTy;
-  for (auto &d : dims) {
-    dimsTy.push_back(match(
-        d.v,
-        [&](const ConstantSubExp &c) { return c.GetIntValue(); },
-        [&](const VarSubExp &) { return mlir::ShapedType::kDynamic; }));
-  }
-
+  for (auto &d : dims)
+    dimsTy.push_back(toShapeType(d));
   return dimsTy;
 }
 
@@ -632,19 +648,21 @@ struct FutharkCompiler {
           Undefined();
         },
         [](const auto &) -> mlir::Type { Undefined(); });
-    auto dimsTy = dimsToType(std::views::values(pSegMap.space.dims));
-    auto rvalueTy = mlir::RankedTensorType::get(dimsTy, baseTy);
+    auto shapeTy = toShapeType(std::views::values(pSegMap.space.dims));
+    auto rvalueTy = mlir::RankedTensorType::get(shapeTy, baseTy);
 
-    // Find iteration space.
-    std::vector<std::string> ids;
-    for (const auto &[id, dim] : pSegMap.space.dims) {
-      LowerSubExp(dim, ctx);
-      ids.push_back(id);
+    // Find iteration space. (id corresponds to gtid.)
+    std::vector<Dim> iterSpace;
+    for (const auto &[i, kv] : std::views::enumerate(pSegMap.space.dims)) {
+      const auto &[id, dim] = kv;
+      auto d = LowerSubExp(dim, ctx);
+      iterSpace.push_back(
+          Dim{id, d, toShapeType(dim) == mlir::ShapedType::kDynamic, i});
     }
-
-    std::unordered_map<std::string, int> dimPosition;
-    for (int i = 0; i < ids.size(); i++)
-      dimPosition[ids[i]] = i;
+    std::unordered_map<std::string, long> idToIndex;
+    for (const auto &d : iterSpace) {
+      idToIndex[d.id] = d.index;
+    };
 
     // Extract reads of the map's input arrays from the kernel body.
     std::vector<AffineRead> reads;
@@ -659,26 +677,19 @@ struct FutharkCompiler {
           auto vnArray = idx->base.GetVName();
 
           if (idx->operands.size() != 1)
-            throw std::runtime_error("TODO: support multiple indices (fix "
-                                     "BasicOpFlatIndex TODOs first)");
+            Undefined(); // TODO multiple indices (fix BasicOpFlatIndex first).
           auto vnDim = idx->operands[0].GetVName();
-          auto pos = dimPosition.find(vnDim.name);
-          if (pos == dimPosition.end()) {
-            throw std::runtime_error("TODO: support affine indexing with "
-                                     "things other than just seg space ids?");
-          }
-          reads.push_back({vnBound, vnArray, {pos->second}});
+          auto i = idToIndex.find(vnDim.name);
+          if (i == idToIndex.end())
+            Undefined(); // TODO suport affine indexing beyond seg space ids
+          reads.push_back(AffineRead{vnBound, vnArray, {i->second}});
         }
       }
       continue;
     }
 
-    PrintValue(ids);
-    PrintValue(reads);
-    PrintValue(pSegMap.space.flat_id);
-
-    // Map the SegSpace dimensions to each input's dimensions.
-    auto rank = dimsTy.size();
+    // Map the iteration space to each input's dimensions.
+    auto rank = iterSpace.size();
     mlir::SmallVector<mlir::AffineMap> indexingMaps;
     for (const auto &read : reads) {
       std::vector<mlir::AffineExpr> usedDims;
@@ -687,7 +698,7 @@ struct FutharkCompiler {
       indexingMaps.push_back(mlir::AffineMap::get(rank, 0, usedDims, &context));
     }
 
-    // Map the SegSpace dimensions to the output's dimensions.
+    // Map the iteration sapce to the output's dimensions.
     indexingMaps.push_back(
         mlir::AffineMap::getMultiDimIdentityMap(rank, &context));
 
@@ -700,7 +711,14 @@ struct FutharkCompiler {
     for (auto &read : reads)
       skip.insert(read.boundName.name);
 
-    mlir::Value output = mlir::tensor::EmptyOp::create(builder, rvalueTy, {});
+    mlir::SmallVector<mlir::Value> dynamicSizes;
+    for (const auto &d : iterSpace) {
+      if (d.isDynamic)
+        dynamicSizes.push_back(mlir::arith::IndexCastOp::create(
+            builder, builder.getIndexType(), d.value));
+    };
+    mlir::Value output =
+        mlir::tensor::EmptyOp::create(builder, rvalueTy, dynamicSizes);
 
     auto op = mlir::linalg::GenericOp::create(
         builder,
@@ -708,16 +726,26 @@ struct FutharkCompiler {
         inputs,
         mlir::ValueRange{output},
         indexingMaps,
-        map(dimsTy, [](auto) { return mlir::utils::IteratorType::parallel; }),
+        map(iterSpace,
+            [](const auto &) { return mlir::utils::IteratorType::parallel; }),
         [&](mlir::OpBuilder &b, mlir::Location loc, mlir::ValueRange args) {
-          // Extend the context locally.
-          Ctx local = ctx;
-          for (auto i = 0; i < reads.size(); i++) {
-            local.subexps.insert(reads[i].boundName.name, args[i]);
-          }
           // Move the insertion point for the compiler's builder (LowerStm etc).
           auto before = builder.saveInsertionPoint();
           builder.setInsertionPointToStart(b.getInsertionBlock());
+
+          // Map the kernel body's indices (gtid) to linalg indices
+          // and input array reads to linalg elements.
+          Ctx local = ctx;
+          for (auto d : iterSpace) {
+            auto idx = mlir::linalg::IndexOp::create(b, loc, d.index);
+            // Cast Linalg's index type to the lowered Futhark index type.
+            auto val = mlir::arith::IndexCastOp::create(
+                b, loc, d.value.getType(), idx);
+            local.subexps.insert(d.id, val);
+          }
+          for (auto i = 0; i < reads.size(); i++) {
+            local.subexps.insert(reads[i].boundName.name, args[i]);
+          }
 
           // Lower the body, skipping the reads which are now block arguments.
           for (Stm &stm : pSegMap.body.stms) {
@@ -735,22 +763,6 @@ struct FutharkCompiler {
 
           mlir::linalg::YieldOp::create(b, loc, results);
         });
-
-    Print("\nLowerSegMap\n===========\n");
-    Print("reads: ");
-    PrintValue(reads);
-    Print("indexing maps:\n");
-    for (auto m : indexingMaps) {
-      Print("  ");
-      PrintValue(m);
-    };
-    Print("input tensors: ");
-    PrintValue(inputs);
-    Print("output tensor: ");
-    PrintValue(output);
-    Print("mlir:\n");
-    PrintValue(op);
-    Print("\n===========\n");
 
     return op.getResult(0);
   }
@@ -844,6 +856,10 @@ struct FutharkCompiler {
     return elems;
   }
 
+  std::vector<int64_t> LowerShape(const Shape &shape) {
+    return toShapeType(shape.dims);
+  }
+
   mlir::Type LowerTy(Type t) {
     auto baseTy = &t.t.v;
     if (auto *val = std::get_if<TypePrim<Shape, NoUniqueness>>(baseTy)) {
@@ -891,7 +907,7 @@ struct FutharkCompiler {
   }
 
   mlir::Type LowerTypeArray(TypeArray<Shape, NoUniqueness> typeArray) {
-    return mlir::RankedTensorType::get(dimsToType(typeArray.shape.dims),
+    return mlir::RankedTensorType::get(LowerShape(typeArray.shape),
                                        LowerPrimType(typeArray.elem));
   }
 
