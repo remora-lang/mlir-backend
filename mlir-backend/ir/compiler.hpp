@@ -653,11 +653,12 @@ struct FutharkCompiler {
 
     // Find iteration space. (id corresponds to gtid.)
     std::vector<Dim> iterSpace;
-    for (const auto &[i, kv] : std::views::enumerate(pSegMap.space.dims)) {
-      const auto &[id, dim] = kv;
+    int i = 0;
+    for (const auto &[id, dim] : pSegMap.space.dims) {
       auto d = LowerSubExp(dim, ctx);
       iterSpace.push_back(
           Dim{id, d, toShapeType(dim) == mlir::ShapedType::kDynamic, i});
+      ++i;
     }
     std::unordered_map<std::string, long> idToIndex;
     for (const auto &d : iterSpace) {
