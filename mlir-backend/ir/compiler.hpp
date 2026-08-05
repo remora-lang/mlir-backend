@@ -8,7 +8,9 @@
 #include "syntax.hpp"
 #include <format>
 #include <mlir/Dialect/Arith/IR/Arith.h>
+#include <mlir/IR/AffineMap.h>
 #include <mlir/IR/BuiltinTypeInterfaces.h>
+#include <optional>
 #include <ranges>
 #include <source_location>
 #include <variant>
@@ -44,20 +46,14 @@ struct Dim {
 };
 
 struct AffineRead {
-  VName boundName;
+  // The result is bound to this name.
+  VName result;
+  // The array being read.
   VName array;
-  std::vector<long> dimToLoopDim;
+  // An affine map from the iteration space to the indexing expression.
+  // For example, (d0, d1) -> (2*d0 + 1, d1).
+  mlir::AffineMap indexMap;
 };
-
-inline llvm::raw_ostream &operator<<(llvm::raw_ostream &os,
-                                     const AffineRead &x) {
-  os << "AffineRead { " << x.boundName << ", " << x.array << ", ";
-  for (auto i : x.dimToLoopDim) {
-    os << "d" << i << " ";
-  }
-  os << "}\n";
-  return os;
-}
 
 template <typename T, typename F> auto map(const std::vector<T> &xs, F f) {
   std::vector<decltype(f(xs[0]))> out;
@@ -633,12 +629,25 @@ struct FutharkCompiler {
   }
 
   mlir::Value LowerSegMap(SegMap pSegMap, Ctx &ctx) {
-    // TODO the rest of this function assumes a single result.
+    // TODO Limitations
+    // 1. The map must return a single result.
+    // 2. The base type must be scalar (i.e., the seg space creates all dims).
+    // 3. Affine reads with dynamic variables are not recognized as such.
+    // For example,
+    //    xs[2*gtid + 1]
+    // is recognized because gtid is in the iteration (seg) space. But
+    //    xs[2*gtid + 1 - c],
+    // where c is a variable defined outside the kernel body, is not.
     if (pSegMap.ret.size() != 1) {
       Undefined();
     }
 
-    // Compute the (outer) dimensions of the return type
+    // This lowers a SegMap to a linalg.generic op, whose
+    //   * iteration space corresponds to the SegMap's SegSpace;
+    //   * inputs correspond to "affine reads" in the SegMap body.
+    // An affine read is an array load whose index expression is an affine
+    // function of the iteration space.
+
     auto baseTy = match(
         pSegMap.ret[0].t.v,
         [&](const TypePrim<Shape, NoUniqueness> &val) {
@@ -649,7 +658,7 @@ struct FutharkCompiler {
         },
         [](const auto &) -> mlir::Type { Undefined(); });
     auto shapeTy = toShapeType(std::views::values(pSegMap.space.dims));
-    auto rvalueTy = mlir::RankedTensorType::get(shapeTy, baseTy);
+    auto returnTy = mlir::RankedTensorType::get(shapeTy, baseTy);
 
     // Find iteration space. (id corresponds to gtid.)
     std::vector<Dim> iterSpace;
@@ -665,40 +674,27 @@ struct FutharkCompiler {
       idToIndex[d.id] = d.index;
     };
 
-    // Classify array reads in the kernel body as affine or non-affine.
-    // Affine reads will become inputs to the linalg operation.
-    // Non-affine reads (e.g., indirect indexing) remain in the lowered body.
-    std::vector<AffineRead> reads;
+    // Find affine reads in the kernel's body.
+    auto rank = iterSpace.size();
+    std::vector<AffineRead> affine_reads;
     for (const auto &stm : pSegMap.body.stms) {
       if (stm.pat.elems.size() != 1)
-        throw std::runtime_error(
-            "Only let-bindings with one name are suppported.");
+        Undefined();
       auto vnBound = stm.pat.elems[0].name;
 
       if (auto e = std::get_if<ExpBasicOp>(&stm.exp.v)) {
-        if (auto *idx = std::get_if<BasicOpFlatIndex>(&e->op.v)) {
-          auto vnArray = idx->base.GetVName();
-
-          if (idx->operands.size() != 1)
-            // TODO multiple indices (fix BasicOpFlatIndex first).
-            Undefined();
-          auto vnDim = idx->operands[0].GetVName();
-          auto i = idToIndex.find(vnDim.name);
-          if (i == idToIndex.end())
-            // TODO suport affine indexing beyond seg space ids
-            Undefined();
-          reads.push_back(AffineRead{vnBound, vnArray, {i->second}});
+        if (auto r = toAffineRead(vnBound, e->op, idToIndex)) {
+          affine_reads.push_back(r.value());
         }
       }
-      continue;
     }
 
     mlir::SmallVector<mlir::Value> inputs;
-    for (auto &read : reads)
+    for (auto &read : affine_reads)
       inputs.push_back(ctx.subexps.lookup(read.array.name));
     std::unordered_set<std::string> skipLowering;
-    for (auto &read : reads)
-      skipLowering.insert(read.boundName.name);
+    for (auto &read : affine_reads)
+      skipLowering.insert(read.result.name);
 
     mlir::SmallVector<mlir::Value> dynamicSizes;
     for (const auto &d : iterSpace) {
@@ -707,16 +703,13 @@ struct FutharkCompiler {
             builder, builder.getIndexType(), d.value));
     };
     mlir::Value output =
-        mlir::tensor::EmptyOp::create(builder, rvalueTy, dynamicSizes);
+        mlir::tensor::EmptyOp::create(builder, returnTy, dynamicSizes);
 
     // Map the iteration space to each input's dimensions.
-    auto rank = iterSpace.size();
+    // (How does each affine read use the iteration dimensions?)
     mlir::SmallVector<mlir::AffineMap> indexingMaps;
-    for (const auto &read : reads) {
-      std::vector<mlir::AffineExpr> usedDims;
-      for (auto i : read.dimToLoopDim)
-        usedDims.push_back(mlir::getAffineDimExpr(i, &context));
-      indexingMaps.push_back(mlir::AffineMap::get(rank, 0, usedDims, &context));
+    for (const auto &read : affine_reads) {
+      indexingMaps.push_back(read.indexMap);
     }
 
     // Map the iteration space to the output's dimensions.
@@ -725,7 +718,7 @@ struct FutharkCompiler {
 
     auto op = mlir::linalg::GenericOp::create(
         builder,
-        mlir::TypeRange{rvalueTy},
+        mlir::TypeRange{returnTy},
         inputs,
         mlir::ValueRange{output},
         indexingMaps,
@@ -735,8 +728,12 @@ struct FutharkCompiler {
           mlir::OpBuilder::InsertionGuard guard(builder);
           builder.setInsertionPointToEnd(b.getInsertionBlock());
 
-          // Lower the kernel's gtids by binding them to the iteration indices.
+          // Lower the kernel's affine reads by binding them to the inputs.
           Ctx local = ctx;
+          for (auto i = 0; i < affine_reads.size(); i++) {
+            local.subexps.insert(affine_reads[i].result.name, args[i]);
+          }
+          // Lower the kernel's gtids by binding them to the iteration indices.
           for (auto d : iterSpace) {
             auto idx = mlir::linalg::IndexOp::create(b, loc, d.index);
             auto futharkIndexTy = d.value.getType();
@@ -744,11 +741,7 @@ struct FutharkCompiler {
                 mlir::arith::IndexCastOp::create(b, loc, futharkIndexTy, idx);
             local.subexps.insert(d.id, val);
           }
-          // Lower the kernel's affine reads by binding them to the inputs.
-          for (auto i = 0; i < reads.size(); i++) {
-            local.subexps.insert(reads[i].boundName.name, args[i]);
-          }
-          // Lower the body, skipping the reads which are now block arguments.
+          // Lower the body, skipping the affine reads.
           for (Stm &stm : pSegMap.body.stms) {
             assert(stm.pat.elems.size() == 1);
             if (skipLowering.contains(stm.pat.elems[0].name.name))
@@ -926,5 +919,44 @@ struct FutharkCompiler {
     }
 
     Unreachable();
+  }
+
+  // (Currently only supports affine functions of the iteration variables
+  // that use the iteration variables and static constants.)
+  std::optional<AffineRead>
+  toAffineRead(VName vn, const BasicOp &exp,
+               std::unordered_map<std::string, long> iterationSpaceIndex) {
+    auto rank = iterationSpaceIndex.size();
+    if (auto *idx = std::get_if<BasicOpFlatIndex>(&exp.v)) {
+      auto vnArray = idx->base.GetVName();
+
+      if (idx->operands.size() != 1)
+        // TODO multiple indices.
+        Undefined();
+
+
+      // XXX faa subexp fra idx->operands[0].
+      // Find ud af om den subexp er paa den rigtige form.
+      // Lav den subexp om til en affine expression.
+      // Lav Affine map.
+
+      // Two cases:
+      // (1) Is idx an iteration space id?
+      auto vnDim = idx->operands[0].GetVName();
+      auto res = iterationSpaceIndex.find(vnDim.name);
+      if (res == iterationSpaceIndex.end())
+        // TODO suport affine indexing beyond seg space ids
+        Undefined();
+      auto i = res->second;
+
+      std::vector<mlir::AffineExpr> usedDims;
+      usedDims.push_back(mlir::getAffineDimExpr(i, &context));
+      auto m = mlir::AffineMap::get(rank, 0, usedDims, &context);
+
+      return AffineRead{vn, vnArray, m};
+
+      // (2) Is idx an affine transform on an iteration space id?
+    }
+    return std::nullopt;
   }
 };
