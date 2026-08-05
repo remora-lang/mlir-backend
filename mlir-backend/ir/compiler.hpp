@@ -665,7 +665,9 @@ struct FutharkCompiler {
       idToIndex[d.id] = d.index;
     };
 
-    // Extract reads of the map's input arrays from the kernel body.
+    // Classify array reads in the kernel body as affine or non-affine.
+    // Affine reads will become inputs to the linalg operation.
+    // Non-affine reads (e.g., indirect indexing) remain in the lowered body.
     std::vector<AffineRead> reads;
     for (const auto &stm : pSegMap.body.stms) {
       if (stm.pat.elems.size() != 1)
@@ -678,16 +680,34 @@ struct FutharkCompiler {
           auto vnArray = idx->base.GetVName();
 
           if (idx->operands.size() != 1)
-            Undefined(); // TODO multiple indices (fix BasicOpFlatIndex first).
+            // TODO multiple indices (fix BasicOpFlatIndex first).
+            Undefined();
           auto vnDim = idx->operands[0].GetVName();
           auto i = idToIndex.find(vnDim.name);
           if (i == idToIndex.end())
-            Undefined(); // TODO suport affine indexing beyond seg space ids
+            // TODO suport affine indexing beyond seg space ids
+            Undefined();
           reads.push_back(AffineRead{vnBound, vnArray, {i->second}});
         }
       }
       continue;
     }
+
+    mlir::SmallVector<mlir::Value> inputs;
+    for (auto &read : reads)
+      inputs.push_back(ctx.subexps.lookup(read.array.name));
+    std::unordered_set<std::string> skipLowering;
+    for (auto &read : reads)
+      skipLowering.insert(read.boundName.name);
+
+    mlir::SmallVector<mlir::Value> dynamicSizes;
+    for (const auto &d : iterSpace) {
+      if (d.isDynamic)
+        dynamicSizes.push_back(mlir::arith::IndexCastOp::create(
+            builder, builder.getIndexType(), d.value));
+    };
+    mlir::Value output =
+        mlir::tensor::EmptyOp::create(builder, rvalueTy, dynamicSizes);
 
     // Map the iteration space to each input's dimensions.
     auto rank = iterSpace.size();
@@ -699,27 +719,9 @@ struct FutharkCompiler {
       indexingMaps.push_back(mlir::AffineMap::get(rank, 0, usedDims, &context));
     }
 
-    // Map the iteration sapce to the output's dimensions.
+    // Map the iteration space to the output's dimensions.
     indexingMaps.push_back(
         mlir::AffineMap::getMultiDimIdentityMap(rank, &context));
-
-    mlir::SmallVector<mlir::Value> inputs;
-    for (auto &read : reads)
-      inputs.push_back(ctx.subexps.lookup(read.array.name));
-
-    // Used to skip reads of the input arrays when lowering the body.
-    std::unordered_set<std::string> skip;
-    for (auto &read : reads)
-      skip.insert(read.boundName.name);
-
-    mlir::SmallVector<mlir::Value> dynamicSizes;
-    for (const auto &d : iterSpace) {
-      if (d.isDynamic)
-        dynamicSizes.push_back(mlir::arith::IndexCastOp::create(
-            builder, builder.getIndexType(), d.value));
-    };
-    mlir::Value output =
-        mlir::tensor::EmptyOp::create(builder, rvalueTy, dynamicSizes);
 
     auto op = mlir::linalg::GenericOp::create(
         builder,
@@ -730,37 +732,32 @@ struct FutharkCompiler {
         map(iterSpace,
             [](const auto &) { return mlir::utils::IteratorType::parallel; }),
         [&](mlir::OpBuilder &b, mlir::Location loc, mlir::ValueRange args) {
-          // Move the insertion point for the compiler's builder (LowerStm etc).
-          auto before = builder.saveInsertionPoint();
-          builder.setInsertionPointToStart(b.getInsertionBlock());
+          mlir::OpBuilder::InsertionGuard guard(builder);
+          builder.setInsertionPointToEnd(b.getInsertionBlock());
 
-          // Map the kernel body's indices (gtid) to linalg indices
-          // and input array reads to linalg elements.
+          // Lower the kernel's gtids by binding them to the iteration indices.
           Ctx local = ctx;
           for (auto d : iterSpace) {
             auto idx = mlir::linalg::IndexOp::create(b, loc, d.index);
-            // Cast Linalg's index type to the lowered Futhark index type.
-            auto val = mlir::arith::IndexCastOp::create(
-                b, loc, d.value.getType(), idx);
+            auto futharkIndexTy = d.value.getType();
+            auto val =
+                mlir::arith::IndexCastOp::create(b, loc, futharkIndexTy, idx);
             local.subexps.insert(d.id, val);
           }
+          // Lower the kernel's affine reads by binding them to the inputs.
           for (auto i = 0; i < reads.size(); i++) {
             local.subexps.insert(reads[i].boundName.name, args[i]);
           }
-
           // Lower the body, skipping the reads which are now block arguments.
           for (Stm &stm : pSegMap.body.stms) {
             assert(stm.pat.elems.size() == 1);
-            if (skip.contains(stm.pat.elems[0].name.name))
+            if (skipLowering.contains(stm.pat.elems[0].name.name))
               continue;
             LowerStm(stm, local);
           }
-
           mlir::SmallVector<mlir::Value> results;
           for (auto &r : pSegMap.body.result)
             results.push_back(LowerSubExp(r.result, local));
-
-          builder.restoreInsertionPoint(before);
 
           mlir::linalg::YieldOp::create(b, loc, results);
         });
