@@ -63,6 +63,12 @@
       exec ./build/mlir-backend/mlir-backend "$@"
     '';
 
+    # Print the Futhark GPU IR for a .fut source. Uses `futhark` from PATH.
+    gpu-ir = pkgs.writeShellScriptBin "gpu-ir" ''
+      set -euo pipefail
+      exec futhark dev --gpu --strip-provenance --no-grid --no-assert --simplify "$@"
+    '';
+
     clean = pkgs.writeShellScriptBin "clean" ''
       set -euo pipefail
       rm -rf build compile_commands.json
@@ -85,6 +91,7 @@
           openjdk
           build
           compile
+          gpu-ir
           clean
           llvmPackages_22.lldb
         ] ++ pkgs.lib.optionals (!pkgs.stdenv.isDarwin) [
