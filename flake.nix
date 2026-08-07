@@ -60,13 +60,16 @@
     compile = pkgs.writeShellScriptBin "compile" ''
       set -euo pipefail
       build >&2
+      # `compile x.fut` first lowers to GPU IR (kept as x.fut_gpu beside the
+      # source), then compiles that and prints the MLIR. Any other input
+      # (e.g. x.fut_gpu) is compiled directly.
+      in=''${1:-}
+      if [ -n "$in" ] && [ "''${in%.fut}" != "$in" ]; then
+        ir="''${in%.fut}.fut_gpu"
+        futhark dev --gpu --strip-provenance --no-grid --simplify "$in" > "$ir"
+        exec ./build/mlir-backend/mlir-backend "$ir"
+      fi
       exec ./build/mlir-backend/mlir-backend "$@"
-    '';
-
-    # Print the Futhark GPU IR for a .fut source. Uses `futhark` from PATH.
-    gpu-ir = pkgs.writeShellScriptBin "gpu-ir" ''
-      set -euo pipefail
-      exec futhark dev --gpu --strip-provenance --no-grid --simplify "$@"
     '';
 
     clean = pkgs.writeShellScriptBin "clean" ''
@@ -91,7 +94,6 @@
           openjdk
           build
           compile
-          gpu-ir
           clean
           llvmPackages_22.lldb
         ] ++ pkgs.lib.optionals (!pkgs.stdenv.isDarwin) [

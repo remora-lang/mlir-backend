@@ -7,9 +7,9 @@
 #   pipeline/run mlir-backend/tests/map.fut_gpu         # from GPU IR directly
 #   pipeline/run mlir-backend/tests/map2.fut 8          # passes 8 to the program
 #
-# A .fut source is first lowered to GPU IR with `gpu-ir`; a .fut_gpu is used
-# as-is. Each program needs a matching pipeline/<name>_scaffold.c that declares
-# _mlir_ciface_entry_main and prints the result.
+# `compile` accepts a .fut source (lowering it to GPU IR first) or a .fut_gpu
+# directly. Each program needs a matching pipeline/<name>_scaffold.c that
+# declares _mlir_ciface_entry_main and prints the result.
 
 set -euo pipefail
 
@@ -33,13 +33,7 @@ if [ ! -f "$scaffold" ]; then
   exit 1
 fi
 
-# 0. Futhark source -> GPU IR (skipped when a .fut_gpu is given directly).
-if [ "${file%.fut}" != "$file" ]; then
-  gpu-ir "$file" >"$out/$name.fut_gpu"
-  file="$out/$name.fut_gpu"
-fi
-
-# 1. Futhark-GPU IR -> MLIR (linalg on tensors).
+# 1. Futhark source (or GPU IR) -> MLIR (linalg on tensors).
 compile "$file" >"$out/$name.mlir"
 
 # 2. Lower to the LLVM dialect. -llvm-request-c-wrappers emits

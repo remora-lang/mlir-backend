@@ -3,12 +3,12 @@
 Run a program with `./run PATH/TO/prog.fut [input]` (or `prog.fut_gpu` to skip
 straight to the IR stage).
 
-It lowers the program through `gpu-ir` (a .fut source only) -> `compile` ->
-`mlir-opt` -> `mlir-translate` -> `clang` (linked against `<name>_scaffold.c`),
-executes it, and leaves intermediates in `out/`.
+It lowers the program through `compile` -> `mlir-opt` -> `mlir-translate` ->
+`clang` (linked against `<name>_scaffold.c`), executes it, and leaves
+intermediates in `out/`.
 
-`gpu-ir` (defined in `flake.nix`) is `futhark dev --gpu --strip-provenance
---no-grid --no-assert --simplify`.
+For a `.fut` source, `compile` (see `flake.nix`) first lowers it to GPU IR
+(`<name>.fut_gpu`).
 
 To support a new `prog.fut_gpu`:
 
