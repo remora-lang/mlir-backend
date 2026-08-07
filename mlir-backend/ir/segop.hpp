@@ -28,6 +28,21 @@ struct SegMap {
   KernelBody body;
 };
 
+struct SegBinOp {
+  Commutativity comm = Commutativity::Noncommutative;
+  Lambda lambda;
+  std::vector<SubExp> neutral;
+  Shape shape;
+};
+
+struct SegRed {
+  std::variant<SegThread, SegBlock, SegThreadInBlock> lvl;
+  SegSpace space;
+  std::vector<Type> ret;
+  KernelBody body;
+  std::vector<SegBinOp> ops;
+};
+
 struct SegOp {
-  std::variant<SegMap> v;
+  std::variant<SegMap, SegRed> v;
 };

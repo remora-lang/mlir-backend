@@ -623,15 +623,17 @@ struct FutharkCompiler {
       return LowerSizeOp(*size, ctx);
     if (auto *other = std::get_if<OtherOp>(&op.v))
       return LowerSoac(other->soac, ctx);
+
     Unreachable();
   }
 
   mlir::Value LowerSegOp(std::shared_ptr<SegOp> pSegOp, Ctx &ctx) {
-    if (auto *val = std::get_if<SegMap>(&pSegOp->v)) {
+    if (auto *val = std::get_if<SegMap>(&pSegOp->v))
       return LowerSegMap(*val, ctx);
-    }
+    if (std::get_if<SegRed>(&pSegOp->v))
+      Undefined();
 
-    Undefined();
+    Unreachable();
   }
 
   mlir::Value LowerSizeOp(SizeOp &sizeOp, Ctx &ctx) { Undefined(); }

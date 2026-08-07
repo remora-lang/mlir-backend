@@ -442,6 +442,8 @@ struct FutharkTranslationVisitor {
     auto segop = ctx->pSegOp();
     if (auto *pSegMap = dynamic_cast<FutharkParser::SegMapContext *>(segop))
       return {ExpHostOp{HostOp{std::make_shared<SegOp>(VisitSegMap(pSegMap))}}};
+    if (auto *pSegRed = dynamic_cast<FutharkParser::SegRedContext *>(segop))
+      return {ExpHostOp{HostOp{std::make_shared<SegOp>(VisitSegRed(pSegRed))}}};
     Unreachable();
   }
 
@@ -456,6 +458,31 @@ struct FutharkTranslationVisitor {
     segmap.body = VisitKernelBody(ctx->pKernelBody());
 
     return {segmap};
+  }
+
+  SegOp VisitSegRed(FutharkParser::SegRedContext *ctx) {
+    SegRed segred;
+    segred.lvl = SegThread{};
+    segred.space = VisitSegSpace(ctx->pSegSpace());
+    for (auto t : ctx->pTypes()->pType())
+      segred.ret.push_back(VisitType(t));
+    segred.body = VisitKernelBody(ctx->pKernelBody());
+    for (auto op : ctx->pSegBinOp())
+      segred.ops.push_back(VisitSegBinOp(op));
+    return {segred};
+  }
+
+  SegBinOp VisitSegBinOp(FutharkParser::PSegBinOpContext *ctx) {
+    SegBinOp op;
+    op.comm = ctx->pComm()->getText() == "commutative"
+                  ? Commutativity::Commutative
+                  : Commutativity::Noncommutative;
+    op.lambda = VisitLambda(ctx->pLambda());
+    for (auto subExp : ctx->pSubExp())
+      op.neutral.push_back(VisitSubExp(subExp));
+    if (ctx->pExtShape())
+      op.shape = VisitExtShape(ctx->pExtShape());
+    return op;
   }
 
   KernelBody VisitKernelBody(FutharkParser::PKernelBodyContext *ctx) {

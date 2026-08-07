@@ -43,8 +43,14 @@ pSizeOp: 'get_size' '(' ID ',' ID ')';
 pSoacOp: 'map' '('  pScrema pMapForm ')' #SoacOpMap
 | 'redomap' '('  pScrema pRedomapForm ')' #SoacOpRedomap;
 
-// This is specialised to a certain form of segmaps.
-pSegOp : 'segmap' '(' 'thread' ';' ';' ')' pSegSpace ':' pTypes '{' pKernelBody '}' #SegMap;
+// This is specialised to a certain form of seg ops.
+pSegOp : 'segmap' '(' 'thread' ';' ';' ')' pSegSpace ':' pTypes '{' pKernelBody '}' #SegMap
+       | 'segred' '(' 'thread' ';' ';' ')' pSegSpace ':' pTypes '{' pKernelBody '}' '(' pSegBinOp (',' pSegBinOp)* ')' #SegRed;
+
+// Futhark's SegBinOp: {neutrals}, shape, [commutative] lambda.
+pSegBinOp: '{' (pSubExp (',' pSubExp)*)? '}' ',' pExtShape? ',' pComm pLambda;
+
+pComm: 'commutative'?;
 
 pKernelBody: pStm* 'return' '{' 'returns' pSubExp (',' 'returns' pSubExp)* '}' #KernelBody
     | '{' 'return' pSubExp (',' 'returns' pSubExp)* '}' #EmptyKernelBody;
@@ -59,8 +65,6 @@ pMapForm: pLambda ',' pLambda;
 pRedomapForm: pLambda ',' '{' pReduce? (',' pReduce)* '}';
 
 pReduce: pComm pLambda  ',' '{' pSubExp? (',' pSubExp)* '}';
-
-pComm: 'commutative'?;
 
 pLambda: '\\' '{' pLParam? (',' pLParam)* '}' ':' pTypes '->' pBody;
 
