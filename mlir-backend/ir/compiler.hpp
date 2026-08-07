@@ -682,10 +682,8 @@ struct FutharkCompiler {
         Undefined();
       auto vnBound = stm.pat.elems[0].name;
 
-      if (auto e = std::get_if<ExpBasicOp>(&stm.exp.v)) {
-        if (auto r = toAffineRead(vnBound, e->op, idToIndex)) {
-          affine_reads.push_back(r.value());
-        }
+      if (auto r = toAffineRead(vnBound, stm.exp, idToIndex)) {
+        affine_reads.push_back(r.value());
       }
     }
 
@@ -921,42 +919,35 @@ struct FutharkCompiler {
     Unreachable();
   }
 
-  // (Currently only supports affine functions of the iteration variables
-  // that use the iteration variables and static constants.)
-  std::optional<AffineRead>
-  toAffineRead(VName vn, const BasicOp &exp,
-               std::unordered_map<std::string, long> iterationSpaceIndex) {
-    auto rank = iterationSpaceIndex.size();
-    if (auto *idx = std::get_if<BasicOpFlatIndex>(&exp.v)) {
-      auto vnArray = idx->base.GetVName();
+  // Currently the only indexing recognized as affine are direct uses of the
+  // iteration space variables, e.g., `x[i]` where `i` is an iteration variable.
+  std::optional<AffineRead> toAffineRead(
+      VName vn, const Exp &exp,
+      const std::unordered_map<std::string, long> &iterationSpaceIndex) {
+      auto rank = iterationSpaceIndex.size();
+      if (auto e = std::get_if<ExpBasicOp>(&exp.v)) {
+        if (auto idx = std::get_if<BasicOpFlatIndex>(&e->op.v)) {
+          auto vnArray = idx->base.GetVName();
 
-      if (idx->operands.size() != 1)
-        // TODO multiple indices.
-        Undefined();
+          if (idx->operands.size() != 1)
+            // TODO multiple indices.
+            Undefined();
 
+          auto vnDim = idx->operands[0].GetVName();
+          auto res = iterationSpaceIndex.find(vnDim.name);
+          if (res == iterationSpaceIndex.end())
+            // TODO suport affine indexing beyond seg space ids
+            Undefined();
+          auto i = res->second;
 
-      // XXX faa subexp fra idx->operands[0].
-      // Find ud af om den subexp er paa den rigtige form.
-      // Lav den subexp om til en affine expression.
-      // Lav Affine map.
+          std::vector<mlir::AffineExpr> usedDims;
+          usedDims.push_back(mlir::getAffineDimExpr(i, &context));
+          auto m = mlir::AffineMap::get(rank, 0, usedDims, &context);
 
-      // Two cases:
-      // (1) Is idx an iteration space id?
-      auto vnDim = idx->operands[0].GetVName();
-      auto res = iterationSpaceIndex.find(vnDim.name);
-      if (res == iterationSpaceIndex.end())
-        // TODO suport affine indexing beyond seg space ids
-        Undefined();
-      auto i = res->second;
+          return AffineRead{vn, vnArray, m};
 
-      std::vector<mlir::AffineExpr> usedDims;
-      usedDims.push_back(mlir::getAffineDimExpr(i, &context));
-      auto m = mlir::AffineMap::get(rank, 0, usedDims, &context);
-
-      return AffineRead{vn, vnArray, m};
-
-      // (2) Is idx an affine transform on an iteration space id?
-    }
+        }
+      }
     return std::nullopt;
   }
 };
