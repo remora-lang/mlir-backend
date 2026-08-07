@@ -1,0 +1,28 @@
+name_source {7562}
+
+types {
+
+}
+
+
+
+entry("main",
+      {xss: [][]i32,
+       c: i32},
+      [][]i32)
+  entry_main (d_7461 : i64,
+              d_7462 : i64,
+              xss_7463 : [d_7461][d_7462]i32,
+              c_7464 : i32)
+  : {[d_7461][d_7462]i32} = {
+  let {defunc_0_map_res_pretr_7555 : [d_7461][d_7462]i32} =
+    segmap(thread; ; )
+    (gtid_7556 < d_7461, gtid_7557 < d_7462) (~phys_tid_7558) : {i32} {
+      let {eta_p_7559 : i32} =
+        xss_7463[gtid_7556, gtid_7557]
+      let {lifted_lambda_res_7560 : i32} =
+        add32(c_7464, eta_p_7559)
+      return {returns lifted_lambda_res_7560}
+    }
+  in {defunc_0_map_res_pretr_7555}
+}

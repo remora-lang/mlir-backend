@@ -924,30 +924,28 @@ struct FutharkCompiler {
   std::optional<AffineRead> toAffineRead(
       VName vn, const Exp &exp,
       const std::unordered_map<std::string, long> &iterationSpaceIndex) {
-      auto rank = iterationSpaceIndex.size();
-      if (auto e = std::get_if<ExpBasicOp>(&exp.v)) {
-        if (auto idx = std::get_if<BasicOpFlatIndex>(&e->op.v)) {
-          auto vnArray = idx->base.GetVName();
+    auto rank = iterationSpaceIndex.size();
+    if (auto e = std::get_if<ExpBasicOp>(&exp.v)) {
+      if (auto idx = std::get_if<BasicOpFlatIndex>(&e->op.v)) {
+        auto vnArray = idx->base.GetVName();
 
-          if (idx->operands.size() != 1)
-            // TODO multiple indices.
-            Undefined();
+        std::vector<mlir::AffineExpr> usedDims;
+        for (auto operand : idx->operands) {
 
-          auto vnDim = idx->operands[0].GetVName();
+          auto vnDim = operand.GetVName();
           auto res = iterationSpaceIndex.find(vnDim.name);
           if (res == iterationSpaceIndex.end())
             // TODO suport affine indexing beyond seg space ids
             Undefined();
           auto i = res->second;
 
-          std::vector<mlir::AffineExpr> usedDims;
           usedDims.push_back(mlir::getAffineDimExpr(i, &context));
-          auto m = mlir::AffineMap::get(rank, 0, usedDims, &context);
-
-          return AffineRead{vn, vnArray, m};
-
         }
+
+        auto m = mlir::AffineMap::get(rank, 0, usedDims, &context);
+        return AffineRead{vn, vnArray, m};
       }
+    }
     return std::nullopt;
   }
 };
