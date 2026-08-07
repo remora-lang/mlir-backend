@@ -33,34 +33,26 @@ pPatElem: ID ':' pType;
 // https://hackage-content.haskell.org/package/futhark-0.25.34/docs/Futhark-IR-Syntax.html#t:Exp
 pExp: pApply #ExpApply
     | pBasicOp #ExpBasicOp
-    | pSoacOp #ExpSoacOp
     | pSegOp #ExpSegOp
     | pSizeOp #ExpSizeOp
     | pSubExp #ExpSubExp;
 
 pSizeOp: 'get_size' '(' ID ',' ID ')';
 
-pSoacOp: 'map' '('  pScrema pMapForm ')' #SoacOpMap
-| 'redomap' '('  pScrema pRedomapForm ')' #SoacOpRedomap;
+// This is specialised to a certain form of seg ops.
+pSegOp : 'segmap' '(' 'thread' ';' ';' ')' pSegSpace ':' pTypes '{' pKernelBody '}' #SegMap
+       | 'segred' '(' 'thread' ';' ';' ')' pSegSpace ':' pTypes '{' pKernelBody '}' '(' pSegBinOp (',' pSegBinOp)* ')' #SegRed;
 
-// This is specialised to a certain form of segmaps.
-pSegOp : 'segmap' '(' 'thread' ';' ';' ')' pSegSpace ':' pTypes '{' pKernelBody '}' #SegMap;
+// Futhark's SegBinOp: {neutrals}, shape, [commutative] lambda.
+pSegBinOp: '{' (pSubExp (',' pSubExp)*)? '}' ',' pExtShape? ',' pComm pLambda;
+
+pComm: 'commutative'?;
 
 pKernelBody: pStm* 'return' '{' 'returns' pSubExp (',' 'returns' pSubExp)* '}' #KernelBody
     | '{' 'return' pSubExp (',' 'returns' pSubExp)* '}' #EmptyKernelBody;
 
 
 pSegSpace: '(' ID '<' pSubExp (',' ID '<' pSubExp)* ')' '(' '~' ID ')';
-
-pScrema: pSubExp ',' '{' ID? (',' ID)* '}' ',';
-
-pMapForm: pLambda ',' pLambda;
-
-pRedomapForm: pLambda ',' '{' pReduce? (',' pReduce)* '}';
-
-pReduce: pComm pLambda  ',' '{' pSubExp? (',' pSubExp)* '}';
-
-pComm: 'commutative'?;
 
 pLambda: '\\' '{' pLParam? (',' pLParam)* '}' ':' pTypes '->' pBody;
 

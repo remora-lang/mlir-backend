@@ -19,7 +19,6 @@ struct Body;
 struct Lambda;
 struct FunDef;
 struct Prog;
-struct Soac;
 struct SegOp;
 struct MCOp;
 struct MemInfoLet;
@@ -207,12 +206,6 @@ struct RetAls {
   std::vector<int> otherAls;
 };
 
-struct NoOp {};
-
-struct Op {
-  std::variant<NoOp, std::shared_ptr<Soac>> v;
-};
-
 // TODO
 struct StmAux {};
 
@@ -226,11 +219,6 @@ struct ExpApply {
   std::vector<std::pair<RetType, RetAls>> retTypes;
   Safety safety;
 };
-
-// struct ExpOp
-//{
-//	Op op;
-// };
 
 struct ExpSubExp {
   SubExp subExp;

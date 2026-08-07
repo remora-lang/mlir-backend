@@ -3,7 +3,6 @@
 #include "core.hpp"
 
 struct SegOp;
-struct Soac;
 
 using Name = std::string;
 
@@ -39,10 +38,7 @@ struct SizeOp {
   std::variant<GetSize, GetSizeMax, CmpSizeLe, CalcNumBlocks> v;
 };
 
-struct OtherOp {
-  std::shared_ptr<Soac> soac;
-};
-
+// OtherOp (SOAC) is omitted: we assume post-unstream GPU IR, which has no SOACs.
 struct HostOp {
-  std::variant<std::shared_ptr<SegOp>, SizeOp, OtherOp> v;
+  std::variant<std::shared_ptr<SegOp>, SizeOp> v;
 };

@@ -4,7 +4,6 @@
 #include "error.hpp"
 #include "match.hpp"
 #include "segop.hpp"
-#include "soac.hpp"
 #include "syntax.hpp"
 #include <format>
 #include <mlir/Dialect/Arith/IR/Arith.h>
@@ -363,275 +362,22 @@ struct FutharkCompiler {
     return ctx.subexps.lookup(vname);
   }
 
-  mlir::Value LowerSoac(std::shared_ptr<Soac> pSoac, Ctx &ctx) {
-    if (auto *val = std::get_if<SoacScrema>(&pSoac->v)) {
-      return LowerScrema(*val, ctx);
-    }
-
-    Unreachable();
-  }
-
-  mlir::Value LowerScrema(SoacScrema screma, Ctx &ctx) {
-    // The size of the input arrays
-    auto inputSize = LowerSubExp(screma.w, ctx);
-
-    // Lower the input arrs
-    std::vector<mlir::Value> arrs;
-    for (auto arr : screma.arrs) {
-      arrs.push_back(LowerSubExp(arr.name, ctx));
-    }
-
-    if (screma.form.scremaLambda.ret.size() != 1) {
-      throw std::runtime_error("TODO: Multiple return types");
-    }
-
-    if (screma.form.scremaPostLambda.params.size() !=
-            screma.form.scremaPostLambda.ret.size() ||
-        screma.form.scremaPostLambda.body.stms.size() != 0) {
-      throw std::runtime_error("TODO: non-identity postlambda");
-    }
-
-    // Compute the dimensions of the return type
-    mlir::Type baseTy;
-    std::vector<int64_t> dimensions;
-    dimensions.push_back(screma.w.GetIntValue());
-    if (auto *val = std::get_if<TypeArray<Shape, NoUniqueness>>(
-            &screma.form.scremaLambda.ret[0].t.v)) {
-      baseTy = LowerPrimType(val->elem);
-      for (auto d : val->shape.dims)
-        dimensions.push_back(d.GetIntValue());
-    }
-
-    else if (auto *val = std::get_if<TypePrim<Shape, NoUniqueness>>(
-                 &screma.form.scremaLambda.ret[0].t.v)) {
-      baseTy = LowerPrimType(val->t);
-    }
-
-    else {
-      throw std::runtime_error("Unsupported screma return type");
-    }
-
-    auto rvalueTy = mlir::RankedTensorType::get(dimensions, baseTy);
-
-    mlir::Value carry = mlir::tensor::EmptyOp::create(builder, rvalueTy, {});
-
-    auto idxTy = mlir::IntegerType::get(&context, 64);
-
-    auto getIdx = [this](unsigned long long x) {
-      return mlir::arith::ConstantIndexOp::create(builder, x).getResult();
-    };
-
-    auto begin = getIdx(0);
-    auto end = getIdx(screma.w.GetIntValue());
-    auto step = getIdx(1);
-
-    auto forOp = mlir::scf::ForOp::create(builder, begin, end, step, carry);
-    auto indVar = forOp.getInductionVar();
-    auto block = forOp.getBody();
-
-    auto outputDest = carry;
-    carry = block->getArgument(1);
-
-    auto before = builder.saveInsertionPoint();
-    builder.setInsertionPointToStart(block);
-
-    auto zero = getIdx(0);
-    auto one = getIdx(1);
-
-    Ctx scremaCtx = ctx;
-    for (auto varIdx = 0; varIdx < screma.form.scremaLambda.params.size();
-         varIdx++) {
-      auto value = scremaCtx.subexps.lookup(screma.arrs[varIdx].name);
-
-      auto t = value.getType();
-
-      auto dd = llvm::dyn_cast<mlir::RankedTensorType>(t).getShape();
-
-      std::vector<mlir::Value> _offsets;
-      _offsets.push_back(indVar);
-      for (auto i = 1; i < dd.size(); i++)
-        _offsets.push_back(zero);
-
-      std::vector<mlir::Value> _sizes;
-      _sizes.push_back(getIdx(1));
-      for (auto i = 1; i < dd.size(); i++)
-        _sizes.push_back(getIdx(dd[i]));
-
-      std::vector<mlir::Value> strides2;
-      for (auto i = 0; i < dd.size(); i++)
-        strides2.push_back(one);
-
-      mlir::Value slice{};
-      if (dd.size() <= 1) {
-        slice =
-            mlir::tensor::ExtractOp::create(builder, value, indVar).getResult();
-      }
-
-      else {
-        std::vector<std::vector<mlir::OpFoldResult>> reassociation = {};
-
-        for (auto vec : {_offsets, _sizes, strides2}) {
-
-          std::vector<mlir::OpFoldResult> indices = {};
-          for (auto elem : vec) {
-            indices.push_back(mlir::getAsOpFoldResult(elem));
-          }
-          reassociation.push_back(indices);
-        }
-
-        slice = mlir::tensor::ExtractSliceOp::create(builder,
-                                                     value,
-                                                     reassociation[0],
-                                                     reassociation[1],
-                                                     reassociation[2])
-                    .getResult();
-
-        std::vector<mlir::ReassociationIndices> toCollapse;
-        toCollapse.push_back({0, 1});
-        for (uint64_t i = 2; i < _offsets.size(); i++) {
-          mlir::ReassociationIndices indices{};
-          indices.push_back(i);
-          toCollapse.push_back(indices);
-        }
-
-        auto currTy = llvm::dyn_cast<mlir::RankedTensorType>(slice.getType());
-        std::vector<int64_t> dims = currTy.getShape();
-        dims.erase(dims.begin());
-
-        auto targetTy =
-            mlir::RankedTensorType::get(dims, currTy.getElementType());
-
-        auto reshaped = mlir::tensor::CollapseShapeOp::create(
-            builder, targetTy, slice, toCollapse);
-        slice = reshaped;
-      }
-
-      scremaCtx.subexps.insert(screma.form.scremaLambda.params[varIdx].name,
-                               slice);
-    }
-
-    auto execution = LowerBody(screma.form.scremaLambda.body, scremaCtx);
-
-    std::vector<mlir::Value> offsets;
-    offsets.push_back(indVar);
-    for (auto i = 1; i < dimensions.size(); i++)
-      offsets.push_back(zero);
-
-    std::vector<mlir::Value> sizes;
-    sizes.push_back(getIdx(1));
-    for (auto i = 1; i < dimensions.size(); i++)
-      sizes.push_back(getIdx(dimensions[i]));
-
-    std::vector<mlir::Value> strides;
-    for (auto i = 0; i < dimensions.size(); i++)
-      strides.push_back(one);
-    ;
-    mlir::Value insert{};
-    if (dimensions.size() <= 1) {
-      insert =
-          mlir::tensor::InsertOp::create(builder, execution, carry, {indVar})
-              .getResult();
-    }
-
-    else {
-      std::vector<std::vector<mlir::OpFoldResult>> reassociation = {};
-
-      for (auto vec : {offsets, sizes, strides}) {
-
-        std::vector<mlir::OpFoldResult> indices = {};
-        for (auto elem : vec) {
-          indices.push_back(mlir::getAsOpFoldResult(elem));
-        }
-        reassociation.push_back(indices);
-      }
-
-      insert = mlir::tensor::InsertSliceOp::create(
-          builder,
-          execution,
-          carry,
-          llvm::ArrayRef<mlir::OpFoldResult>(reassociation[0]),
-          llvm::ArrayRef<mlir::OpFoldResult>(reassociation[1]),
-          llvm::ArrayRef<mlir::OpFoldResult>(reassociation[2]));
-    }
-
-    mlir::scf::YieldOp::create(builder, insert);
-    builder.restoreInsertionPoint(before);
-
-    outputDest = forOp.getResult(0);
-    if (screma.form.scremaReduces.size() == 0)
-      return outputDest;
-
-    auto red = LowerRedomap(screma, outputDest, ctx);
-    return red;
-  }
-
-  mlir::Value LowerRedomap(SoacScrema screma, mlir::Value src, Ctx &ctx) {
-    auto inputSize = LowerSubExp(screma.w, ctx);
-
-    // Clone the context
-    Ctx scremaCtx = ctx;
-
-    auto inputTy = llvm::dyn_cast<mlir::RankedTensorType>(src.getType());
-    mlir::RankedTensorType temp =
-        mlir::RankedTensorType::Builder(inputTy).dropDim(0);
-    mlir::Type rvalueTy = temp;
-    if (temp.getShape().size() == 0)
-      rvalueTy = temp.getElementType();
-
-    auto red = screma.form.scremaReduces[0];
-    assert(screma.form.scremaReduces.size() == 1);
-    auto carry = LowerSubExp(red.neutral[0], ctx);
-    assert(red.neutral.size() == 1);
-
-    auto getIdx = [this](unsigned long long x) {
-      return mlir::arith::ConstantIndexOp::create(builder, x).getResult();
-    };
-
-    auto begin = getIdx(0);
-    auto end = getIdx(screma.w.GetIntValue());
-    auto step = getIdx(1);
-
-    auto forOp = mlir::scf::ForOp::create(builder, begin, end, step, carry);
-    auto indVar = forOp.getInductionVar();
-    auto block = forOp.getBody();
-
-    auto outputDest = carry;
-    carry = block->getArgument(1);
-
-    auto before = builder.saveInsertionPoint();
-    builder.setInsertionPointToStart(block);
-
-    auto zero = getIdx(0);
-    auto one = getIdx(1);
-
-    scremaCtx.subexps.insert(red.lambda.params[0].name, carry);
-    auto slice = mlir::tensor::ExtractOp::create(builder, src, indVar);
-    scremaCtx.subexps.insert(red.lambda.params[1].name, slice);
-
-    auto execution = LowerBody(red.lambda.body, scremaCtx);
-
-    mlir::scf::YieldOp::create(builder, carry);
-    builder.restoreInsertionPoint(before);
-
-    return forOp.getResult(0);
-  }
-
   mlir::Value LowerHostOp(HostOp &op, Ctx &ctx) {
     if (auto *seg = std::get_if<std::shared_ptr<SegOp>>(&op.v))
       return LowerSegOp(*seg, ctx);
     if (auto *size = std::get_if<SizeOp>(&op.v))
       return LowerSizeOp(*size, ctx);
-    if (auto *other = std::get_if<OtherOp>(&op.v))
-      return LowerSoac(other->soac, ctx);
+
     Unreachable();
   }
 
   mlir::Value LowerSegOp(std::shared_ptr<SegOp> pSegOp, Ctx &ctx) {
-    if (auto *val = std::get_if<SegMap>(&pSegOp->v)) {
+    if (auto *val = std::get_if<SegMap>(&pSegOp->v))
       return LowerSegMap(*val, ctx);
-    }
+    if (std::get_if<SegRed>(&pSegOp->v))
+      Undefined();
 
-    Undefined();
+    Unreachable();
   }
 
   mlir::Value LowerSizeOp(SizeOp &sizeOp, Ctx &ctx) { Undefined(); }

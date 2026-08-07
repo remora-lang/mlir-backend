@@ -18,7 +18,7 @@ set(LIBS
         LLVM
         )
 
-add_executable  (mlir-backend "mlir-backend.cpp" "${GEN_DIR}/FutharkLexer.cpp" "${GEN_DIR}/FutharkParser.cpp" "ir/core.hpp" "ir/parser.hpp" "ir/primitive.hpp" "ir/soac.hpp" "ir/segop.hpp" "ir/gpu.hpp" "ir/syntax.hpp")
+add_executable  (mlir-backend "mlir-backend.cpp" "${GEN_DIR}/FutharkLexer.cpp" "${GEN_DIR}/FutharkParser.cpp" "ir/core.hpp" "ir/parser.hpp" "ir/primitive.hpp" "ir/segop.hpp" "ir/gpu.hpp" "ir/syntax.hpp")
 
 target_precompile_headers(mlir-backend PRIVATE 
     pch.h
