@@ -145,9 +145,18 @@ struct FutharkTranslationVisitor {
       return {VisitApply(pApply->pApply())};
     if (auto *pBasicOp = dynamic_cast<FutharkParser::ExpBasicOpContext *>(ctx))
       return {VisitExpBasicOp(pBasicOp)};
+    if (auto *pSizeOp = dynamic_cast<FutharkParser::ExpSizeOpContext *>(ctx))
+      return {VisitSizeOp(pSizeOp->pSizeOp())};
     if (auto *pSubExp = dynamic_cast<FutharkParser::ExpSubExpContext *>(ctx))
       return {VisitExpSubExp(pSubExp)};
     Unreachable();
+  }
+
+  Exp VisitSizeOp(FutharkParser::PSizeOpContext *ctx) {
+    GetSize g;
+    g.name = VisitId(ctx->ID(0));
+    g.cls = SizeClass{VisitId(ctx->ID(1))};
+    return {ExpHostOp{HostOp{SizeOp{g}}}};
   }
 
   // TODO: Parse diet and RetAls
@@ -252,6 +261,13 @@ struct FutharkTranslationVisitor {
       return {BinOpMul{intTy}};
     if (name == "fmul")
       return {BinOpFMul{floatTy}};
+    // No-wrap integer arithmetic behaves like plain arithmetic here.
+    if (name == "add_nw")
+      return {BinOpAdd{intTy}};
+    if (name == "sub_nw")
+      return {BinOpSub{intTy}};
+    if (name == "mul_nw")
+      return {BinOpMul{intTy}};
 
     Unreachable();
   }
@@ -349,10 +365,12 @@ struct FutharkTranslationVisitor {
   Exp VisitExpSoacOp(FutharkParser::ExpSoacOpContext *ctx) {
     auto soac = ctx->pSoacOp();
     if (auto *pMap = dynamic_cast<FutharkParser::SoacOpMapContext *>(soac))
-      return {ExpSoacOp{std::make_shared<Soac>(VisitSoacOpMap(pMap))}};
+      return {ExpHostOp{
+          HostOp{OtherOp{std::make_shared<Soac>(VisitSoacOpMap(pMap))}}}};
     if (auto *pRedomap =
             dynamic_cast<FutharkParser::SoacOpRedomapContext *>(soac))
-      return {ExpSoacOp{std::make_shared<Soac>(VisitSoacOpRedomap(pRedomap))}};
+      return {ExpHostOp{HostOp{
+          OtherOp{std::make_shared<Soac>(VisitSoacOpRedomap(pRedomap))}}}};
 
     Unreachable();
   }
@@ -423,7 +441,7 @@ struct FutharkTranslationVisitor {
   Exp VisitExpSegOp(FutharkParser::ExpSegOpContext *ctx) {
     auto segop = ctx->pSegOp();
     if (auto *pSegMap = dynamic_cast<FutharkParser::SegMapContext *>(segop))
-      return {ExpSegOp{std::make_shared<SegOp>(VisitSegMap(pSegMap))}};
+      return {ExpHostOp{HostOp{std::make_shared<SegOp>(VisitSegMap(pSegMap))}}};
     Unreachable();
   }
 

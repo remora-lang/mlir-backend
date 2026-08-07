@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core.hpp"
+#include "gpu.hpp"
 
 enum class Rep {
   SOACS,
@@ -20,7 +21,6 @@ struct FunDef;
 struct Prog;
 struct Soac;
 struct SegOp;
-struct HostOp;
 struct MCOp;
 struct MemInfoLet;
 struct MemInfoFParam;
@@ -232,21 +232,16 @@ struct ExpApply {
 //	Op op;
 // };
 
-// TODO: Use a generic `Op` structure instead of forcing soacs
-struct ExpSoacOp {
-  std::shared_ptr<Soac> soac;
-};
-
-struct ExpSegOp {
-  std::shared_ptr<SegOp> segop;
-};
-
 struct ExpSubExp {
   SubExp subExp;
 };
 
+struct ExpHostOp {
+  HostOp op;
+};
+
 struct Exp {
-  std::variant<ExpBasicOp, ExpApply, ExpSoacOp, ExpSegOp, ExpSubExp> v;
+  std::variant<ExpBasicOp, ExpApply, ExpHostOp, ExpSubExp> v;
 };
 
 struct Stm {

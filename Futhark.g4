@@ -4,9 +4,9 @@ root: header? pFunDef+ EOF;
 
 header: 'name_source' '{' NUMBER '}' 'types' '{' '}';
 
-pFunDef: (pEntry? | 'fun') ID LPARAM fParam? (',' fParam)* RPARAM ':' OPEN_BRACKET pType CLOSE_BRACKET '=' OPEN_BRACKET pBody CLOSE_BRACKET;
+pFunDef: (pEntry? | 'fun') ID LPARAM fParam? (',' fParam)* RPARAM ':' OPEN_BRACKET '*'? pType CLOSE_BRACKET '=' OPEN_BRACKET pBody CLOSE_BRACKET;
 
-pEntry: ('entry') LPARAM STRING_LITERAL COMMA OPEN_BRACKET pEntryPointInput? (COMMA pEntryPointInput)* CLOSE_BRACKET COMMA pType RPARAM;
+pEntry: ('entry') LPARAM STRING_LITERAL COMMA OPEN_BRACKET pEntryPointInput? (COMMA pEntryPointInput)* CLOSE_BRACKET COMMA '*'? pType RPARAM;
 
 pEntryPointInput: ID ':' pType;
 
@@ -35,7 +35,10 @@ pExp: pApply #ExpApply
     | pBasicOp #ExpBasicOp
     | pSoacOp #ExpSoacOp
     | pSegOp #ExpSegOp
+    | pSizeOp #ExpSizeOp
     | pSubExp #ExpSubExp;
+
+pSizeOp: 'get_size' '(' ID ',' ID ')';
 
 pSoacOp: 'map' '('  pScrema pMapForm ')' #SoacOpMap
 | 'redomap' '('  pScrema pRedomapForm ')' #SoacOpRedomap;
@@ -83,7 +86,7 @@ pBasicOp: 'replicate' '(' pExtShape ',' pSubExp ')' #BasicOpReplicate
 
 pBinOp: binaryOpcode LPARAM pSubExp ',' pSubExp RPARAM;
 
-binaryOpcode: ADD | FADD | SUB | FSUB | MUL | FMUL | UDIV | UDIVUP | SDIV | SDIVUP | FDIV | FMOD | UMOD | SMOD | SQUOT | SREM | SMIN | UMIN | FMIN | SMAX | UMAX | FMAX | SHL | LSHR | ASHR | AND | OR | XOR | POW | FPOW | LOGAND | LOGOR;
+binaryOpcode: ADD | ADDNW | FADD | SUB | SUBNW | FSUB | MUL | MULNW | FMUL | UDIV | UDIVUP | SDIV | SDIVUP | FDIV | FMOD | UMOD | SMOD | SQUOT | SREM | SMIN | UMIN | FMIN | SMAX | UMAX | FMAX | SHL | LSHR | ASHR | AND | OR | XOR | POW | FPOW | LOGAND | LOGOR;
 
 pConvOp: 'sext' pPrimType pSubExp 'to' pPrimType;
 
@@ -111,6 +114,9 @@ SUB: 'sub' NUMBER;
 FSUB: 'fsub' NUMBER;
 MUL: 'mul' NUMBER;
 FMUL: 'fmul' NUMBER;
+ADDNW: 'add_nw' NUMBER;
+SUBNW: 'sub_nw' NUMBER;
+MULNW: 'mul_nw' NUMBER;
 UDIV: 'udiv' NUMBER;
 UDIVUP: 'udiv_up' NUMBER;
 SDIV: 'sdiv' NUMBER;
@@ -143,7 +149,7 @@ fragment DIGIT  : [0-9];
 
 STRING_LITERAL: '"' ID '"';
 
-ID : ( [a-zA-Z_+'-'*/%!<>|&^.#] ) ([a-zA-Z0-9_+\-*/%!<>|&^.#])*;
+ID : ( [a-zA-Z_+'-'*/%!<>|&^.#] ) ([a-zA-Z0-9_+\-*/%!<>|&^.#₀-₉])*;
 
 LPARAM      : '(';
 RPARAM      : ')';

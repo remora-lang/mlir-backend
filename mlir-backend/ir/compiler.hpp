@@ -163,12 +163,8 @@ struct FutharkCompiler {
       return LowerSubExp(val->subExp, ctx);
     }
 
-    if (auto *val = std::get_if<ExpSoacOp>(&exp.v)) {
-      return LowerSoac(val->soac, ctx);
-    }
-
-    if (auto *val = std::get_if<ExpSegOp>(&exp.v)) {
-      return LowerSegOp(val->segop, ctx);
+    if (auto *val = std::get_if<ExpHostOp>(&exp.v)) {
+      return LowerHostOp(val->op, ctx);
     }
 
     if (auto *val = std::get_if<ExpApply>(&exp.v)) {
@@ -620,6 +616,16 @@ struct FutharkCompiler {
     return forOp.getResult(0);
   }
 
+  mlir::Value LowerHostOp(HostOp &op, Ctx &ctx) {
+    if (auto *seg = std::get_if<std::shared_ptr<SegOp>>(&op.v))
+      return LowerSegOp(*seg, ctx);
+    if (auto *size = std::get_if<SizeOp>(&op.v))
+      return LowerSizeOp(*size, ctx);
+    if (auto *other = std::get_if<OtherOp>(&op.v))
+      return LowerSoac(other->soac, ctx);
+    Unreachable();
+  }
+
   mlir::Value LowerSegOp(std::shared_ptr<SegOp> pSegOp, Ctx &ctx) {
     if (auto *val = std::get_if<SegMap>(&pSegOp->v)) {
       return LowerSegMap(*val, ctx);
@@ -627,6 +633,8 @@ struct FutharkCompiler {
 
     Undefined();
   }
+
+  mlir::Value LowerSizeOp(SizeOp &sizeOp, Ctx &ctx) { Undefined(); }
 
   mlir::Value LowerSegMap(SegMap pSegMap, Ctx &ctx) {
     // TODO Limitations
@@ -798,6 +806,10 @@ struct FutharkCompiler {
       }
 
       return mlir::arith::MulIOp::create(builder, {op0, op1}).getResult();
+    }
+
+    if (std::get_if<BinOpSub>(&binOp.v)) {
+      Undefined();
     }
 
     if (auto *div = std::get_if<BinOpSDivUp>(&binOp.v)) {
