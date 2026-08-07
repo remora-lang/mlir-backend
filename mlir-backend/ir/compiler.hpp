@@ -788,7 +788,7 @@ struct FutharkCompiler {
       return mlir::arith::AddIOp::create(builder, {op0, op1}).getResult();
     }
 
-    if (auto *mul = std::get_if<BinOpAdd>(&binOp.v)) {
+    if (auto *mul = std::get_if<BinOpMul>(&binOp.v)) {
 
       if (isTensor) {
         auto emptyTensor = mlir::tensor::EmptyOp::create(
