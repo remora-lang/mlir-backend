@@ -11,7 +11,6 @@
 
 #include "ir/core.hpp"
 #include "ir/syntax.hpp"
-#include "ir/soac.hpp"
 #include "ir/parser.hpp"
 #include "ir/compiler.hpp"
 #include <config.h>

@@ -3,7 +3,6 @@
 #include "FutharkParser.h"
 #include "error.hpp"
 #include "segop.hpp"
-#include "soac.hpp"
 #include "syntax.hpp"
 
 using namespace antlr4;
@@ -137,8 +136,6 @@ struct FutharkTranslationVisitor {
   }
 
   Exp VisitExp(FutharkParser::PExpContext *ctx) {
-    if (auto *pSoac = dynamic_cast<FutharkParser::ExpSoacOpContext *>(ctx))
-      return {VisitExpSoacOp(pSoac)};
     if (auto *pSegOp = dynamic_cast<FutharkParser::ExpSegOpContext *>(ctx))
       return {VisitExpSegOp(pSegOp)};
     if (auto *pApply = dynamic_cast<FutharkParser::ExpApplyContext *>(ctx))
@@ -362,56 +359,6 @@ struct FutharkTranslationVisitor {
     return {ExpSubExp{VisitSubExp(ctx->pSubExp())}};
   }
 
-  Exp VisitExpSoacOp(FutharkParser::ExpSoacOpContext *ctx) {
-    auto soac = ctx->pSoacOp();
-    if (auto *pMap = dynamic_cast<FutharkParser::SoacOpMapContext *>(soac))
-      return {ExpHostOp{
-          HostOp{OtherOp{std::make_shared<Soac>(VisitSoacOpMap(pMap))}}}};
-    if (auto *pRedomap =
-            dynamic_cast<FutharkParser::SoacOpRedomapContext *>(soac))
-      return {ExpHostOp{HostOp{
-          OtherOp{std::make_shared<Soac>(VisitSoacOpRedomap(pRedomap))}}}};
-
-    Unreachable();
-  }
-
-  Soac VisitSoacOpMap(FutharkParser::SoacOpMapContext *ctx) {
-    SoacScrema screma;
-    screma.w = VisitSubExp(ctx->pScrema()->pSubExp());
-    for (auto id : ctx->pScrema()->ID()) {
-      screma.arrs.push_back(VName{id->getText()});
-    }
-
-    screma.form = VisitMapForm(ctx->pMapForm());
-    return {screma};
-  }
-
-  ScremaForm VisitMapForm(FutharkParser::PMapFormContext *ctx) {
-    ScremaForm form;
-    form.scremaLambda = VisitLambda(ctx->pLambda()[0]);
-    form.scremaPostLambda = VisitLambda(ctx->pLambda()[1]);
-    return form;
-  }
-
-  Soac VisitSoacOpRedomap(FutharkParser::SoacOpRedomapContext *ctx) {
-    SoacScrema screma;
-    screma.w = VisitSubExp(ctx->pScrema()->pSubExp());
-    for (auto id : ctx->pScrema()->ID()) {
-      screma.arrs.push_back(VName{id->getText()});
-    }
-
-    screma.form = VisitRedomapForm(ctx->pRedomapForm());
-    return {screma};
-  }
-
-  ScremaForm VisitRedomapForm(FutharkParser::PRedomapFormContext *ctx) {
-    ScremaForm form;
-    form.scremaLambda = VisitLambda(ctx->pLambda());
-    for (auto reduce : ctx->pReduce())
-      form.scremaReduces.push_back(VisitReduce(reduce));
-    return form;
-  }
-
   Lambda VisitLambda(FutharkParser::PLambdaContext *ctx) {
     Lambda lambda;
     for (auto param : ctx->pLParam()) {
@@ -425,17 +372,6 @@ struct FutharkTranslationVisitor {
       lambda.ret.push_back(VisitType(t));
     lambda.body = VisitBody(ctx->pBody());
     return lambda;
-  }
-
-  Reduce VisitReduce(FutharkParser::PReduceContext *ctx) {
-    Reduce reduce;
-    // TODO: Parse commutativity
-    reduce.comm = Commutativity::Commutative;
-    reduce.lambda = VisitLambda(ctx->pLambda());
-    for (auto subExp : ctx->pSubExp())
-      reduce.neutral.push_back(VisitSubExp(subExp));
-
-    return reduce;
   }
 
   Exp VisitExpSegOp(FutharkParser::ExpSegOpContext *ctx) {
