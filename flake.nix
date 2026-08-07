@@ -66,7 +66,7 @@
     # Print the Futhark GPU IR for a .fut source. Uses `futhark` from PATH.
     gpu-ir = pkgs.writeShellScriptBin "gpu-ir" ''
       set -euo pipefail
-      exec futhark dev --gpu --strip-provenance --no-grid --no-assert --simplify "$@"
+      exec futhark dev --gpu --strip-provenance --no-grid --simplify "$@"
     '';
 
     clean = pkgs.writeShellScriptBin "clean" ''

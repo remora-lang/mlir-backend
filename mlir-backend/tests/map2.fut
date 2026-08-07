@@ -1,1 +1,1 @@
-def main (n: i64) = map (+n) (iota n)
+def main (n: i64) = #[unsafe] map (+n) (iota n)
