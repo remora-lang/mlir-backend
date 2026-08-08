@@ -386,12 +386,12 @@ struct FutharkCompiler {
     // TODO Limitations
     // 1. The map must return a single result.
     // 2. The base type must be scalar (i.e., the seg space creates all dims).
-    // 3. Affine reads with dynamic variables are not recognized as such.
+    // 3. Only affine reads with seg space ids are recognized as such.
     // For example,
-    //    xs[2*gtid + 1]
+    //    xs[gtid]
     // is recognized because gtid is in the iteration (seg) space. But
-    //    xs[2*gtid + 1 - c],
-    // where c is a variable defined outside the kernel body, is not.
+    //    xs[2*gtid + 1]  and  xs[2*gtid + 1 - c],
+    // where c is a variable defined outside the kernel body, are not.
     if (pSegMap.ret.size() != 1) {
       Undefined();
     }
