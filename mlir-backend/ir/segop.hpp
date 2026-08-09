@@ -21,18 +21,18 @@ struct KernelBody {
   std::vector<KernelResult> result;
 };
 
-struct SegMap {
-  std::variant<SegThread, SegBlock, SegThreadInBlock> lvl;
-  SegSpace space;
-  std::vector<Type> ret;
-  KernelBody body;
-};
-
 struct SegBinOp {
   Commutativity comm = Commutativity::Noncommutative;
   Lambda lambda;
   std::vector<SubExp> neutral;
   Shape shape;
+};
+
+struct SegMap {
+  std::variant<SegThread, SegBlock, SegThreadInBlock> lvl;
+  SegSpace space;
+  std::vector<Type> ret;
+  KernelBody body;
 };
 
 struct SegRed {

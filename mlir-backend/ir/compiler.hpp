@@ -7,6 +7,8 @@
 #include "syntax.hpp"
 #include <format>
 #include <mlir/Dialect/Arith/IR/Arith.h>
+#include <mlir/Dialect/Linalg/IR/Linalg.h>
+#include <mlir/Dialect/Tensor/IR/Tensor.h>
 #include <mlir/IR/AffineMap.h>
 #include <mlir/IR/BuiltinTypeInterfaces.h>
 #include <optional>
@@ -363,47 +365,24 @@ struct FutharkCompiler {
   }
 
   mlir::Value LowerHostOp(HostOp &op, Ctx &ctx) {
-    if (auto *seg = std::get_if<std::shared_ptr<SegOp>>(&op.v))
-      return LowerSegOp(*seg, ctx);
-    if (auto *size = std::get_if<SizeOp>(&op.v))
-      return LowerSizeOp(*size, ctx);
-
-    Unreachable();
-  }
-
-  mlir::Value LowerSegOp(std::shared_ptr<SegOp> pSegOp, Ctx &ctx) {
-    if (auto *val = std::get_if<SegMap>(&pSegOp->v))
-      return LowerSegMap(*val, ctx);
-    if (std::get_if<SegRed>(&pSegOp->v))
-      Undefined();
-
-    Unreachable();
+    return match(
+        op.v,
+        [&](SizeOp &v) { return LowerSizeOp(v, ctx); },
+        [&](std::shared_ptr<SegOp> &v) { return LowerSegOp(v, ctx); });
   }
 
   mlir::Value LowerSizeOp(SizeOp &sizeOp, Ctx &ctx) { Undefined(); }
 
-  mlir::Value LowerSegMap(SegMap pSegMap, Ctx &ctx) {
-    // TODO Limitations
-    // 1. The map must return a single result.
-    // 2. The base type must be scalar (i.e., the seg space creates all dims).
-    // 3. Only affine reads with seg space ids are recognized as such.
-    // For example,
-    //    xs[gtid]
-    // is recognized because gtid is in the iteration (seg) space. But
-    //    xs[2*gtid + 1]  and  xs[2*gtid + 1 - c],
-    // where c is a variable defined outside the kernel body, are not.
-    if (pSegMap.ret.size() != 1) {
-      Undefined();
-    }
+  mlir::Value LowerSegOp(std::shared_ptr<SegOp> pSegOp, Ctx &ctx) {
+    return match(
+        pSegOp->v,
+        [&](const SegMap &v) { return LowerSegMap(v, ctx); },
+        [&](const SegRed &v) { return LowerSegRed(v, ctx); });
+  }
 
-    // This lowers a SegMap to a linalg.generic op, whose
-    //   * iteration space corresponds to the SegMap's SegSpace;
-    //   * inputs correspond to "affine reads" in the SegMap body.
-    // An affine read is an array load whose index expression is an affine
-    // function of the iteration space.
-
-    auto baseTy = match(
-        pSegMap.ret[0].t.v,
+  mlir::Type LowerSegOpBaseType(const Type &pReturnType, Ctx &ctx) {
+    return match(
+        pReturnType.t.v,
         [&](const TypePrim<Shape, NoUniqueness> &val) {
           return LowerPrimType(val.t);
         },
@@ -411,8 +390,23 @@ struct FutharkCompiler {
           Undefined();
         },
         [](const auto &) -> mlir::Type { Undefined(); });
-    auto shapeTy = toShapeType(std::views::values(pSegMap.space.dims));
-    auto returnTy = mlir::RankedTensorType::get(shapeTy, baseTy);
+  };
+
+  // TODO Limitations
+  // 1. The map must return a single result.
+  // 2. The base type must be scalar (i.e., the seg space creates all dims).
+  // 3. Only affine reads with seg space ids are recognized as such.
+  // For example,
+  //    xs[gtid]
+  // is recognized because gtid is in the iteration (seg) space. But
+  //    xs[2*gtid + 1]  and  xs[2*gtid + 1 - c],
+  // where c is a variable defined outside the kernel body, are not.
+  mlir::Value LowerSegMap(SegMap pSegMap, Ctx &ctx) {
+    // This lowers a SegMap to a linalg.generic op, whose
+    //   * iteration space corresponds to the SegMap's SegSpace;
+    //   * inputs correspond to "affine reads" in the SegMap body.
+    // An affine read is an array load whose index expression is an affine
+    // function of the iteration space.
 
     // Find iteration space. (id corresponds to gtid.)
     std::vector<Dim> iterSpace;
@@ -448,25 +442,37 @@ struct FutharkCompiler {
     for (auto &read : affine_reads)
       skipLowering.insert(read.result.name);
 
+    // Map the iteration space to each input's dimensions.
+    mlir::SmallVector<mlir::AffineMap> indexingMaps;
+    for (const auto &read : affine_reads) {
+      indexingMaps.push_back(read.indexMap);
+    }
+
     mlir::SmallVector<mlir::Value> dynamicSizes;
     for (const auto &d : iterSpace) {
       if (d.isDynamic)
         dynamicSizes.push_back(mlir::arith::IndexCastOp::create(
             builder, builder.getIndexType(), d.value));
     };
-    mlir::Value output =
-        mlir::tensor::EmptyOp::create(builder, returnTy, dynamicSizes);
 
-    // Map the iteration space to each input's dimensions.
-    // (How does each affine read use the iteration dimensions?)
-    mlir::SmallVector<mlir::AffineMap> indexingMaps;
-    for (const auto &read : affine_reads) {
-      indexingMaps.push_back(read.indexMap);
-    }
-
+    // XXX Different.
     // Map the iteration space to the output's dimensions.
     indexingMaps.push_back(
         mlir::AffineMap::getMultiDimIdentityMap(rank, &context));
+
+    if (pSegMap.ret.size() != 1) {
+      Undefined();
+    }
+    auto baseTy = LowerSegOpBaseType(pSegMap.ret[0], ctx);
+    auto shapeTy = toShapeType(std::views::values(pSegMap.space.dims));
+    auto returnTy = mlir::RankedTensorType::get(shapeTy, baseTy);
+
+    mlir::Value output =
+        mlir::tensor::EmptyOp::create(builder, returnTy, dynamicSizes);
+
+    auto iterTypes = map(iterSpace, [](const auto &) {
+      return mlir::utils::IteratorType::parallel;
+    });
 
     auto op = mlir::linalg::GenericOp::create(
         builder,
@@ -474,8 +480,147 @@ struct FutharkCompiler {
         inputs,
         mlir::ValueRange{output},
         indexingMaps,
-        map(iterSpace,
-            [](const auto &) { return mlir::utils::IteratorType::parallel; }),
+        iterTypes,
+        [&](mlir::OpBuilder &b, mlir::Location loc, mlir::ValueRange args) {
+          mlir::OpBuilder::InsertionGuard guard(builder);
+          builder.setInsertionPointToEnd(b.getInsertionBlock());
+
+          // TODO extract "InsertSegOpKernelPrelude"
+
+          // Lower the kernel's affine reads by binding them to the inputs.
+          Ctx local = ctx;
+          for (auto i = 0; i < affine_reads.size(); i++) {
+            local.subexps.insert(affine_reads[i].result.name, args[i]);
+          }
+          // Lower the kernel's gtids by binding them to the iteration indices.
+          // TODO only do this if they're actually used.
+          for (auto d : iterSpace) {
+            auto idx = mlir::linalg::IndexOp::create(b, loc, d.index);
+            auto futharkIndexTy = d.value.getType();
+            auto val =
+                mlir::arith::IndexCastOp::create(b, loc, futharkIndexTy, idx);
+            local.subexps.insert(d.id, val);
+          }
+          // Lower the body, skipping the affine reads.
+          for (Stm &stm : pSegMap.body.stms) {
+            assert(stm.pat.elems.size() == 1);
+            if (skipLowering.contains(stm.pat.elems[0].name.name))
+              continue;
+            LowerStm(stm, local);
+          }
+
+          mlir::SmallVector<mlir::Value> results;
+          for (auto &r : pSegMap.body.result)
+            results.push_back(LowerSubExp(r.result, local));
+
+          mlir::linalg::YieldOp::create(b, loc, results);
+        });
+
+    return op.getResult(0);
+  }
+
+  mlir::Value LowerSegRed(SegRed pSegRed, Ctx &ctx) {
+    // Find iteration space. (id corresponds to gtid.)
+    std::vector<Dim> iterSpace;
+    int i = 0;
+    for (const auto &[id, dim] : pSegRed.space.dims) {
+      auto d = LowerSubExp(dim, ctx);
+      iterSpace.push_back(
+          Dim{id, d, toShapeType(dim) == mlir::ShapedType::kDynamic, i});
+      ++i;
+    }
+    std::unordered_map<std::string, long> idToIndex;
+    for (const auto &d : iterSpace) {
+      idToIndex[d.id] = d.index;
+    };
+
+    // Find affine reads in the kernel's body.
+    std::vector<AffineRead> affine_reads;
+    for (const auto &stm : pSegRed.body.stms) {
+      if (stm.pat.elems.size() != 1)
+        Undefined();
+      auto vnBound = stm.pat.elems[0].name;
+
+      if (auto r = toAffineRead(vnBound, stm.exp, idToIndex)) {
+        affine_reads.push_back(r.value());
+      }
+    }
+
+    mlir::SmallVector<mlir::Value> inputs;
+    for (auto &read : affine_reads)
+      inputs.push_back(ctx.subexps.lookup(read.array.name));
+    std::unordered_set<std::string> skipLowering;
+    for (auto &read : affine_reads)
+      skipLowering.insert(read.result.name);
+
+    // Map the iteration space to each input's dimensions.
+    mlir::SmallVector<mlir::AffineMap> indexingMaps;
+    for (const auto &read : affine_reads) {
+      indexingMaps.push_back(read.indexMap);
+    }
+
+    mlir::SmallVector<mlir::Value> dynamicSizes;
+    for (const auto &d : iterSpace) {
+      if (d.isDynamic)
+        dynamicSizes.push_back(mlir::arith::IndexCastOp::create(
+            builder, builder.getIndexType(), d.value));
+    };
+
+    // XXX Different
+    // Map the iteration space to the output's dimensions.
+    auto rank = pSegRed.space.dims.size();
+    if (rank == 0) {
+      Undefined();
+    }
+
+    mlir::SmallVector<mlir::AffineExpr> outDims;
+    for (auto i = 0; i < rank - 1; ++i) {
+      outDims.push_back(mlir::getAffineDimExpr(i, &context));
+    }
+    indexingMaps.push_back(mlir::AffineMap::get(rank, 0, outDims, &context));
+
+    auto iterTypes = map(iterSpace, [](const auto &) {
+      return mlir::utils::IteratorType::parallel;
+    });
+    iterTypes[rank - 1] = mlir::utils::IteratorType::reduction;
+
+    if (pSegRed.ret.size() != 1) {
+      Undefined();
+    }
+    auto baseTy = LowerSegOpBaseType(pSegRed.ret[0], ctx);
+    auto shapeTy = toShapeType(std::views::values(pSegRed.space.dims) |
+                               std::views::take(rank - 1));
+    auto returnTy = mlir::RankedTensorType::get(shapeTy, baseTy);
+
+    if (pSegRed.ops.size() != 1) {
+      Undefined();
+    }
+    auto pSegBinOp = pSegRed.ops[0];
+    if (pSegBinOp.shape.dims.size() != 0) {
+      Undefined();
+    }
+    if (pSegBinOp.neutral.size() != 1) {
+      Undefined();
+    }
+    auto neutral = LowerSubExp(pSegBinOp.neutral[0], ctx);
+
+    mlir::Value output = mlir::linalg::FillOp::create(
+                             builder,
+                             mlir::ValueRange{neutral},
+                             mlir::ValueRange{mlir::tensor::EmptyOp::create(
+                                 builder, returnTy, dynamicSizes)})
+                             .result();
+
+    PrintValue(neutral);
+    PrintValue(output);
+
+    auto op = mlir::linalg::GenericOp::create(
+        builder,
+        mlir::TypeRange{returnTy},
+        inputs,
+        mlir::ValueRange{output},
+        indexingMaps,
+        iterTypes,
         [&](mlir::OpBuilder &b, mlir::Location loc, mlir::ValueRange args) {
           mlir::OpBuilder::InsertionGuard guard(builder);
           builder.setInsertionPointToEnd(b.getInsertionBlock());
@@ -493,21 +638,49 @@ struct FutharkCompiler {
                 mlir::arith::IndexCastOp::create(b, loc, futharkIndexTy, idx);
             local.subexps.insert(d.id, val);
           }
-          // Lower the body, skipping the affine reads.
-          for (Stm &stm : pSegMap.body.stms) {
+          // Lower the kernel body, skipping the affine reads.
+          for (Stm &stm : pSegRed.body.stms) {
             assert(stm.pat.elems.size() == 1);
             if (skipLowering.contains(stm.pat.elems[0].name.name))
               continue;
             LowerStm(stm, local);
           }
-          mlir::SmallVector<mlir::Value> results;
-          for (auto &r : pSegMap.body.result)
-            results.push_back(LowerSubExp(r.result, local));
+          mlir::SmallVector<mlir::Value> returns;
+          for (auto &r : pSegRed.body.result)
+            returns.push_back(LowerSubExp(r.result, local));
+          // XXX prelude end; have kernel prelude return the returns
+          // TODO insert op
+          auto lol = pSegBinOp.lambda.params;
+          // 1. Bind lambda params to (in this order): args.back, returns
+          // 2. Lower lambda body
 
+          // TODO return type of this whole operation should have been taken
+          // from the lambda! but I guess a reduce lambda actually has
+          // to preserve the kernel body return type?
+          //   reduce : (a -> a -> a) -> a -> []a -> a
+          // we cant know that that's the case for the internal rep though
+
+          // opInputs.push_back(args.back()); // We only have one output/acc.
+          // for (auto i = 0; i < returns.size(); ++i) {
+          //   opInputs.push_back(returns[i]);
+          // }
+
+          // Apply ops to returns above + args that are outputs
+          auto out = args.back(); // We only allow one output.
+          for (SegBinOp &op : pSegRed.ops) {
+            // TODO commutativity unused
+            // Lower
+          }
+
+          mlir::SmallVector<mlir::Value> results;
           mlir::linalg::YieldOp::create(b, loc, results);
         });
 
-    return op.getResult(0);
+    PrintValue(returnTy);
+    PrintValue(indexingMaps);
+    PrintValue(op);
+
+    Undefined();
   }
 
   mlir::Value LowerPrimValue(PrimValue value, Ctx &ctx) {
