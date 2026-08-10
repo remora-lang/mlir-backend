@@ -380,6 +380,8 @@ struct FutharkTranslationVisitor {
       return {ExpHostOp{HostOp{std::make_shared<SegOp>(VisitSegMap(pSegMap))}}};
     if (auto *pSegRed = dynamic_cast<FutharkParser::SegRedContext *>(segop))
       return {ExpHostOp{HostOp{std::make_shared<SegOp>(VisitSegRed(pSegRed))}}};
+    if (auto *pSegScan = dynamic_cast<FutharkParser::SegScanContext *>(segop))
+      return {ExpHostOp{HostOp{std::make_shared<SegOp>(VisitSegScan(pSegScan))}}};
     Unreachable();
   }
 
@@ -406,6 +408,18 @@ struct FutharkTranslationVisitor {
     for (auto op : ctx->pSegBinOp())
       segred.ops.push_back(VisitSegBinOp(op));
     return {segred};
+  }
+
+  SegOp VisitSegScan(FutharkParser::SegScanContext *ctx) {
+    SegScan segscan;
+    segscan.lvl = SegThread{};
+    segscan.space = VisitSegSpace(ctx->pSegSpace());
+    for (auto t : ctx->pTypes()->pType())
+      segscan.ret.push_back(VisitType(t));
+    segscan.body = VisitKernelBody(ctx->pKernelBody());
+    for (auto op : ctx->pSegBinOp())
+      segscan.ops.push_back(VisitSegBinOp(op));
+    return {segscan};
   }
 
   SegBinOp VisitSegBinOp(FutharkParser::PSegBinOpContext *ctx) {

@@ -377,7 +377,8 @@ struct FutharkCompiler {
     return match(
         pSegOp->v,
         [&](const SegMap &v) { return LowerSegMap(v, ctx); },
-        [&](const SegRed &v) { return LowerSegRed(v, ctx); });
+        [&](const SegRed &v) { return LowerSegRed(v, ctx); },
+        [&](const SegScan &v) { return LowerSegScan(v, ctx); });
   }
 
   mlir::Type LowerSegOpBaseType(const Type &pReturnType, Ctx &ctx) {
@@ -519,6 +520,9 @@ struct FutharkCompiler {
     return op.getResult(0);
   }
 
+  mlir::Value LowerSegScan(SegScan pSegScan, Ctx &ctx) {
+     Undefined();
+  }
   mlir::Value LowerSegRed(SegRed pSegRed, Ctx &ctx) {
     // Find iteration space. (id corresponds to gtid.)
     std::vector<Dim> iterSpace;
