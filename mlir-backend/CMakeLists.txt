@@ -14,9 +14,17 @@ add_custom_command(
 )
 
 set(LIBS
-        MLIR
-        LLVM
-        )
+  MLIRArithDialect
+  MLIRFuncDialect
+  MLIRIndexDialect
+  MLIRIR
+  MLIRLinalgDialect
+  MLIRSCFDialect
+  MLIRSupport
+  MLIRTensorDialect
+
+  iree::compiler::Dialect::LinalgExt::IR
+)
 
 add_executable  (mlir-backend "mlir-backend.cpp" "${GEN_DIR}/FutharkLexer.cpp" "${GEN_DIR}/FutharkParser.cpp" "ir/core.hpp" "ir/parser.hpp" "ir/primitive.hpp" "ir/segop.hpp" "ir/gpu.hpp" "ir/syntax.hpp")
 

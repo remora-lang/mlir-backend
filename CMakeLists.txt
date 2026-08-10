@@ -1,37 +1,26 @@
-cmake_minimum_required(VERSION 3.13.4)
-
-if(POLICY CMP0068)
-  cmake_policy(SET CMP0068 NEW)
-  set(CMAKE_BUILD_WITH_INSTALL_NAME_DIR ON)
-endif()
-
-if(POLICY CMP0075)
-  cmake_policy(SET CMP0075 NEW)
-endif()
-
-if(POLICY CMP0077)
-  cmake_policy(SET CMP0077 NEW)
-endif()
+cmake_minimum_required(VERSION 3.26)
 
 project(mocha LANGUAGES CXX C)
 
-set(CMAKE_CXX_STANDARD 23 CACHE STRING "C++ standard to conform to")
+# Build IREE and its matching LLVM/MLIR revision.
+set(IREE_BUILD_COMPILER ON)
+set(IREE_BUILD_BUNDLED_LLVM ON)
 
-find_package(MLIR REQUIRED CONFIG)
+# Disable components not needed by this backend.
+set(IREE_BUILD_TESTS OFF)
+set(IREE_BUILD_SAMPLES OFF)
+set(IREE_BUILD_PYTHON_BINDINGS OFF)
+set(IREE_INPUT_STABLEHLO OFF)
+set(IREE_INPUT_TORCH OFF)
+set(IREE_INPUT_TOSA OFF)
 
-message(STATUS "Using MLIRConfig.cmake in: ${MLIR_DIR}")
-message(STATUS "Using LLVMConfig.cmake in: ${LLVM_DIR}")
-message(STATUS "Using build configuration: ${CMAKE_BUILD_TYPE}")
+set(MOCHA_IREE_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/iree"
+    CACHE PATH "Path to the IREE source tree")
+if(NOT EXISTS "${MOCHA_IREE_SOURCE_DIR}/CMakeLists.txt")
+  message(FATAL_ERROR
+    "IREE source tree not found at ${MOCHA_IREE_SOURCE_DIR}. "
+    "Set MOCHA_IREE_SOURCE_DIR or use the Nix development shell.")
+endif()
 
-list(APPEND CMAKE_MODULE_PATH "${MLIR_CMAKE_DIR}")
-list(APPEND CMAKE_MODULE_PATH "${LLVM_CMAKE_DIR}")
-include(TableGen)
-include(AddLLVM)
-include(AddMLIR)
-
-include_directories(${LLVM_INCLUDE_DIRS})
-include_directories(${MLIR_INCLUDE_DIRS})
-link_directories(${LLVM_BUILD_LIBRARY_DIR})
-add_definitions(${LLVM_DEFINITIONS})
-
+add_subdirectory("${MOCHA_IREE_SOURCE_DIR}" iree EXCLUDE_FROM_ALL)
 add_subdirectory(mlir-backend)
