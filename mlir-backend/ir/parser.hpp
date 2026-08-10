@@ -23,7 +23,8 @@ struct FutharkTranslationVisitor {
                     ? std::nullopt
                     : std::make_optional(VisitEntry(ctx->pEntry()));
     fun.name = VisitId(ctx->ID());
-    fun.retType.push_back({RetType{VisitType(ctx->pType())}, {}});
+    for (auto type : ctx->pType())
+      fun.retType.push_back({RetType{VisitType(type)}, {}});
     for (auto param : ctx->fParam())
       fun.params.push_back(VisitFParam(param));
     fun.body = VisitBody(ctx->pBody());

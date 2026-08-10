@@ -2,11 +2,20 @@ grammar Futhark;
 
 root: header? pFunDef+ EOF;
 
-header: 'name_source' '{' NUMBER '}' 'types' '{' '}';
+header: 'name_source' '{' NUMBER '}' 'types' '{' pTypeBind* '}';
 
-pFunDef: (pEntry? | 'fun') ID LPARAM fParam? (',' fParam)* RPARAM ':' OPEN_BRACKET '*'? pType CLOSE_BRACKET '=' OPEN_BRACKET pBody CLOSE_BRACKET;
+pTypeBind: 'type' STRING_LITERAL '=' pTypeExp;
 
-pEntry: ('entry') LPARAM STRING_LITERAL COMMA OPEN_BRACKET pEntryPointInput? (COMMA pEntryPointInput)* CLOSE_BRACKET COMMA '*'? pType RPARAM;
+pTypeExp: 'record' '{' pRecordField* '}'
+        | 'record_array' pRank STRING_LITERAL '{' pRecordField* '}';
+
+pRecordField: NUMBER ':' pType;
+
+pRank: NUMBER ID;
+
+pFunDef: (pEntry? | 'fun') ID LPARAM fParam? (',' fParam)* RPARAM ':' OPEN_BRACKET '*'? pType (',' '*'? pType)* CLOSE_BRACKET '=' OPEN_BRACKET pBody CLOSE_BRACKET;
+
+pEntry: ('entry') LPARAM STRING_LITERAL COMMA OPEN_BRACKET pEntryPointInput? (COMMA pEntryPointInput)* CLOSE_BRACKET COMMA (OPAQUE STRING_LITERAL | '*'? pType) RPARAM;
 
 pEntryPointInput: ID ':' pType;
 
@@ -26,7 +35,7 @@ pBody: pStm* 'in' OPEN_BRACKET pSubExp (',' pSubExp)* CLOSE_BRACKET #Body
 
 pStm: 'let' pPat '=' pExp;
 
-pPat: OPEN_BRACKET pPatElem (pPatElem ',')* CLOSE_BRACKET;
+pPat: OPEN_BRACKET pPatElem (',' pPatElem)* CLOSE_BRACKET;
 
 pPatElem: ID ':' pType;
 
@@ -141,7 +150,9 @@ LOGOR: 'logor' NUMBER;
 FLOAT   : (DIGIT+ '.' DIGIT+) ;
 fragment DIGIT  : [0-9];
 
-STRING_LITERAL: '"' ID '"';
+STRING_LITERAL: '"' ~'"'* '"';
+
+OPAQUE: '*'? 'opaque';
 
 ID : ( [a-zA-Z_+'-'*/%!<>|&^.#] ) ([a-zA-Z0-9_+\-*/%!<>|&^.#₀-₉])*;
 
