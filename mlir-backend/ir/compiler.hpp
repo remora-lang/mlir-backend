@@ -46,6 +46,8 @@ struct Dim {
   long index; // Position in the iteration space.
 };
 
+using IterationSpace = std::vector<Dim>;
+
 struct AffineRead {
   // The result is bound to this name.
   VName result;
@@ -380,18 +382,6 @@ struct FutharkCompiler {
         [&](const SegRed &v) { return LowerSegRed(v, ctx); });
   }
 
-  mlir::Type LowerSegOpBaseType(const Type &pReturnType, Ctx &ctx) {
-    return match(
-        pReturnType.t.v,
-        [&](const TypePrim<Shape, NoUniqueness> &val) {
-          return LowerPrimType(val.t);
-        },
-        [&](const TypeArray<Shape, NoUniqueness> &val) -> mlir::Type {
-          Undefined();
-        },
-        [](const auto &) -> mlir::Type { Undefined(); });
-  };
-
   // TODO Limitations
   // 1. The map must return a single result.
   // 2. The base type must be scalar (i.e., the seg space creates all dims).
@@ -399,8 +389,10 @@ struct FutharkCompiler {
   // For example,
   //    xs[gtid]
   // is recognized because gtid is in the iteration (seg) space. But
-  //    xs[2*gtid + 1]  and  xs[2*gtid + 1 - c],
-  // where c is a variable defined outside the kernel body, are not.
+  //    xs[2*gtid + 1]
+  // is not. Neither is
+  //    xs[gtid - c],
+  // where c is a variable defined outside the kernel body.
   mlir::Value LowerSegMap(SegMap pSegMap, Ctx &ctx) {
     // This lowers a SegMap to a linalg.generic op, whose
     //   * iteration space corresponds to the SegMap's SegSpace;
@@ -408,39 +400,14 @@ struct FutharkCompiler {
     // An affine read is an array load whose index expression is an affine
     // function of the iteration space.
 
-    // Find iteration space. (id corresponds to gtid.)
-    std::vector<Dim> iterSpace;
-    int i = 0;
-    for (const auto &[id, dim] : pSegMap.space.dims) {
-      auto d = LowerSubExp(dim, ctx);
-      iterSpace.push_back(
-          Dim{id, d, toShapeType(dim) == mlir::ShapedType::kDynamic, i});
-      ++i;
-    }
-    std::unordered_map<std::string, long> idToIndex;
-    for (const auto &d : iterSpace) {
-      idToIndex[d.id] = d.index;
-    };
+    IterationSpace iterSpace = LowerSegSpace(pSegMap.space, ctx);
 
-    // Find affine reads in the kernel's body.
-    auto rank = iterSpace.size();
-    std::vector<AffineRead> affine_reads;
-    for (const auto &stm : pSegMap.body.stms) {
-      if (stm.pat.elems.size() != 1)
-        Undefined();
-      auto vnBound = stm.pat.elems[0].name;
-
-      if (auto r = toAffineRead(vnBound, stm.exp, idToIndex)) {
-        affine_reads.push_back(r.value());
-      }
-    }
+    std::vector<AffineRead> affine_reads =
+        FindSegOpAffineReads(iterSpace, pSegMap.body);
 
     mlir::SmallVector<mlir::Value> inputs;
     for (auto &read : affine_reads)
       inputs.push_back(ctx.subexps.lookup(read.array.name));
-    std::unordered_set<std::string> skipLowering;
-    for (auto &read : affine_reads)
-      skipLowering.insert(read.result.name);
 
     // Map the iteration space to each input's dimensions.
     mlir::SmallVector<mlir::AffineMap> indexingMaps;
@@ -448,8 +415,8 @@ struct FutharkCompiler {
       indexingMaps.push_back(read.indexMap);
     }
 
-    // XXX Different.
     // Map the iteration space to the output's dimensions.
+    auto rank = iterSpace.size();
     indexingMaps.push_back(
         mlir::AffineMap::getMultiDimIdentityMap(rank, &context));
 
@@ -484,35 +451,11 @@ struct FutharkCompiler {
           mlir::OpBuilder::InsertionGuard guard(builder);
           builder.setInsertionPointToEnd(b.getInsertionBlock());
 
-          // TODO extract "InsertSegOpKernelPrelude"
-
-          // Lower the kernel's affine reads by binding them to the inputs.
           Ctx local = ctx;
-          for (auto i = 0; i < affine_reads.size(); i++) {
-            local.subexps.insert(affine_reads[i].result.name, args[i]);
-          }
-          // Lower the kernel's gtids by binding them to the iteration indices.
-          // TODO only do this if they're actually used.
-          for (auto d : iterSpace) {
-            auto idx = mlir::linalg::IndexOp::create(b, loc, d.index);
-            auto futharkIndexTy = d.value.getType();
-            auto val =
-                mlir::arith::IndexCastOp::create(b, loc, futharkIndexTy, idx);
-            local.subexps.insert(d.id, val);
-          }
-          // Lower the body, skipping the affine reads.
-          for (Stm &stm : pSegMap.body.stms) {
-            assert(stm.pat.elems.size() == 1);
-            if (skipLowering.contains(stm.pat.elems[0].name.name))
-              continue;
-            LowerStm(stm, local);
-          }
+          mlir::SmallVector<mlir::Value> results = LowerSegOpKernelBody(
+              loc, args, affine_reads, iterSpace, pSegMap.body, local);
 
-          mlir::SmallVector<mlir::Value> results;
-          for (auto &r : pSegMap.body.result)
-            results.push_back(LowerSubExp(r.result, local));
-
-          mlir::linalg::YieldOp::create(b, loc, results);
+          mlir::linalg::YieldOp::create(builder, loc, results);
         });
 
     return op.getResult(0);
@@ -520,38 +463,14 @@ struct FutharkCompiler {
 
   // TODO Same limitations as SegMap, probably.
   mlir::Value LowerSegRed(SegRed pSegRed, Ctx &ctx) {
-    // Find iteration space. (id corresponds to gtid.)
-    std::vector<Dim> iterSpace;
-    int i = 0;
-    for (const auto &[id, dim] : pSegRed.space.dims) {
-      auto d = LowerSubExp(dim, ctx);
-      iterSpace.push_back(
-          Dim{id, d, toShapeType(dim) == mlir::ShapedType::kDynamic, i});
-      ++i;
-    }
-    std::unordered_map<std::string, long> idToIndex;
-    for (const auto &d : iterSpace) {
-      idToIndex[d.id] = d.index;
-    };
+    IterationSpace iterSpace = LowerSegSpace(pSegRed.space, ctx);
 
-    // Find affine reads in the kernel's body.
-    std::vector<AffineRead> affine_reads;
-    for (const auto &stm : pSegRed.body.stms) {
-      if (stm.pat.elems.size() != 1)
-        Undefined();
-      auto vnBound = stm.pat.elems[0].name;
-
-      if (auto r = toAffineRead(vnBound, stm.exp, idToIndex)) {
-        affine_reads.push_back(r.value());
-      }
-    }
+    std::vector<AffineRead> affine_reads =
+        FindSegOpAffineReads(iterSpace, pSegRed.body);
 
     mlir::SmallVector<mlir::Value> inputs;
     for (auto &read : affine_reads)
       inputs.push_back(ctx.subexps.lookup(read.array.name));
-    std::unordered_set<std::string> skipLowering;
-    for (auto &read : affine_reads)
-      skipLowering.insert(read.result.name);
 
     // Map the iteration space to each input's dimensions.
     mlir::SmallVector<mlir::AffineMap> indexingMaps;
@@ -629,30 +548,9 @@ struct FutharkCompiler {
           mlir::OpBuilder::InsertionGuard guard(builder);
           builder.setInsertionPointToEnd(b.getInsertionBlock());
 
-          // Lower the kernel's affine reads by binding them to the inputs.
           Ctx local = ctx;
-          for (auto i = 0; i < affine_reads.size(); i++) {
-            local.subexps.insert(affine_reads[i].result.name, args[i]);
-          }
-          // Lower the kernel's gtids by binding them to the iteration indices.
-          for (auto d : iterSpace) {
-            auto idx = mlir::linalg::IndexOp::create(b, loc, d.index);
-            auto futharkIndexTy = d.value.getType();
-            auto val =
-                mlir::arith::IndexCastOp::create(b, loc, futharkIndexTy, idx);
-            local.subexps.insert(d.id, val);
-          }
-          // Lower the kernel body, skipping the affine reads.
-          for (Stm &stm : pSegRed.body.stms) {
-            assert(stm.pat.elems.size() == 1);
-            if (skipLowering.contains(stm.pat.elems[0].name.name))
-              continue;
-            LowerStm(stm, local);
-          }
-          mlir::SmallVector<mlir::Value> returns;
-          for (auto &r : pSegRed.body.result)
-            returns.push_back(LowerSubExp(r.result, local));
-          // XXX prelude end; have kernel prelude return the returns
+          mlir::SmallVector<mlir::Value> returns = LowerSegOpKernelBody(
+              loc, args, affine_reads, iterSpace, pSegRed.body, local);
 
           assert(pSegBinOp.lambda.params.size() == 2);
           assert(pSegBinOp.lambda.params.size() == returns.size() * 2);
@@ -665,10 +563,93 @@ struct FutharkCompiler {
           }
           auto results = LowerBody(pSegBinOp.lambda.body, local);
 
-          mlir::linalg::YieldOp::create(b, loc, results);
+          mlir::linalg::YieldOp::create(builder, loc, results);
         });
 
     return op.getResult(0);
+  }
+
+  // Find SegOp iteration space.
+  IterationSpace LowerSegSpace(const SegSpace &space, Ctx &ctx) {
+    IterationSpace iterSpace;
+    int i = 0;
+    for (const auto &[id, dim] : space.dims) {
+      auto d = LowerSubExp(dim, ctx);
+      iterSpace.push_back(
+          Dim{id, d, toShapeType(dim) == mlir::ShapedType::kDynamic, i});
+      ++i;
+    }
+    return iterSpace;
+  }
+
+  // Find affine reads in the kernel body. An affine read is an array load whose
+  // index expression is an affine function of the iteration space.
+  std::vector<AffineRead> FindSegOpAffineReads(const IterationSpace &iterSpace,
+                                               const KernelBody &body) {
+    std::unordered_map<std::string, long> idToIndex;
+    for (const auto &d : iterSpace) {
+      idToIndex[d.id] = d.index;
+    };
+    std::vector<AffineRead> affine_reads;
+    for (const auto &stm : body.stms) {
+      if (stm.pat.elems.size() != 1)
+        Undefined();
+      auto vnBound = stm.pat.elems[0].name;
+
+      if (auto r = toAffineRead(vnBound, stm.exp, idToIndex)) {
+        affine_reads.push_back(r.value());
+      }
+    }
+
+    return affine_reads;
+  }
+
+  mlir::Type LowerSegOpBaseType(const Type &pReturnType, Ctx &ctx) {
+    return match(
+        pReturnType.t.v,
+        [&](const TypePrim<Shape, NoUniqueness> &val) {
+          return LowerPrimType(val.t);
+        },
+        [&](const TypeArray<Shape, NoUniqueness> &val) -> mlir::Type {
+          Undefined();
+        },
+        [](const auto &) -> mlir::Type { Undefined(); });
+  };
+
+  mlir::SmallVector<mlir::Value>
+  LowerSegOpKernelBody(mlir::Location loc, const mlir::ValueRange blockArgs,
+                       const std::vector<AffineRead> &affine_reads,
+                       const IterationSpace &iterSpace, const KernelBody &body,
+                       Ctx &ctx) {
+    std::unordered_set<std::string> skipLowering;
+    for (auto &read : affine_reads)
+      skipLowering.insert(read.result.name);
+
+    // Lower the kernel's affine reads by binding them to the inputs.
+    for (auto i = 0; i < affine_reads.size(); i++) {
+      ctx.subexps.insert(affine_reads[i].result.name, blockArgs[i]);
+    }
+    // Lower the kernel's gtids by binding them to the iteration indices.
+    // TODO only do this if they're actually used
+    for (auto d : iterSpace) {
+      auto idx = mlir::linalg::IndexOp::create(builder, loc, d.index);
+      auto futharkIndexTy = d.value.getType();
+      auto val =
+          mlir::arith::IndexCastOp::create(builder, loc, futharkIndexTy, idx);
+      ctx.subexps.insert(d.id, val);
+    }
+    // Lower the kernel body, skipping the affine reads.
+    for (const Stm &stm : body.stms) {
+      assert(stm.pat.elems.size() == 1);
+      if (skipLowering.contains(stm.pat.elems[0].name.name))
+        continue;
+      LowerStm(stm, ctx);
+    }
+    mlir::SmallVector<mlir::Value> returns;
+    for (auto &r : body.result)
+      returns.push_back(LowerSubExp(r.result, ctx));
+
+    return returns;
   }
 
   mlir::Value LowerPrimValue(PrimValue value, Ctx &ctx) {
