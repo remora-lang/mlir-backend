@@ -483,7 +483,6 @@ struct FutharkCompiler {
     if (rank == 0) {
       Undefined();
     }
-
     mlir::SmallVector<mlir::AffineExpr> outDims;
     for (auto i = 0; i < rank - 1; ++i) {
       outDims.push_back(mlir::getAffineDimExpr(i, &context));
