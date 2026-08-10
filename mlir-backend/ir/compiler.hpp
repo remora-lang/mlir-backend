@@ -244,8 +244,8 @@ struct FutharkCompiler {
       std::vector<mlir::Value> indices;
       for (auto idx : val->operands) {
         auto i = LowerSubExp(idx, ctx);
-        auto casted =
-            mlir::arith::IndexCastOp::create(builder, builder.getIndexType(), i);
+        auto casted = mlir::arith::IndexCastOp::create(
+            builder, builder.getIndexType(), i);
         indices.push_back(casted);
       }
 
