@@ -13,30 +13,20 @@ add_custom_command(
     DEPENDS ${GRAMMAR_FILE}
 )
 
-get_property(dialect_libs GLOBAL PROPERTY MLIR_DIALECT_LIBS)
-get_property(conversion_libs GLOBAL PROPERTY MLIR_CONVERSION_LIBS)
 set(LIBS
-        ${dialect_libs}
-        ${conversion_libs}
-        MLIRAnalysis
-        MLIRCallInterfaces
-        MLIRCastInterfaces
-        MLIRExecutionEngine
-        MLIRIR
-        MLIRLLVMCommonConversion
-        MLIRLLVMToLLVMIRTranslation
-        MLIRMemRefDialect
-        MLIRLLVMDialect
-        MLIRParser
-        MLIRPass
-        MLIRSideEffectInterfaces
-        MLIRSupport
-        MLIRTargetLLVMIRExport
-        MLIRTransforms
-        MLIROptLib
-        )
+  MLIRArithDialect
+  MLIRFuncDialect
+  MLIRIndexDialect
+  MLIRIR
+  MLIRLinalgDialect
+  MLIRSCFDialect
+  MLIRSupport
+  MLIRTensorDialect
 
-add_executable  (mlir-backend "mlir-backend.cpp" "${GEN_DIR}/FutharkLexer.cpp" "${GEN_DIR}/FutharkParser.cpp" "ir/core.hpp" "ir/parser.hpp" "ir/primitive.hpp" "ir/soac.hpp" "ir/syntax.hpp")
+  iree::compiler::Dialect::LinalgExt::IR
+)
+
+add_executable  (mlir-backend "mlir-backend.cpp" "${GEN_DIR}/FutharkLexer.cpp" "${GEN_DIR}/FutharkParser.cpp" "ir/core.hpp" "ir/parser.hpp" "ir/primitive.hpp" "ir/segop.hpp" "ir/gpu.hpp" "ir/syntax.hpp")
 
 target_precompile_headers(mlir-backend PRIVATE 
     pch.h
@@ -65,5 +55,5 @@ else()
 endif()
 
 if (CMAKE_VERSION VERSION_GREATER 3.12)
-  set_property(TARGET mlir-backend PROPERTY CXX_STANDARD 20)
+  set_property(TARGET mlir-backend PROPERTY CXX_STANDARD 23)
 endif()

@@ -1,0 +1,60 @@
+#!/usr/bin/env bash
+#
+# Compile a Futhark-GPU IR program through the MLIR backend to a native
+# executable and run it. Intermediates land in pipeline/out/.
+#
+#   pipeline/run mlir-backend/tests/map.fut             # from Futhark source
+#   pipeline/run mlir-backend/tests/map.fut_gpu         # from GPU IR directly
+#   pipeline/run mlir-backend/tests/map2.fut 8          # passes 8 to the program
+#
+# `compile` accepts a .fut source (lowering it to GPU IR first) or a .fut_gpu
+# directly. Each program needs a matching pipeline/<name>_scaffold.c that
+# declares _mlir_ciface_entry_main and prints the result.
+
+set -euo pipefail
+
+if [ $# -lt 1 ]; then
+  echo "usage: $0 FILE.fut|FILE.fut_gpu [program args...]" >&2
+  exit 2
+fi
+
+# Run from the repo root so `compile` finds ./build/...
+here=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+cd "$here"
+
+file=$1; shift
+name=$(basename "$file"); name=${name%.fut_gpu}; name=${name%.fut}
+scaffold="pipeline/${name}_scaffold.c"
+out="pipeline/out"
+mkdir -p "$out"
+
+if [ ! -f "$scaffold" ]; then
+  echo "missing scaffold: $scaffold" >&2
+  exit 1
+fi
+
+# 1. Futhark source (or GPU IR) -> MLIR (linalg on tensors).
+compile "$file" >"$out/$name.mlir"
+
+# 2. Lower to the LLVM dialect. -llvm-request-c-wrappers emits
+#    _mlir_ciface_entry_main with a stable pointer/sret calling convention.
+mlir-opt "$out/$name.mlir" \
+  -empty-tensor-to-alloc-tensor \
+  -one-shot-bufferize="bufferize-function-boundaries function-boundary-type-conversion=identity-layout-map" \
+  -convert-linalg-to-loops \
+  -buffer-deallocation-pipeline \
+  -convert-scf-to-cf \
+  -llvm-request-c-wrappers \
+  -finalize-memref-to-llvm \
+  -convert-arith-to-llvm \
+  -convert-cf-to-llvm \
+  -convert-func-to-llvm \
+  -reconcile-unrealized-casts \
+  -o "$out/${name}_llvm.mlir"
+
+# 3. LLVM dialect -> LLVM IR -> native executable (backend + scaffold).
+mlir-translate --mlir-to-llvmir "$out/${name}_llvm.mlir" -o "$out/$name.ll"
+clang "$out/$name.ll" "$scaffold" -o "$out/$name"
+
+# 4. Run it.
+exec "$out/$name" "$@"

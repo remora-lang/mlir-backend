@@ -1,10 +1,15 @@
 #pragma once
+#include "match.hpp"
 #include "primitive.hpp"
 
 struct VName {
   std::string name;
   int64_t tag = 0;
 };
+
+inline llvm::raw_ostream &operator<<(llvm::raw_ostream &os, const VName &v) {
+  return os << v.name << "_" << v.tag;
+}
 
 enum Commutativity {
   Noncommutative,
@@ -21,6 +26,8 @@ template <typename D> struct ShapeBase {
 
 struct ConstantSubExp {
   PrimValue v;
+
+  int64_t GetIntValue() const { return v.GetIntValue(); }
 };
 
 struct VarSubExp {
@@ -30,10 +37,22 @@ struct VarSubExp {
 struct SubExp {
   std::variant<ConstantSubExp, VarSubExp> v;
 
-  int64_t GetIntValue() {
-    auto constExp = std::get<ConstantSubExp>(v);
-    auto iv = std::get<IntValue>(constExp.v.v);
-    return GetValue(iv);
+  int64_t GetIntValue() const {
+    return match(
+        v,
+        [&](const ConstantSubExp &c) { return c.GetIntValue(); },
+        [](const auto &) -> int64_t {
+          throw std::runtime_error("GetIntValue on non-constant SubExp");
+        });
+  }
+
+  VName GetVName() const {
+    return match(
+        v,
+        [&](const VarSubExp &v) { return v.v; },
+        [](const auto &) -> VName {
+          throw std::runtime_error("GetVName on non-VName SubExp");
+        });
   }
 };
 
@@ -101,7 +120,9 @@ template <typename ShapeT, typename UT> struct TypeMem {
 };
 
 template <typename ShapeT, typename UT> struct TypeBase {
-  std::variant<TypePrim<ShapeT, UT>, TypeAcc<ShapeT, UT>, TypeArray<ShapeT, UT>, TypeMem<ShapeT, UT>> v;
+  std::variant<TypePrim<ShapeT, UT>, TypeAcc<ShapeT, UT>, TypeArray<ShapeT, UT>,
+               TypeMem<ShapeT, UT>>
+      v;
 };
 
 struct Type {
@@ -218,5 +239,7 @@ struct FunExp {
 };
 
 struct PrimExp {
-  std::variant<LeafExp, ValueExp, BinOpExp, CmpOpExp, UnOpExp, ConvOpExp, FunExp> v;
+  std::variant<LeafExp, ValueExp, BinOpExp, CmpOpExp, UnOpExp, ConvOpExp,
+               FunExp>
+      v;
 };

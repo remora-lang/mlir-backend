@@ -4,12 +4,11 @@ root: header? pFunDef+ EOF;
 
 header: 'name_source' '{' NUMBER '}' 'types' '{' '}';
 
-pFunDef: (pEntry? | 'fun') ID LPARAM fParam? (',' fParam)* RPARAM ':' OPEN_BRACKET pType CLOSE_BRACKET '=' OPEN_BRACKET pBody CLOSE_BRACKET;
+pFunDef: (pEntry? | 'fun') ID LPARAM fParam? (',' fParam)* RPARAM ':' OPEN_BRACKET '*'? pType CLOSE_BRACKET '=' OPEN_BRACKET pBody CLOSE_BRACKET;
 
-pEntry: ('entry') LPARAM STRING_LITERAL COMMA OPEN_BRACKET CLOSE_BRACKET COMMA pType RPARAM;
+pEntry: ('entry') LPARAM STRING_LITERAL COMMA OPEN_BRACKET pEntryPointInput? (COMMA pEntryPointInput)* CLOSE_BRACKET COMMA '*'? pType RPARAM;
 
-// Empty for now
-pEntryPointInput: ;
+pEntryPointInput: ID ':' pType;
 
 fParam: ID ':' pType;
 
@@ -34,21 +33,28 @@ pPatElem: ID ':' pType;
 // https://hackage-content.haskell.org/package/futhark-0.25.34/docs/Futhark-IR-Syntax.html#t:Exp
 pExp: pApply #ExpApply
     | pBasicOp #ExpBasicOp
-    | pSoacOp #ExpSoacOp
+    | pSegOp #ExpSegOp
+    | pSizeOp #ExpSizeOp
     | pSubExp #ExpSubExp;
 
-pSoacOp: 'map' '('  pScrema pMapForm ')' #SoacOpMap
-| 'redomap' '('  pScrema pRedomapForm ')' #SoacOpRedomap;
+pSizeOp: 'get_size' '(' ID ',' ID ')';
 
-pScrema: pSubExp ',' '{' ID? (',' ID)* '}' ',';
+// This is specialised to a certain form of seg ops.
+pSegOp : 'segmap' '(' 'thread' ';' ';' ')' pSegSpace ':' pTypes '{' pKernelBody '}' #SegMap
+       | 'segred' '(' 'thread' ';' ';' ')' pSegSpace ':' pTypes '{' pKernelBody '}' '(' pSegBinOp (',' pSegBinOp)* ')' #SegRed
+       | 'segscan' '(' 'thread' ';' ';' ')' pSegSpace ':' pTypes '{' pKernelBody '}' '(' pSegBinOp (',' pSegBinOp)* ')' #SegScan
+       ;
 
-pMapForm: pLambda ',' pLambda;
-
-pRedomapForm: pLambda ',' '{' pReduce? (',' pReduce)* '}';
-
-pReduce: pComm pLambda  ',' '{' pSubExp? (',' pSubExp)* '}';
+// Futhark's SegBinOp: {neutrals}, shape, [commutative] lambda.
+pSegBinOp: '{' (pSubExp (',' pSubExp)*)? '}' ',' pExtShape? ',' pComm pLambda;
 
 pComm: 'commutative'?;
+
+pKernelBody: pStm* 'return' '{' 'returns' pSubExp (',' 'returns' pSubExp)* '}' #KernelBody
+    | '{' 'return' pSubExp (',' 'returns' pSubExp)* '}' #EmptyKernelBody;
+
+
+pSegSpace: '(' ID '<' pSubExp (',' ID '<' pSubExp)* ')' '(' '~' ID ')';
 
 pLambda: '\\' '{' pLParam? (',' pLParam)* '}' ':' pTypes '->' pBody;
 
@@ -74,7 +80,7 @@ pBasicOp: 'replicate' '(' pExtShape ',' pSubExp ')' #BasicOpReplicate
 
 pBinOp: binaryOpcode LPARAM pSubExp ',' pSubExp RPARAM;
 
-binaryOpcode: ADD | FADD | SUB | FSUB | MUL | FMUL | UDIV | UDIVUP | SDIV | SDIVUP | FDIV | FMOD | UMOD | SMOD | SQUOT | SREM | SMIN | UMIN | FMIN | SMAX | UMAX | FMAX | SHL | LSHR | ASHR | AND | OR | XOR | POW | FPOW | LOGAND | LOGOR;
+binaryOpcode: ADD | ADDNW | FADD | SUB | SUBNW | FSUB | MUL | MULNW | FMUL | UDIV | UDIVUP | SDIV | SDIVUP | FDIV | FMOD | UMOD | SMOD | SQUOT | SREM | SMIN | UMIN | FMIN | SMAX | UMAX | FMAX | SHL | LSHR | ASHR | AND | OR | XOR | POW | FPOW | LOGAND | LOGOR;
 
 pConvOp: 'sext' pPrimType pSubExp 'to' pPrimType;
 
@@ -102,10 +108,13 @@ SUB: 'sub' NUMBER;
 FSUB: 'fsub' NUMBER;
 MUL: 'mul' NUMBER;
 FMUL: 'fmul' NUMBER;
+ADDNW: 'add_nw' NUMBER;
+SUBNW: 'sub_nw' NUMBER;
+MULNW: 'mul_nw' NUMBER;
 UDIV: 'udiv' NUMBER;
-UDIVUP: 'udivup' NUMBER;
+UDIVUP: 'udiv_up' NUMBER;
 SDIV: 'sdiv' NUMBER;
-SDIVUP: 'sdivup' NUMBER;
+SDIVUP: 'sdiv_up' NUMBER;
 FDIV: 'fdiv' NUMBER;
 FMOD: 'fmod' NUMBER;
 UMOD: 'umod' NUMBER;
@@ -134,7 +143,7 @@ fragment DIGIT  : [0-9];
 
 STRING_LITERAL: '"' ID '"';
 
-ID : ( [a-zA-Z_+'-'*/%=!<>|&^.#] ) ([a-zA-Z0-9_+\-*/%=!<>|&^.#])*;
+ID : ( [a-zA-Z_+'-'*/%!<>|&^.#] ) ([a-zA-Z0-9_+\-*/%!<>|&^.#₀-₉])*;
 
 LPARAM      : '(';
 RPARAM      : ')';
@@ -144,7 +153,6 @@ CLOSE_BRACKET: '}';
 
 COMMA       : ',';
 BUILTIN     : 'builtin';
-RETURN      : 'return';
 FUNCTIONS      : 'FUNCTIONS';
 RULES      : 'RULES';
 

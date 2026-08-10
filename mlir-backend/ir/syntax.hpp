@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core.hpp"
+#include "gpu.hpp"
 
 enum class Rep {
   SOACS,
@@ -18,8 +19,7 @@ struct Body;
 struct Lambda;
 struct FunDef;
 struct Prog;
-struct Soac;
-struct HostOp;
+struct SegOp;
 struct MCOp;
 struct MemInfoLet;
 struct MemInfoFParam;
@@ -187,9 +187,11 @@ struct BasicOpUpdateAcc {
 };
 
 struct BasicOp {
-  std::variant<BasicOpSubExp, BasicOpOpaque, BasicOpArrayLit, BasicOpArrayVal, BasicOpUnOp, BasicOpBinOp, BasicOpCmpOp,
-               BasicOpConvOp, BasicOpAssert, BasicOpIndex, BasicOpUpdate, BasicOpFlatIndex, BasicOpFlatUpdate,
-               BasicOpConcat, BasicOpManifest, BasicOpIota, BasicOpReplicate, BasicOpScratch, BasicOpReshape,
+  std::variant<BasicOpSubExp, BasicOpOpaque, BasicOpArrayLit, BasicOpArrayVal,
+               BasicOpUnOp, BasicOpBinOp, BasicOpCmpOp, BasicOpConvOp,
+               BasicOpAssert, BasicOpIndex, BasicOpUpdate, BasicOpFlatIndex,
+               BasicOpFlatUpdate, BasicOpConcat, BasicOpManifest, BasicOpIota,
+               BasicOpReplicate, BasicOpScratch, BasicOpReshape,
                BasicOpRearrange, BasicOpUpdate>
       v;
 };
@@ -202,12 +204,6 @@ struct SubExpRes {
 struct RetAls {
   std::vector<int> paramAls;
   std::vector<int> otherAls;
-};
-
-struct NoOp {};
-
-struct Op {
-  std::variant<NoOp, std::shared_ptr<Soac>> v;
 };
 
 // TODO
@@ -224,22 +220,16 @@ struct ExpApply {
   Safety safety;
 };
 
-// struct ExpOp
-//{
-//	Op op;
-// };
-
-// TODO: Use a generic `Op` structure instead of forcing soacs
-struct ExpSoacOp {
-  std::shared_ptr<Soac> soac;
-};
-
 struct ExpSubExp {
   SubExp subExp;
 };
 
+struct ExpHostOp {
+  HostOp op;
+};
+
 struct Exp {
-  std::variant<ExpBasicOp, ExpApply, ExpSoacOp, ExpSubExp> v;
+  std::variant<ExpBasicOp, ExpApply, ExpHostOp, ExpSubExp> v;
 };
 
 struct Stm {
@@ -290,7 +280,9 @@ struct FunDef {
 };
 
 struct FunDefHasher {
-  size_t operator()(const FunDef &fun) const { return std::hash<std::string>{}(fun.name); }
+  size_t operator()(const FunDef &fun) const {
+    return std::hash<std::string>{}(fun.name);
+  }
 };
 
 struct Prog {
