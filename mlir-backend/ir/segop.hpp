@@ -43,6 +43,14 @@ struct SegRed {
   std::vector<SegBinOp> ops;
 };
 
+struct SegScan {
+  std::variant<SegThread, SegBlock, SegThreadInBlock> lvl;
+  SegSpace space;
+  std::vector<Type> ret;
+  KernelBody body;
+  std::vector<SegBinOp> ops;
+};
+
 struct SegOp {
-  std::variant<SegMap, SegRed> v;
+  std::variant<SegMap, SegRed,SegScan> v;
 };

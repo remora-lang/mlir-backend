@@ -379,7 +379,8 @@ struct FutharkCompiler {
     return match(
         pSegOp->v,
         [&](const SegMap &v) { return LowerSegMap(v, ctx); },
-        [&](const SegRed &v) { return LowerSegRed(v, ctx); });
+        [&](const SegRed &v) { return LowerSegRed(v, ctx); },
+        [&](const SegScan &v) { return LowerSegScan(v, ctx); });
   }
 
   // TODO Limitations
@@ -565,6 +566,10 @@ struct FutharkCompiler {
         });
 
     return op.getResult(0);
+  }
+  
+  mlir::Value LowerSegScan(SegScan pSegScan, Ctx &ctx) {
+     Undefined();
   }
 
   // Find SegOp iteration space.
