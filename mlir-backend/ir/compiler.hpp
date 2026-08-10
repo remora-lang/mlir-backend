@@ -478,7 +478,6 @@ struct FutharkCompiler {
       indexingMaps.push_back(read.indexMap);
     }
 
-    // XXX Different
     // Map the iteration space to the output's dimensions.
     auto rank = pSegRed.space.dims.size();
     if (rank == 0) {
