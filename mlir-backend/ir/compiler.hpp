@@ -586,17 +586,13 @@ struct FutharkCompiler {
   // index expression is an affine function of the iteration space.
   std::vector<AffineRead> FindSegOpAffineReads(const IterationSpace &iterSpace,
                                                const KernelBody &body) {
-    std::unordered_map<std::string, long> idToIndex;
-    for (const auto &d : iterSpace) {
-      idToIndex[d.id] = d.index;
-    };
     std::vector<AffineRead> affine_reads;
     for (const auto &stm : body.stms) {
       if (stm.pat.elems.size() != 1)
         Undefined();
       auto vnBound = stm.pat.elems[0].name;
 
-      if (auto r = toAffineRead(vnBound, stm.exp, idToIndex)) {
+      if (auto r = toAffineRead(vnBound, stm.exp, iterSpace)) {
         affine_reads.push_back(r.value());
       }
     }
@@ -606,10 +602,9 @@ struct FutharkCompiler {
 
   // Currently the only indexing recognized as affine are direct uses of the
   // iteration space variables, e.g., `x[i]` where `i` is an iteration variable.
-  std::optional<AffineRead> toAffineRead(
-      VName vn, const Exp &exp,
-      const std::unordered_map<std::string, long> &iterationSpaceIndex) {
-    auto rank = iterationSpaceIndex.size();
+  std::optional<AffineRead> toAffineRead(VName vn, const Exp &exp,
+                                         const IterationSpace &iterSpace) {
+    auto rank = iterSpace.size();
     if (auto e = std::get_if<ExpBasicOp>(&exp.v)) {
       if (auto idx = std::get_if<BasicOpFlatIndex>(&e->op.v)) {
         auto vnArray = idx->base.GetVName();
@@ -618,11 +613,11 @@ struct FutharkCompiler {
         for (auto operand : idx->operands) {
 
           auto vnDim = operand.GetVName();
-          auto res = iterationSpaceIndex.find(vnDim.name);
-          if (res == iterationSpaceIndex.end())
+          auto d = std::ranges::find(iterSpace, vnDim.name, &Dim::id);
+          if (d == iterSpace.end())
             // TODO suport affine indexing beyond seg space ids
             Undefined();
-          auto i = res->second;
+          auto i = d->index;
 
           usedDims.push_back(mlir::getAffineDimExpr(i, &context));
         }
