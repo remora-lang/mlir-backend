@@ -593,7 +593,9 @@ struct FutharkCompiler {
     auto neutral = LowerSubExp(pSegBinOp.neutral[0], ctx);
 
     auto pBaseTy = pSegBinOp.lambda.ret;
-    if (pBaseTy.size() != 1) { Undefined(); }
+    if (pBaseTy.size() != 1) {
+      Undefined();
+    }
 
     auto baseTy = LowerSegOpBaseType(pBaseTy[0], ctx);
     auto shapeTy = toShapeType(std::views::values(pSegRed.space.dims) |
@@ -603,7 +605,8 @@ struct FutharkCompiler {
     mlir::SmallVector<mlir::Value> dynamicSizes;
     auto reductionIndex = rank - 1;
     for (const auto &d : iterSpace) {
-      if (d.index == reductionIndex) continue;
+      if (d.index == reductionIndex)
+        continue;
       if (d.isDynamic)
         dynamicSizes.push_back(mlir::arith::IndexCastOp::create(
             builder, builder.getIndexType(), d.value));
@@ -652,12 +655,13 @@ struct FutharkCompiler {
           // XXX prelude end; have kernel prelude return the returns
 
           assert(pSegBinOp.lambda.params.size() == 2);
-          assert(pSegBinOp.lambda.params.size() == returns.size()*2);
+          assert(pSegBinOp.lambda.params.size() == returns.size() * 2);
           // Bind accumulator to first lambda parameter.
           local.subexps.insert(pSegBinOp.lambda.params[0].name, args.back());
           // Bind kernel body results second lambda parameter.
           for (auto i = 1; i < pSegBinOp.lambda.params.size(); i++) {
-            local.subexps.insert(pSegBinOp.lambda.params[i].name, returns[i-1]);
+            local.subexps.insert(pSegBinOp.lambda.params[i].name,
+                                 returns[i - 1]);
           }
           auto results = LowerBody(pSegBinOp.lambda.body, local);
 
