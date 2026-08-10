@@ -604,6 +604,36 @@ struct FutharkCompiler {
     return affine_reads;
   }
 
+  // Currently the only indexing recognized as affine are direct uses of the
+  // iteration space variables, e.g., `x[i]` where `i` is an iteration variable.
+  std::optional<AffineRead> toAffineRead(
+      VName vn, const Exp &exp,
+      const std::unordered_map<std::string, long> &iterationSpaceIndex) {
+    auto rank = iterationSpaceIndex.size();
+    if (auto e = std::get_if<ExpBasicOp>(&exp.v)) {
+      if (auto idx = std::get_if<BasicOpFlatIndex>(&e->op.v)) {
+        auto vnArray = idx->base.GetVName();
+
+        std::vector<mlir::AffineExpr> usedDims;
+        for (auto operand : idx->operands) {
+
+          auto vnDim = operand.GetVName();
+          auto res = iterationSpaceIndex.find(vnDim.name);
+          if (res == iterationSpaceIndex.end())
+            // TODO suport affine indexing beyond seg space ids
+            Undefined();
+          auto i = res->second;
+
+          usedDims.push_back(mlir::getAffineDimExpr(i, &context));
+        }
+
+        auto m = mlir::AffineMap::get(rank, 0, usedDims, &context);
+        return AffineRead{vn, vnArray, m};
+      }
+    }
+    return std::nullopt;
+  }
+
   mlir::Type LowerSegOpBaseType(const Type &pReturnType, Ctx &ctx) {
     return match(
         pReturnType.t.v,
@@ -817,35 +847,5 @@ struct FutharkCompiler {
     }
 
     Unreachable();
-  }
-
-  // Currently the only indexing recognized as affine are direct uses of the
-  // iteration space variables, e.g., `x[i]` where `i` is an iteration variable.
-  std::optional<AffineRead> toAffineRead(
-      VName vn, const Exp &exp,
-      const std::unordered_map<std::string, long> &iterationSpaceIndex) {
-    auto rank = iterationSpaceIndex.size();
-    if (auto e = std::get_if<ExpBasicOp>(&exp.v)) {
-      if (auto idx = std::get_if<BasicOpFlatIndex>(&e->op.v)) {
-        auto vnArray = idx->base.GetVName();
-
-        std::vector<mlir::AffineExpr> usedDims;
-        for (auto operand : idx->operands) {
-
-          auto vnDim = operand.GetVName();
-          auto res = iterationSpaceIndex.find(vnDim.name);
-          if (res == iterationSpaceIndex.end())
-            // TODO suport affine indexing beyond seg space ids
-            Undefined();
-          auto i = res->second;
-
-          usedDims.push_back(mlir::getAffineDimExpr(i, &context));
-        }
-
-        auto m = mlir::AffineMap::get(rank, 0, usedDims, &context);
-        return AffineRead{vn, vnArray, m};
-      }
-    }
-    return std::nullopt;
   }
 };
