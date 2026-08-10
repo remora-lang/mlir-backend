@@ -245,7 +245,7 @@ struct FutharkCompiler {
       for (auto idx : val->operands) {
         auto i = LowerSubExp(idx, ctx);
         auto casted =
-            mlir::index::CastSOp::create(builder, builder.getIndexType(), i);
+            mlir::arith::IndexCastOp::create(builder, builder.getIndexType(), i);
         indices.push_back(casted);
       }
 
@@ -448,13 +448,6 @@ struct FutharkCompiler {
       indexingMaps.push_back(read.indexMap);
     }
 
-    mlir::SmallVector<mlir::Value> dynamicSizes;
-    for (const auto &d : iterSpace) {
-      if (d.isDynamic)
-        dynamicSizes.push_back(mlir::arith::IndexCastOp::create(
-            builder, builder.getIndexType(), d.value));
-    };
-
     // XXX Different.
     // Map the iteration space to the output's dimensions.
     indexingMaps.push_back(
@@ -467,6 +460,12 @@ struct FutharkCompiler {
     auto shapeTy = toShapeType(std::views::values(pSegMap.space.dims));
     auto returnTy = mlir::RankedTensorType::get(shapeTy, baseTy);
 
+    mlir::SmallVector<mlir::Value> dynamicSizes;
+    for (const auto &d : iterSpace) {
+      if (d.isDynamic)
+        dynamicSizes.push_back(mlir::arith::IndexCastOp::create(
+            builder, builder.getIndexType(), d.value));
+    };
     mlir::Value output =
         mlir::tensor::EmptyOp::create(builder, returnTy, dynamicSizes);
 
@@ -519,6 +518,7 @@ struct FutharkCompiler {
     return op.getResult(0);
   }
 
+  // TODO Same limitations as SegMap, probably.
   mlir::Value LowerSegRed(SegRed pSegRed, Ctx &ctx) {
     // Find iteration space. (id corresponds to gtid.)
     std::vector<Dim> iterSpace;
@@ -559,13 +559,6 @@ struct FutharkCompiler {
       indexingMaps.push_back(read.indexMap);
     }
 
-    mlir::SmallVector<mlir::Value> dynamicSizes;
-    for (const auto &d : iterSpace) {
-      if (d.isDynamic)
-        dynamicSizes.push_back(mlir::arith::IndexCastOp::create(
-            builder, builder.getIndexType(), d.value));
-    };
-
     // XXX Different
     // Map the iteration space to the output's dimensions.
     auto rank = pSegRed.space.dims.size();
@@ -587,11 +580,6 @@ struct FutharkCompiler {
     if (pSegRed.ret.size() != 1) {
       Undefined();
     }
-    auto baseTy = LowerSegOpBaseType(pSegRed.ret[0], ctx);
-    auto shapeTy = toShapeType(std::views::values(pSegRed.space.dims) |
-                               std::views::take(rank - 1));
-    auto returnTy = mlir::RankedTensorType::get(shapeTy, baseTy);
-
     if (pSegRed.ops.size() != 1) {
       Undefined();
     }
@@ -604,15 +592,28 @@ struct FutharkCompiler {
     }
     auto neutral = LowerSubExp(pSegBinOp.neutral[0], ctx);
 
+    auto pBaseTy = pSegBinOp.lambda.ret;
+    if (pBaseTy.size() != 1) { Undefined(); }
+
+    auto baseTy = LowerSegOpBaseType(pBaseTy[0], ctx);
+    auto shapeTy = toShapeType(std::views::values(pSegRed.space.dims) |
+                               std::views::take(rank - 1));
+    auto returnTy = mlir::RankedTensorType::get(shapeTy, baseTy);
+
+    mlir::SmallVector<mlir::Value> dynamicSizes;
+    auto reductionIndex = rank - 1;
+    for (const auto &d : iterSpace) {
+      if (d.index == reductionIndex) continue;
+      if (d.isDynamic)
+        dynamicSizes.push_back(mlir::arith::IndexCastOp::create(
+            builder, builder.getIndexType(), d.value));
+    };
     mlir::Value output = mlir::linalg::FillOp::create(
                              builder,
                              mlir::ValueRange{neutral},
                              mlir::ValueRange{mlir::tensor::EmptyOp::create(
                                  builder, returnTy, dynamicSizes)})
                              .result();
-
-    PrintValue(neutral);
-    PrintValue(output);
 
     auto op = mlir::linalg::GenericOp::create(
         builder,
@@ -649,38 +650,21 @@ struct FutharkCompiler {
           for (auto &r : pSegRed.body.result)
             returns.push_back(LowerSubExp(r.result, local));
           // XXX prelude end; have kernel prelude return the returns
-          // TODO insert op
-          auto lol = pSegBinOp.lambda.params;
-          // 1. Bind lambda params to (in this order): args.back, returns
-          // 2. Lower lambda body
 
-          // TODO return type of this whole operation should have been taken
-          // from the lambda! but I guess a reduce lambda actually has
-          // to preserve the kernel body return type?
-          //   reduce : (a -> a -> a) -> a -> []a -> a
-          // we cant know that that's the case for the internal rep though
-
-          // opInputs.push_back(args.back()); // We only have one output/acc.
-          // for (auto i = 0; i < returns.size(); ++i) {
-          //   opInputs.push_back(returns[i]);
-          // }
-
-          // Apply ops to returns above + args that are outputs
-          auto out = args.back(); // We only allow one output.
-          for (SegBinOp &op : pSegRed.ops) {
-            // TODO commutativity unused
-            // Lower
+          assert(pSegBinOp.lambda.params.size() == 2);
+          assert(pSegBinOp.lambda.params.size() == returns.size()*2);
+          // Bind accumulator to first lambda parameter.
+          local.subexps.insert(pSegBinOp.lambda.params[0].name, args.back());
+          // Bind kernel body results second lambda parameter.
+          for (auto i = 1; i < pSegBinOp.lambda.params.size(); i++) {
+            local.subexps.insert(pSegBinOp.lambda.params[i].name, returns[i-1]);
           }
+          auto results = LowerBody(pSegBinOp.lambda.body, local);
 
-          mlir::SmallVector<mlir::Value> results;
           mlir::linalg::YieldOp::create(b, loc, results);
         });
 
-    PrintValue(returnTy);
-    PrintValue(indexingMaps);
-    PrintValue(op);
-
-    Undefined();
+    return op.getResult(0);
   }
 
   mlir::Value LowerPrimValue(PrimValue value, Ctx &ctx) {
