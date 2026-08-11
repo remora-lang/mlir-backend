@@ -108,7 +108,7 @@ struct FutharkCompiler {
     builder.setInsertionPointToStart(module.getBody());
   }
 
-  mlir::func::FuncOp LowerFunction(FunDef fun) {
+  mlir::func::FuncOp LowerFunction(const FunDef& fun) {
     if (functions.find(fun) != functions.end())
       return functions[fun];
 
@@ -156,7 +156,7 @@ struct FutharkCompiler {
     return results;
   }
 
-  void LowerStm(Stm stm, Ctx &ctx) {
+  void LowerStm(const Stm &stm, Ctx &ctx) {
     auto vs = LowerExp(stm.exp, ctx);
     assert(stm.pat.elems.size() == vs.size());
     for (auto [elem, value] : llvm::zip_equal(stm.pat.elems, vs)) {
@@ -164,7 +164,7 @@ struct FutharkCompiler {
     }
   }
 
-  Values LowerExp(Exp exp, Ctx &ctx) {
+  Values LowerExp(const Exp &exp, Ctx &ctx) {
     if (auto *val = std::get_if<ExpBasicOp>(&exp.v)) {
       return {LowerBasicOp(val->op, ctx)};
     }
@@ -198,7 +198,7 @@ struct FutharkCompiler {
     Unreachable();
   }
 
-  mlir::Value LowerBasicOp(BasicOp basicOp, Ctx &ctx) {
+  mlir::Value LowerBasicOp(const BasicOp &basicOp, Ctx &ctx) {
     if (auto *val = std::get_if<BasicOpSubExp>(&basicOp.v)) {
       return LowerSubExp(val->subExp, ctx);
     }
@@ -373,14 +373,14 @@ struct FutharkCompiler {
     return ctx.subexps.lookup(vname);
   }
 
-  Values LowerHostOp(HostOp &op, Ctx &ctx) {
+  Values LowerHostOp(const HostOp &op, Ctx &ctx) {
     return match(
         op.v,
-        [&](SizeOp &v) { return Values{LowerSizeOp(v, ctx)}; },
-        [&](std::shared_ptr<SegOp> &v) { return LowerSegOp(v, ctx); });
+        [&](const SizeOp &v) { return Values{LowerSizeOp(v, ctx)}; },
+        [&](const std::shared_ptr<SegOp> &v) { return LowerSegOp(v, ctx); });
   }
 
-  mlir::Value LowerSizeOp(SizeOp &sizeOp, Ctx &ctx) { Undefined(); }
+  mlir::Value LowerSizeOp(const SizeOp &sizeOp, Ctx &ctx) { Undefined(); }
 
   Values LowerSegOp(std::shared_ptr<SegOp> pSegOp, Ctx &ctx) {
     return match(
@@ -401,7 +401,7 @@ struct FutharkCompiler {
   // is not. Neither is
   //    xs[gtid - c],
   // where c is a variable defined outside the kernel body.
-  Values LowerSegMap(SegMap pSegMap, Ctx &ctx) {
+  Values LowerSegMap(const SegMap &pSegMap, Ctx &ctx) {
     // This lowers a SegMap to a linalg.generic op, whose
     //   * iteration space corresponds to the SegMap's SegSpace;
     //   * inputs correspond to "affine reads" in the SegMap body.
@@ -474,7 +474,7 @@ struct FutharkCompiler {
   }
 
   // TODO Same limitations as SegMap, probably.
-  Values LowerSegRed(SegRed pSegRed, Ctx &ctx) {
+  Values LowerSegRed(const SegRed &pSegRed, Ctx &ctx) {
     IterationSpace iterSpace = LowerSegSpace(pSegRed.space, ctx);
     auto rank = iterSpace.size();
 
@@ -582,7 +582,7 @@ struct FutharkCompiler {
     return op.getResults();
   }
 
-  mlir::Value LowerSegScan(SegScan pSegScan, Ctx &ctx) { Undefined(); }
+  mlir::Value LowerSegScan(const SegScan &pSegScan, Ctx &ctx) { Undefined(); }
 
   // Find SegOp iteration space.
   IterationSpace LowerSegSpace(const SegSpace &space, Ctx &ctx) {
