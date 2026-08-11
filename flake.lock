@@ -1,5 +1,24 @@
 {
   "nodes": {
+    "iree": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1786121953,
+        "narHash": "sha256-Is/6bewx3XftudGfSvsCWRkQYug+/IEYBOXR5TmRMaY=",
+        "ref": "refs/heads/main",
+        "rev": "3699452d60c6dfe483df4675c7e98299fe790ec4",
+        "revCount": 20359,
+        "submodules": true,
+        "type": "git",
+        "url": "https://github.com/iree-org/iree.git"
+      },
+      "original": {
+        "rev": "3699452d60c6dfe483df4675c7e98299fe790ec4",
+        "submodules": true,
+        "type": "git",
+        "url": "https://github.com/iree-org/iree.git"
+      }
+    },
     "nixpkgs": {
       "locked": {
         "lastModified": 1782723713,
@@ -18,6 +37,7 @@
     },
     "root": {
       "inputs": {
+        "iree": "iree",
         "nixpkgs": "nixpkgs"
       }
     }
