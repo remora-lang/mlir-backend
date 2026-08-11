@@ -26,6 +26,12 @@ import sys
 
 TESTS_GLOB = "tests/*.fut"
 
+_COLOR = sys.stdout.isatty()
+
+
+def _c(s, code):
+    return f"\033[{code}m{s}\033[0m" if _COLOR else s
+
 
 class Unsupported(Exception):
     pass
@@ -191,10 +197,10 @@ def main():
                 # failure of the backend/runner, not something to skip.
                 ok, msg = False, f"unsupported: {e}"
             if ok:
-                print(f"PASS {name}")
+                print(f"{_c('PASS', '32')} {name}")
                 passed += 1
             else:
-                print(f"FAIL {name}\n     {msg}")
+                print(f"{_c('FAIL', '31')} {name}\n     {msg}")
                 failed += 1
     print(f"\n{passed} passed, {failed} failed")
     return 1 if failed else 0
