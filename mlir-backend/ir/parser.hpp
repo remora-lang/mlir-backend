@@ -41,6 +41,7 @@ struct FutharkTranslationVisitor {
       return VisitTypePrim(pPrim);
     if (auto *pShape = dynamic_cast<FutharkParser::TypeShapeContext *>(ctx))
       return VisitTypeShape(pShape);
+    Undefined();
   }
 
   Type VisitTypePrim(FutharkParser::TypePrimContext *ctx) {
