@@ -359,7 +359,7 @@ struct FutharkCompiler {
 
   mlir::Value LowerSubExp(SubExp subExp, Ctx &ctx) {
     if (auto *val = std::get_if<VarSubExp>(&subExp.v)) {
-      return ctx.subexps.lookup(val->v.name);
+      return LowerSubExp(val->v.name, ctx);
     }
 
     if (auto *val = std::get_if<ConstantSubExp>(&subExp.v)) {
