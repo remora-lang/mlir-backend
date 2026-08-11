@@ -23,6 +23,11 @@ run-tests              # all annotated tests
 run-tests FILE.fut     # one file
 ```
 
+Verify test specifications using Futhark's C backend:
+```
+futhark-test
+```
+
 ## Without nix
 
 ### Build LLVM `22.x` from source:
