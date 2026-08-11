@@ -59,10 +59,15 @@
     build = pkgs.writeShellScriptBin "build" ''
       set -euo pipefail
       jobs=''${1:-}
+      export CCACHE_BASEDIR="$PWD"
+      export CCACHE_NOHASHDIR=1
+      export CCACHE_SLOPPINESS=include_file_mtime,include_file_ctime,time_macros,pch_defines
       if [ ! -f build/build.ninja ]; then
         cmake -S . -B build -G Ninja \
           -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
           -DCMAKE_BUILD_TYPE=Release \
+          -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+          -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
           -DMOCHA_IREE_SOURCE_DIR=${iree}
       fi
       cmake --build build ''${jobs:+-j "$jobs"} \
@@ -161,6 +166,7 @@
         inputsFrom = [ mlir-backend ];
 
         packages = with pkgs; [
+          ccache
           clangd
           antlr4
           openjdk
