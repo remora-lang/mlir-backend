@@ -391,9 +391,8 @@ struct FutharkCompiler {
   }
 
   // TODO Limitations
-  // 1. The map must return a single result.
-  // 2. The base type must be scalar (i.e., the seg space creates all dims).
-  // 3. Only affine reads with seg space ids are recognized as such.
+  // 1. The base type must be scalar (i.e., the seg space creates all dims).
+  // 2. Only affine reads with seg space ids are recognized as such.
   // For example,
   //    xs[gtid]
   // is recognized because gtid is in the iteration (seg) space. But
