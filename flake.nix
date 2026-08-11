@@ -63,9 +63,7 @@
       if [ ! -f build/build.ninja ]; then
         cmake -S . -B build -G Ninja \
           -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
-          -DCMAKE_BUILD_TYPE=RelWithDebInfo \
-          -DCMAKE_C_COMPILER_LAUNCHER=ccache \
-          -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+          -DCMAKE_BUILD_TYPE=Release \
           -DMOCHA_IREE_SOURCE_DIR=${iree}
       fi
       cmake --build build ''${jobs:+-j "$jobs"} \
@@ -134,7 +132,16 @@
       futhark dev --gpu --strip-provenance --no-grid --simplify "$1"
     '';
 
+    # Scoped clean: only removes mlir-backend's build artifacts, leaving the
+    # already-built IREE tree (build/iree) intact so it isn't recompiled.
     clean = pkgs.writeShellScriptBin "clean" ''
+      set -euo pipefail
+      rm -rf build/mlir-backend
+    '';
+
+    # Full clean: nukes everything, including IREE. Use only when you
+    # intend to rebuild IREE from scratch.
+    clean-all = pkgs.writeShellScriptBin "clean-all" ''
       set -euo pipefail
       rm -rf build compile_commands.json
     '';
@@ -153,12 +160,12 @@
         packages = with pkgs; [
           clangd
           antlr4
-          ccache
           openjdk
           build
           compile
           gpu-ir
           clean
+          clean-all
           ireeCompile
           ireeRunModule
           runIree
