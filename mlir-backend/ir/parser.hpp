@@ -421,7 +421,12 @@ struct FutharkTranslationVisitor {
     segscan.body = VisitKernelBody(ctx->pKernelBody());
     for (auto op : ctx->pSegBinOp())
       segscan.ops.push_back(VisitSegBinOp(op));
+    segscan.post_op = VisitSegPostOp(ctx->pSegPostOp());
     return {segscan};
+  }
+
+  SegPostOp VisitSegPostOp(FutharkParser::PSegPostOpContext *ctx) {
+    return {VisitLambda(ctx->pLambda())};
   }
 
   SegBinOp VisitSegBinOp(FutharkParser::PSegBinOpContext *ctx) {

@@ -28,6 +28,10 @@ struct SegBinOp {
   Shape shape;
 };
 
+struct SegPostOp {
+  Lambda lambda;
+};
+
 struct SegMap {
   std::variant<SegThread, SegBlock, SegThreadInBlock> lvl;
   SegSpace space;
@@ -49,6 +53,7 @@ struct SegScan {
   std::vector<Type> ret;
   KernelBody body;
   std::vector<SegBinOp> ops;
+  SegPostOp post_op;
 };
 
 struct SegOp {
