@@ -21,10 +21,12 @@ pEntryPointInput: ID ':' pType;
 
 fParam: ID ':' pType;
 
-// TODO: Aliasing annotations
 pRetTypes: '{' pType* (',' pType)* '}';
-pType: pExtShape pPrimType #TypeShape
-    | pPrimType #TypePrim;
+pType: pExtShape pPrimType pAlias? #TypeShape
+    | pPrimType pAlias? #TypePrim;
+
+pAlias: '#' '(' pAliasSet (',' pAliasSet)* ')';
+pAliasSet: '[' (NUMBER (',' NUMBER)*)? ']';
 pTypes: '{' pType? (',' pType)* '}';
 pRetType: pType;
 
@@ -156,7 +158,7 @@ STRING_LITERAL: '"' ~'"'* '"';
 
 OPAQUE: '*'? 'opaque';
 
-ID : ( [a-zA-Z_+'-'*/%!<>|&^.#] ) ([a-zA-Z0-9_+\-*/%!<>|&^.#₀-₉])*;
+ID : ( [a-zA-Z_+'-'*/%!<>|&^.] ) ([a-zA-Z0-9_+\-*/%!<>|&^.₀-₉])*;
 
 LPARAM      : '(';
 RPARAM      : ')';
