@@ -131,24 +131,19 @@
       futhark dev --gpu --strip-provenance --no-grid --simplify "$1"
     '';
 
-    # End-to-end tests: build, then run each annotated tests/*.fut through the
-    # IREE pipeline and check its output. Kept separate from `build`.
-    # Named `run-tests` (not `test`) to avoid shadowing the shell builtin.
     run-tests = pkgs.writeShellScriptBin "run-tests" ''
       set -euo pipefail
       ${build}/bin/build >&2
       exec ${pkgs.python3}/bin/python3 run_tests.py "$@"
     '';
 
-    # Scoped clean: only removes mlir-backend's build artifacts, leaving the
-    # already-built IREE tree (build/iree) intact so it isn't recompiled.
+    # Only removes mlir-backend's build artifacts, leaving the already-built
+    # IREE tree (build/iree) intact so it isn't recompiled.
     clean = pkgs.writeShellScriptBin "clean" ''
       set -euo pipefail
       rm -rf build/mlir-backend
     '';
 
-    # Full clean: nukes everything, including IREE. Use only when you
-    # intend to rebuild IREE from scratch.
     clean-all = pkgs.writeShellScriptBin "clean-all" ''
       set -euo pipefail
       rm -rf build compile_commands.json
