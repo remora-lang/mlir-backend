@@ -59,15 +59,18 @@
 
     build = pkgs.writeShellScriptBin "build" ''
       set -euo pipefail
-      if [ ! -f build-iree-nix/build.ninja ]; then
-        cmake -S . -B build-iree-nix -G Ninja \
+      jobs=''${1:-}
+      if [ ! -f build/build.ninja ]; then
+        cmake -S . -B build -G Ninja \
           -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
           -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+          -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+          -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
           -DMOCHA_IREE_SOURCE_DIR=${iree}
       fi
-      cmake --build build-iree-nix \
+      cmake --build build ''${jobs:+-j "$jobs"} \
         --target mlir-backend iree-compile iree-run-module
-      ln -sfn build-iree-nix/compile_commands.json compile_commands.json
+      ln -sfn build/compile_commands.json compile_commands.json
     '';
 
     # `compile x.fut` first lowers to GPU IR (kept as x.fut_gpu beside the
@@ -80,21 +83,21 @@
       if [ -n "$in" ] && [ "''${in%.fut}" != "$in" ]; then
         ir="''${in%.fut}.fut_gpu"
         ${gpu-ir}/bin/gpu-ir "$in" > "$ir"
-        exec ./build-iree-nix/mlir-backend/mlir-backend "$ir"
+        exec ./build/mlir-backend/mlir-backend "$ir"
       fi
-      exec ./build-iree-nix/mlir-backend/mlir-backend "$@"
+      exec ./build/mlir-backend/mlir-backend "$@"
     '';
 
     ireeCompile = pkgs.writeShellScriptBin "iree-compile-local" ''
       set -euo pipefail
       ${build}/bin/build >&2
-      exec ./build-iree-nix/iree/tools/iree-compile "$@"
+      exec ./build/iree/tools/iree-compile "$@"
     '';
 
     ireeRunModule = pkgs.writeShellScriptBin "iree-run-module-local" ''
       set -euo pipefail
       ${build}/bin/build >&2
-      exec ./build-iree-nix/iree/tools/iree-run-module "$@"
+      exec ./build/iree/tools/iree-run-module "$@"
     '';
 
     runIree = pkgs.writeShellScriptBin "run-iree" ''
@@ -115,12 +118,12 @@
       vmfb_file="pipeline/out/$name.vmfb"
       ${compile}/bin/compile "$file" > "$mlir_file"
 
-      ./build-iree-nix/iree/tools/iree-compile "$mlir_file" \
+      ./build/iree/tools/iree-compile "$mlir_file" \
         --iree-hal-target-device=local \
         --iree-hal-local-target-device-backends=llvm-cpu \
         -o "$vmfb_file"
 
-      exec ./build-iree-nix/iree/tools/iree-run-module \
+      exec ./build/iree/tools/iree-run-module \
         --module="$vmfb_file" \
         --device=local-task \
         --function=entry_main \
@@ -133,7 +136,7 @@
 
     clean = pkgs.writeShellScriptBin "clean" ''
       set -euo pipefail
-      rm -rf build-iree-nix compile_commands.json
+      rm -rf build compile_commands.json
     '';
 
     clangd = pkgs.writeShellScriptBin "clangd" ''
@@ -150,6 +153,7 @@
         packages = with pkgs; [
           clangd
           antlr4
+          ccache
           openjdk
           build
           compile
