@@ -142,6 +142,17 @@
       exec ${pkgs.python3}/bin/python3 run_tests.py "$@"
     '';
 
+    # Validates the `-- input`/`-- output` blocks against Futhark's own
+    # reference backend (independent of the MLIR/IREE pipeline). Defaults to
+    # every test if no files are given.
+    futhark-test = pkgs.writeShellScriptBin "futhark-test" ''
+      set -euo pipefail
+      if [ "$#" -eq 0 ]; then
+        set -- mlir-backend/tests/*.fut
+      fi
+      exec futhark test --backend=c "$@"
+    '';
+
     # Only removes mlir-backend's build artifacts, leaving the already-built
     # IREE tree (build/iree) intact so it isn't recompiled.
     clean = pkgs.writeShellScriptBin "clean" ''
@@ -179,6 +190,7 @@
           ireeRunModule
           runIree
           run-tests
+          futhark-test
           llvmPackages_22.lldb
         ] ++ pkgs.lib.optionals (!pkgs.stdenv.isDarwin) [
           # Linux stdenv is gcc-based, so add clang for an LLVM toolchain.
