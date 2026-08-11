@@ -6,6 +6,7 @@
 #include "segop.hpp"
 #include "syntax.hpp"
 #include <format>
+#include <iterator>
 #include <mlir/Dialect/Arith/IR/Arith.h>
 #include <mlir/Dialect/Linalg/IR/Linalg.h>
 #include <mlir/Dialect/Tensor/IR/Tensor.h>
@@ -108,7 +109,7 @@ struct FutharkCompiler {
     builder.setInsertionPointToStart(module.getBody());
   }
 
-  mlir::func::FuncOp LowerFunction(const FunDef& fun) {
+  mlir::func::FuncOp LowerFunction(const FunDef &fun) {
     if (functions.find(fun) != functions.end())
       return functions[fun];
 
@@ -135,8 +136,8 @@ struct FutharkCompiler {
     auto entry = func.addEntryBlock();
     builder.setInsertionPointToStart(entry);
 
-    for (auto i = 0; i < fun.params.size(); i++) {
-      ctx.subexps.insert(fun.params[i].name, func.getArgument(i));
+    for (auto [param, arg] : llvm::zip_equal(fun.params, func.getArguments())) {
+      ctx.subexps.insert(param.name, arg);
     }
 
     auto retValue = LowerBody(fun.body, ctx);
@@ -182,7 +183,7 @@ struct FutharkCompiler {
       auto llvmFunc = LowerFunction(func);
 
       std::vector<mlir::Value> args;
-      for (auto i = 0; i < func.params.size(); i++) {
+      for (int64_t i = 0; i < std::ssize(func.params); i++) {
         auto [subExp, diet] = val->args[i];
         args.push_back(LowerSubExp(subExp, ctx));
       }
@@ -286,7 +287,7 @@ struct FutharkCompiler {
       reassociations.push_back(ranges);
 
       auto prevTy = llvm::dyn_cast<mlir::RankedTensorType>(op0.getType());
-      for (auto i = val->dimEnd; i < prevTy.getShape().size(); i++) {
+      for (int64_t i = val->dimEnd; i < std::ssize(prevTy.getShape()); i++) {
         reassociations.push_back({i});
       }
 
@@ -345,7 +346,7 @@ struct FutharkCompiler {
           mlir::tensor::EmptyOp::create(builder, transposedTy, {});
 
       std::vector<int64_t> addedDims;
-      for (auto i = 0; i < (before.size() - original.size()); i++) {
+      for (int64_t i = 0; i < std::ssize(before) - std::ssize(original); i++) {
         addedDims.push_back(i);
       }
 
@@ -475,7 +476,9 @@ struct FutharkCompiler {
   // TODO Same limitations as SegMap, probably.
   Values LowerSegRed(const SegRed &pSegRed, Ctx &ctx) {
     IterationSpace iterSpace = LowerSegSpace(pSegRed.space, ctx);
-    auto rank = iterSpace.size();
+    int64_t rank = std::ssize(iterSpace);
+    if (rank == 0)
+      Undefined();
 
     std::vector<AffineRead> affine_reads =
         FindSegOpAffineReads(iterSpace, pSegRed.body);
@@ -507,7 +510,7 @@ struct FutharkCompiler {
     }
 
     Values dynamicSizes;
-    auto reductionIndex = rank - 1;
+    int64_t reductionIndex = rank - 1;
     for (const auto &d : iterSpace) {
       if (d.index == reductionIndex)
         continue;
@@ -537,11 +540,8 @@ struct FutharkCompiler {
     }
 
     // Map the iteration space to each output's dimensions.
-    if (rank == 0) {
-      Undefined();
-    }
     mlir::SmallVector<mlir::AffineExpr> outDims;
-    for (auto i = 0; i < rank - 1; ++i) {
+    for (int64_t i = 0; i < rank - 1; ++i) {
       outDims.push_back(mlir::getAffineDimExpr(i, &context));
     }
     indexingMaps.append(outputs.size(),
@@ -566,12 +566,13 @@ struct FutharkCompiler {
           auto accs = args.drop_front(inputs.size());
           assert(pSegBinOp.lambda.params.size() ==
                  accs.size() + returns.size());
-          for (auto i = 0; i < accs.size(); i++) {
-            local.subexps.insert(pSegBinOp.lambda.params[i].name, accs[i]);
+          for (auto [param, acc] : llvm::zip(pSegBinOp.lambda.params, accs)) {
+            local.subexps.insert(param.name, acc);
           }
-          for (auto i = 0; i < returns.size(); i++) {
-            local.subexps.insert(pSegBinOp.lambda.params[accs.size() + i].name,
-                                 returns[i]);
+          for (auto [param, ret] : llvm::zip_equal(
+                   llvm::drop_begin(pSegBinOp.lambda.params, accs.size()),
+                   returns)) {
+            local.subexps.insert(param.name, ret);
           }
           auto results = LowerBody(pSegBinOp.lambda.body, local);
 
@@ -665,8 +666,8 @@ struct FutharkCompiler {
       skipLowering.insert(read.result.name);
 
     // Lower the kernel's affine reads by binding them to the inputs.
-    for (auto i = 0; i < affine_reads.size(); i++) {
-      ctx.subexps.insert(affine_reads[i].result.name, blockArgs[i]);
+    for (auto [read, arg] : llvm::zip_equal(affine_reads, blockArgs)) {
+      ctx.subexps.insert(read.result.name, arg);
     }
     // Lower the kernel's gtids by binding them to the iteration indices.
     // TODO only do this if they're actually used
@@ -770,13 +771,13 @@ struct FutharkCompiler {
     return tensor;
   }
 
-  template <typename T> static std::vector<T> Iota(size_t n, T x, T s) {
+  template <typename T> static std::vector<T> Iota(int64_t n, T x, T s) {
     std::vector<T> elems;
     if (n <= 0)
       return elems;
 
     auto currentValue = x;
-    for (auto i = 0; i < n; i++) {
+    for (int64_t i = 0; i < n; i++) {
       elems.push_back(currentValue);
       currentValue += s;
     }
