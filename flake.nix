@@ -34,7 +34,6 @@
         antlr
         python3
         git
-        futhark
       ];
 
       buildInputs = with pkgs; [
