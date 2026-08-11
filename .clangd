@@ -1,2 +1,2 @@
 CompileFlags:
-  Add: [-Wall, -Wunused-variable]
+  Add: [-Wall, -Wunused-variable, -Wsign-compare]
