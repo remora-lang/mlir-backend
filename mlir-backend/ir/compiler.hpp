@@ -567,7 +567,14 @@ struct FutharkCompiler {
 
     return op.getResult(0);
   }
-  
+
+// TODOs: 
+// Support multi-dim SegSpace
+// Support vector SegBinOps
+// Support multiple SegBinOps
+// Support multiple input/output for SegBinOps
+// Support size(SegBinOp) > 0
+//  Parallelise     
 mlir::Value LowerSegScan(SegScan pSegScan, Ctx &ctx) {
 
   if (pSegScan.ret.size() != 1)
