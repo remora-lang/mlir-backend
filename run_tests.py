@@ -24,7 +24,7 @@ import re
 import subprocess
 import sys
 
-TESTS_GLOB = "mlir-backend/tests/*.fut"
+TESTS_GLOB = "tests/*.fut"
 
 
 class Unsupported(Exception):

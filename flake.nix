@@ -148,7 +148,7 @@
     futhark-test = pkgs.writeShellScriptBin "futhark-test" ''
       set -euo pipefail
       if [ "$#" -eq 0 ]; then
-        set -- mlir-backend/tests/*.fut
+        set -- tests/*.fut
       fi
       exec futhark test --backend=c "$@"
     '';
