@@ -109,10 +109,10 @@
       name=$(basename "$file")
       name=''${name%.fut_gpu}
       name=''${name%.fut}
-      mkdir -p pipeline/out
+      mkdir -p out
 
-      mlir_file="pipeline/out/$name.mlir"
-      vmfb_file="pipeline/out/$name.vmfb"
+      mlir_file="out/$name.mlir"
+      vmfb_file="out/$name.vmfb"
       ${compile}/bin/compile "$file" > "$mlir_file"
 
       ./build/iree/tools/iree-compile "$mlir_file" \
@@ -129,6 +129,15 @@
 
     gpu-ir = pkgs.writeShellScriptBin "gpu-ir" ''
       futhark dev --gpu --strip-provenance --no-grid --simplify "$1"
+    '';
+
+    # End-to-end tests: build, then run each annotated tests/*.fut through the
+    # IREE pipeline and check its output. Kept separate from `build`.
+    # Named `run-tests` (not `test`) to avoid shadowing the shell builtin.
+    run-tests = pkgs.writeShellScriptBin "run-tests" ''
+      set -euo pipefail
+      ${build}/bin/build >&2
+      exec ${pkgs.python3}/bin/python3 run_tests.py "$@"
     '';
 
     # Scoped clean: only removes mlir-backend's build artifacts, leaving the
@@ -168,6 +177,7 @@
           ireeCompile
           ireeRunModule
           runIree
+          run-tests
           llvmPackages_22.lldb
         ] ++ pkgs.lib.optionals (!pkgs.stdenv.isDarwin) [
           # Linux stdenv is gcc-based, so add clang for an LLVM toolchain.
