@@ -1,0 +1,1 @@
+def main (xs: []i32): []i32 = scan (+) 0 xs
