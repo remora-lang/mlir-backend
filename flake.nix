@@ -59,14 +59,19 @@
     build = pkgs.writeShellScriptBin "build" ''
       set -euo pipefail
       jobs=''${1:-}
+      export CCACHE_BASEDIR="$PWD"
+      export CCACHE_NOHASHDIR=1
+      export CCACHE_SLOPPINESS=include_file_mtime,include_file_ctime,time_macros,pch_defines
       if [ ! -f build/build.ninja ]; then
         cmake -S . -B build -G Ninja \
           -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
           -DCMAKE_BUILD_TYPE=Release \
+          -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+          -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
           -DMOCHA_IREE_SOURCE_DIR=${iree}
       fi
       cmake --build build ''${jobs:+-j "$jobs"} \
-        --target mlir-backend iree-compile iree-run-module
+        --target mlir-backend iree-compile iree-run-module iree-benchmark-module
       ln -sfn build/compile_commands.json compile_commands.json
     '';
 
@@ -99,8 +104,15 @@
 
     runIree = pkgs.writeShellScriptBin "run-iree" ''
       set -euo pipefail
+
+      vulkan=0
+      if [ "''${1:-}" = "--vulkan" ]; then
+        vulkan=1
+        shift
+      fi
+
       if [ "$#" -lt 1 ]; then
-        echo "usage: run-iree FILE.fut|FILE.fut_gpu [iree-run-module arguments...]" >&2
+        echo "usage: run-iree [--vulkan] FILE.fut|FILE.fut_gpu [iree-run-module arguments...]" >&2
         exit 2
       fi
 
@@ -115,14 +127,73 @@
       vmfb_file="out/$name.vmfb"
       ${compile}/bin/compile "$file" > "$mlir_file"
 
-      ./build/iree/tools/iree-compile "$mlir_file" \
-        --iree-hal-target-device=local \
-        --iree-hal-local-target-device-backends=llvm-cpu \
-        -o "$vmfb_file"
+      if [ "$vulkan" = 1 ]; then
+        # sm_89 = Ada Lovelace (RTX 40xx)
+        ./build/iree/tools/iree-compile "$mlir_file" \
+          --iree-hal-target-device=vulkan \
+          --iree-vulkan-target=sm_89 \
+          --iree-dispatch-creation-enable-split-reduction \
+          -o "$vmfb_file"
+        device=vulkan
+      else
+        ./build/iree/tools/iree-compile "$mlir_file" \
+          --iree-hal-target-device=local \
+          --iree-hal-local-target-device-backends=llvm-cpu \
+          -o "$vmfb_file"
+        device=local-task
+      fi
 
       exec ./build/iree/tools/iree-run-module \
         --module="$vmfb_file" \
-        --device=local-task \
+        --device="$device" \
+        --function=entry_main \
+        "$@"
+    '';
+
+    iree-benchmark = pkgs.writeShellScriptBin "iree-benchmark" ''
+      set -euo pipefail
+
+      vulkan=0
+      if [ "''${1:-}" = "--vulkan" ]; then
+        vulkan=1
+        shift
+      fi
+
+      if [ "$#" -lt 1 ]; then
+        echo "usage: iree-benchmark [--vulkan] FILE.fut|FILE.fut_gpu [iree-benchmark-module arguments...]" >&2
+        exit 2
+      fi
+
+      file="$1"
+      shift
+      name=$(basename "$file")
+      name=''${name%.fut_gpu}
+      name=''${name%.fut}
+      mkdir -p out
+
+      mlir_file="out/$name.mlir"
+      vmfb_file="out/$name.vmfb"
+      ${compile}/bin/compile "$file" > "$mlir_file"
+
+      if [ "$vulkan" = 1 ]; then
+        # sm_89 = Ada Lovelace (RTX 40xx)
+        ./build/iree/tools/iree-compile "$mlir_file" \
+          --iree-hal-target-device=vulkan \
+          --iree-vulkan-target=sm_89 \
+          --iree-dispatch-creation-enable-split-reduction \
+          -o "$vmfb_file"
+        device=vulkan
+      else
+        ./build/iree/tools/iree-compile "$mlir_file" \
+          --iree-hal-target-device=local \
+          --iree-hal-local-target-device-backends=llvm-cpu \
+          -o "$vmfb_file"
+        device=local-task
+      fi
+
+      exec ./build/iree/tools/iree-benchmark-module \
+        --module="$vmfb_file" \
+        --device="$device" \
         --function=entry_main \
         "$@"
     '';
@@ -135,6 +206,17 @@
       set -euo pipefail
       ${build}/bin/build >&2
       exec ${pkgs.python3}/bin/python3 run_tests.py "$@"
+    '';
+
+    # Validates the `-- input`/`-- output` blocks against Futhark's own
+    # reference backend (independent of the MLIR/IREE pipeline). Defaults to
+    # every test if no files are given.
+    futhark-test = pkgs.writeShellScriptBin "futhark-test" ''
+      set -euo pipefail
+      if [ "$#" -eq 0 ]; then
+        set -- tests/*.fut
+      fi
+      exec futhark test --backend=c "$@"
     '';
 
     # Only removes mlir-backend's build artifacts, leaving the already-built
@@ -157,10 +239,11 @@
     in {
       package = mlir-backend;
 
-      devShell = pkgs.mkShell {
+      devShell = pkgs.mkShell ({
         inputsFrom = [ mlir-backend ];
 
         packages = with pkgs; [
+          ccache
           clangd
           antlr4
           openjdk
@@ -173,14 +256,20 @@
           ireeRunModule
           runIree
           run-tests
+          iree-benchmark
+          futhark-test
           llvmPackages_22.lldb
         ] ++ pkgs.lib.optionals (!pkgs.stdenv.isDarwin) [
           # Linux stdenv is gcc-based, so add clang for an LLVM toolchain.
           # On Darwin the stdenv is already clang-based; a second clang here
           # is redundant and can clash with the stdenv/llvmPackages_22 clang.
           clang
+          vulkan-loader
         ];
-      };
+      } // pkgs.lib.optionalAttrs (!pkgs.stdenv.isDarwin) {
+        IREE_HAL_VULKAN_LIBVULKAN_PATH = "${pkgs.vulkan-loader}/lib";
+        VK_ICD_FILENAMES = "/run/opengl-driver/share/vulkan/icd.d/nvidia_icd.json";
+      });
     };
   in {
     packages = forAllSystems (pkgs: { default = (perSystem pkgs).package; });

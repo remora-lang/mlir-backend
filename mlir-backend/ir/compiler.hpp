@@ -1,5 +1,6 @@
 #pragma once
 // Represents the state of a Futhark function
+#include "core.hpp"
 #include "debug.hpp"
 #include "error.hpp"
 #include "iree/compiler/Dialect/Flow/IR/FlowOps.h"
@@ -7,6 +8,7 @@
 #include "segop.hpp"
 #include "syntax.hpp"
 #include <format>
+#include <iterator>
 #include <mlir/Dialect/Arith/IR/Arith.h>
 #include <mlir/Dialect/Linalg/IR/Linalg.h>
 #include <mlir/Dialect/Tensor/IR/Tensor.h>
@@ -84,6 +86,8 @@ inline std::vector<int64_t> toShapeType(const R &dims) {
 }
 
 struct FutharkCompiler {
+  using Values = mlir::SmallVector<mlir::Value>;
+
   Prog &prog;
 
   std::unordered_map<FunDef, mlir::func::FuncOp, FunDefHasher> functions;
@@ -108,9 +112,25 @@ struct FutharkCompiler {
     builder.setInsertionPointToStart(module.getBody());
   }
 
-  mlir::func::FuncOp LowerFunction(FunDef fun) {
+  mlir::func::FuncOp LowerFunction(const FunDef &fun) {
     if (functions.find(fun) != functions.end())
       return functions[fun];
+
+    llvm::errs() << "FUN " << fun.name << "\n";
+    for (auto attr : fun.attrs.attrs) {
+      match(
+          attr.v,
+          [&](const AtomAttr &attr) { PrintValue(attr.name); },
+          [&](const CompAttr &attr) {
+            PrintValue(attr.name);
+            match(
+                attr.args[0].v,
+                [&](const AtomAttr &attr) { PrintValue(attr.name); },
+                [](const auto &) {});
+          },
+          [](const auto &) { llvm::errs() << "other\n"; });
+    }
+    llvm::errs() << "\n";
 
     auto lastPos = builder.saveInsertionPoint();
     builder.setInsertionPointToEnd(module.getBody());
@@ -135,65 +155,56 @@ struct FutharkCompiler {
     auto entry = func.addEntryBlock();
     builder.setInsertionPointToStart(entry);
 
-    for (auto i = 0; i < fun.params.size(); i++) {
-      ctx.subexps.insert(fun.params[i].name, func.getArgument(i));
+    for (auto [param, arg] : llvm::zip_equal(fun.params, func.getArguments())) {
+      ctx.subexps.insert(param.name, arg);
     }
 
     auto retValue = LowerBody(fun.body, ctx);
-    mlir::func::ReturnOp::create(builder, builder.getUnknownLoc(), {retValue});
+    mlir::func::ReturnOp::create(builder, builder.getUnknownLoc(), retValue);
     builder.restoreInsertionPoint(lastPos);
     return func;
   }
 
-  mlir::Value LowerBody(Body body, Ctx &ctx) {
-    for (auto stm : body.stms) {
+  Values LowerBody(Body body, Ctx &ctx) {
+    for (auto &stm : body.stms) {
       LowerStm(stm, ctx);
     }
-
-    return LowerSubExp(body.result[0], ctx);
+    Values results;
+    for (auto &res : body.result) {
+      results.push_back(LowerSubExp(res, ctx));
+    }
+    return results;
   }
 
-  void LowerStm(Stm stm, Ctx &ctx) {
-    auto v = LowerExp(stm.exp, ctx);
-    assert(stm.pat.elems.size() == 1);
-    ctx.subexps.insert(stm.pat.elems[0].name.name, v);
+  void LowerStm(const Stm &stm, Ctx &ctx) {
+    auto vs = LowerExp(stm.exp, ctx);
+    assert(stm.pat.elems.size() == vs.size());
+    for (auto [elem, value] : llvm::zip_equal(stm.pat.elems, vs)) {
+      ctx.subexps.insert(elem.name.name, value);
+    }
   }
 
-  mlir::Value LowerExp(Exp exp, Ctx &ctx) {
-    if (auto *val = std::get_if<ExpBasicOp>(&exp.v)) {
-      return LowerBasicOp(val->op, ctx);
-    }
+  Values LowerExp(const Exp &exp, Ctx &ctx) {
+    return match(
+        exp.v,
+        [&](const ExpBasicOp &e) { return Values{LowerBasicOp(e.op, ctx)}; },
+        [&](const ExpSubExp &e) { return Values{LowerSubExp(e.subExp, ctx)}; },
+        [&](const ExpHostOp &e) { return LowerHostOp(e.op, ctx); },
+        [&](const ExpApply &e) -> Values {
+          auto func = GetFunction(prog, e.fname);
+          auto llvmFunc = LowerFunction(func);
 
-    if (auto *val = std::get_if<ExpSubExp>(&exp.v)) {
-      return LowerSubExp(val->subExp, ctx);
-    }
+          Values args;
+          for (int64_t i = 0; i < std::ssize(func.params); i++) {
+            args.push_back(LowerSubExp(e.args[i].first, ctx));
+          }
 
-    if (auto *val = std::get_if<ExpHostOp>(&exp.v)) {
-      return LowerHostOp(val->op, ctx);
-    }
-
-    if (auto *val = std::get_if<ExpApply>(&exp.v)) {
-      auto func = GetFunction(prog, val->fname);
-      auto llvmFunc = LowerFunction(func);
-
-      std::vector<mlir::Value> args;
-      for (auto i = 0; i < func.params.size(); i++) {
-        auto [subExp, diet] = val->args[i];
-        args.push_back(LowerSubExp(subExp, ctx));
-      }
-
-      auto call = mlir::func::CallOp::create(builder, llvmFunc, args);
-      return call->getResult(0);
-    }
-
-    if (auto *val = std::get_if<ExpBasicOp>(&exp.v)) {
-      return LowerBasicOp(val->op, ctx);
-    }
-
-    Unreachable();
+          auto call = mlir::func::CallOp::create(builder, llvmFunc, args);
+          return call->getResults();
+        });
   }
 
-  mlir::Value LowerBasicOp(BasicOp basicOp, Ctx &ctx) {
+  mlir::Value LowerBasicOp(const BasicOp &basicOp, Ctx &ctx) {
     if (auto *val = std::get_if<BasicOpSubExp>(&basicOp.v)) {
       return LowerSubExp(val->subExp, ctx);
     }
@@ -209,26 +220,31 @@ struct FutharkCompiler {
     }
 
     if (auto *val = std::get_if<BasicOpIota>(&basicOp.v)) {
-      auto n = (uint64_t)val->n.GetIntValue();
-      uint64_t s = val->s.GetIntValue();
-      auto iota = Iota(n, (uint64_t)val->x.GetIntValue(), s);
+      return match(
+          val->n.v,
+          [&](const ConstantSubExp &c) {
+            auto n = c.GetIntValue();
+            int64_t s = val->s.GetIntValue();
+            auto iota = Iota(n, val->x.GetIntValue(), s);
 
-      // Get an array type for the iota
-      auto primType = PrimTypeInt{val->t};
-      Shape shape{};
-      shape.dims.push_back(val->n);
-      auto arrTy = Type::CreateArr(PrimType{primType}, shape);
+            // Get an array type for the iota
+            auto primType = PrimTypeInt{val->t};
+            Shape shape{};
+            shape.dims.push_back(val->n);
+            auto arrTy = Type::CreateArr(PrimType{primType}, shape);
 
-      BasicOpArrayLit arrLit{};
-      arrLit.t = arrTy;
+            BasicOpArrayLit arrLit{};
+            arrLit.t = arrTy;
 
-      for (auto v : iota) {
-        ConstantSubExp exp = {
-            PrimValue::CreateInt((int64_t)val, (uint64_t)primType.t)};
-        arrLit.values.push_back({exp});
-      }
+            for (int64_t v : iota) {
+              ConstantSubExp exp = {
+                  PrimValue::CreateInt(v, (uint64_t)primType.t)};
+              arrLit.values.push_back({exp});
+            }
 
-      return LowerArrayLit(arrLit, ctx);
+            return LowerArrayLit(arrLit, ctx);
+          },
+          [](const auto &) -> mlir::Value { Undefined(); });
     }
 
     if (auto *val = std::get_if<BasicOpConcat>(&basicOp.v)) {
@@ -260,15 +276,22 @@ struct FutharkCompiler {
     if (auto *val = std::get_if<BasicOpConvOp>(&basicOp.v)) {
       auto op0 = LowerSubExp(val->op0, ctx);
       auto convOp = val->op;
-      if (auto *zext = std::get_if<ConvOpZExt>(&convOp.v)) {
-        auto primTy = Type::CreatePrim(PrimType::Int(zext->to));
-        return mlir::arith::ExtUIOp::create(builder, LowerTy(primTy), op0);
-      }
+      return match(
+          convOp.v,
+          [&](const ConvOpZExt &zext) -> mlir::Value {
+            return mlir::arith::ExtUIOp::create(
+                builder,
+                LowerTy(Type::CreatePrim(PrimType::Int(zext.to))),
+                op0);
+          },
 
-      if (auto *sext = std::get_if<ConvOpSExt>(&convOp.v)) {
-        auto primTy = Type::CreatePrim(PrimType::Int(sext->to));
-        return mlir::arith::ExtUIOp::create(builder, LowerTy(primTy), op0);
-      }
+          [&](const ConvOpSExt &sext) -> mlir::Value {
+            return mlir::arith::ExtSIOp::create(
+                builder,
+                LowerTy(Type::CreatePrim(PrimType::Int(sext.to))),
+                op0);
+          },
+          [](const auto &) -> mlir::Value { Undefined(); });
     }
 
     if (auto *val = std::get_if<BasicOpReshape>(&basicOp.v)) {
@@ -281,7 +304,9 @@ struct FutharkCompiler {
       reassociations.push_back(ranges);
 
       auto prevTy = llvm::dyn_cast<mlir::RankedTensorType>(op0.getType());
-      for (auto i = val->dimEnd; i < prevTy.getShape().size(); i++) {
+      if (!prevTy)
+        Undefined();
+      for (int64_t i = val->dimEnd; i < std::ssize(prevTy.getShape()); i++) {
         reassociations.push_back({i});
       }
 
@@ -299,6 +324,8 @@ struct FutharkCompiler {
     if (auto *val = std::get_if<BasicOpRearrange>(&basicOp.v)) {
       auto op = LowerSubExp(val->arr.name, ctx);
       auto tensorTy = llvm::dyn_cast<mlir::RankedTensorType>(op.getType());
+      if (!tensorTy)
+        Undefined();
 
       std::vector<int64_t> dims = tensorTy.getShape();
       std::reverse(dims.begin(), dims.end());
@@ -340,7 +367,7 @@ struct FutharkCompiler {
           mlir::tensor::EmptyOp::create(builder, transposedTy, {});
 
       std::vector<int64_t> addedDims;
-      for (auto i = 0; i < (before.size() - original.size()); i++) {
+      for (int64_t i = 0; i < std::ssize(before) - std::ssize(original); i++) {
         addedDims.push_back(i);
       }
 
@@ -354,7 +381,7 @@ struct FutharkCompiler {
 
   mlir::Value LowerSubExp(SubExp subExp, Ctx &ctx) {
     if (auto *val = std::get_if<VarSubExp>(&subExp.v)) {
-      return ctx.subexps.lookup(val->v.name);
+      return LowerSubExp(val->v.name, ctx);
     }
 
     if (auto *val = std::get_if<ConstantSubExp>(&subExp.v)) {
@@ -368,27 +395,26 @@ struct FutharkCompiler {
     return ctx.subexps.lookup(vname);
   }
 
-  mlir::Value LowerHostOp(HostOp &op, Ctx &ctx) {
+  Values LowerHostOp(const HostOp &op, Ctx &ctx) {
     return match(
         op.v,
-        [&](SizeOp &v) { return LowerSizeOp(v, ctx); },
-        [&](std::shared_ptr<SegOp> &v) { return LowerSegOp(v, ctx); });
+        [&](const SizeOp &v) { return Values{LowerSizeOp(v, ctx)}; },
+        [&](const std::shared_ptr<SegOp> &v) { return LowerSegOp(v, ctx); });
   }
 
-  mlir::Value LowerSizeOp(SizeOp &sizeOp, Ctx &ctx) { Undefined(); }
+  mlir::Value LowerSizeOp(const SizeOp &sizeOp, Ctx &ctx) { Undefined(); }
 
-  mlir::Value LowerSegOp(std::shared_ptr<SegOp> pSegOp, Ctx &ctx) {
+  Values LowerSegOp(std::shared_ptr<SegOp> pSegOp, Ctx &ctx) {
     return match(
         pSegOp->v,
         [&](const SegMap &v) { return LowerSegMap(v, ctx); },
-        [&](const SegRed &v) { return LowerSegRed(v, ctx); },
-        [&](const SegScan &v) { return LowerSegScan(v, ctx); });
+        [&](const SegRed &v) { return Values{LowerSegRed(v, ctx)}; },
+        [&](const SegScan &v) { return Values{LowerSegScan(v, ctx)}; });
   }
 
   // TODO Limitations
-  // 1. The map must return a single result.
-  // 2. The base type must be scalar (i.e., the seg space creates all dims).
-  // 3. Only affine reads with seg space ids are recognized as such.
+  // 1. The base type must be scalar (i.e., the seg space creates all dims).
+  // 2. Only affine reads with seg space ids are recognized as such.
   // For example,
   //    xs[gtid]
   // is recognized because gtid is in the iteration (seg) space. But
@@ -396,7 +422,7 @@ struct FutharkCompiler {
   // is not. Neither is
   //    xs[gtid - c],
   // where c is a variable defined outside the kernel body.
-  mlir::Value LowerSegMap(SegMap pSegMap, Ctx &ctx) {
+  Values LowerSegMap(const SegMap &pSegMap, Ctx &ctx) {
     // This lowers a SegMap to a linalg.generic op, whose
     //   * iteration space corresponds to the SegMap's SegSpace;
     //   * inputs correspond to "affine reads" in the SegMap body.
@@ -408,9 +434,31 @@ struct FutharkCompiler {
     std::vector<AffineRead> affine_reads =
         FindSegOpAffineReads(iterSpace, pSegMap.body);
 
-    mlir::SmallVector<mlir::Value> inputs;
+    Values inputs;
     for (auto &read : affine_reads)
       inputs.push_back(ctx.subexps.lookup(read.array.name));
+
+    mlir::SmallVector<mlir::Type> returnTypes;
+    for (auto ret : pSegMap.ret) {
+      auto baseTy = LowerSegOpBaseType(ret, ctx);
+      auto shapeTy = toShapeType(std::views::values(pSegMap.space.dims));
+      returnTypes.push_back(mlir::RankedTensorType::get(shapeTy, baseTy));
+    }
+    Values dynamicSizes;
+    for (const auto &d : iterSpace) {
+      if (d.isDynamic)
+        dynamicSizes.push_back(mlir::arith::IndexCastOp::create(
+            builder, builder.getIndexType(), d.value));
+    };
+    Values outputs;
+    for (auto &ty : returnTypes) {
+      outputs.push_back(
+          mlir::tensor::EmptyOp::create(builder, ty, dynamicSizes));
+    }
+
+    auto iterTypes = map(iterSpace, [](const auto &) {
+      return mlir::utils::IteratorType::parallel;
+    });
 
     // Map the iteration space to each input's dimensions.
     mlir::SmallVector<mlir::AffineMap> indexingMaps;
@@ -418,36 +466,17 @@ struct FutharkCompiler {
       indexingMaps.push_back(read.indexMap);
     }
 
-    // Map the iteration space to the output's dimensions.
+    // Map the iteration space to each output's dimensions.
     auto rank = iterSpace.size();
-    indexingMaps.push_back(
+    indexingMaps.append(
+        outputs.size(),
         mlir::AffineMap::getMultiDimIdentityMap(rank, &context));
-
-    if (pSegMap.ret.size() != 1) {
-      Undefined();
-    }
-    auto baseTy = LowerSegOpBaseType(pSegMap.ret[0], ctx);
-    auto shapeTy = toShapeType(std::views::values(pSegMap.space.dims));
-    auto returnTy = mlir::RankedTensorType::get(shapeTy, baseTy);
-
-    mlir::SmallVector<mlir::Value> dynamicSizes;
-    for (const auto &d : iterSpace) {
-      if (d.isDynamic)
-        dynamicSizes.push_back(mlir::arith::IndexCastOp::create(
-            builder, builder.getIndexType(), d.value));
-    };
-    mlir::Value output =
-        mlir::tensor::EmptyOp::create(builder, returnTy, dynamicSizes);
-
-    auto iterTypes = map(iterSpace, [](const auto &) {
-      return mlir::utils::IteratorType::parallel;
-    });
 
     auto op = mlir::linalg::GenericOp::create(
         builder,
-        mlir::TypeRange{returnTy},
+        returnTypes,
         inputs,
-        mlir::ValueRange{output},
+        outputs,
         indexingMaps,
         iterTypes,
         [&](mlir::OpBuilder &b, mlir::Location loc, mlir::ValueRange args) {
@@ -455,51 +484,30 @@ struct FutharkCompiler {
           builder.setInsertionPointToEnd(b.getInsertionBlock());
 
           Ctx local = ctx;
-          mlir::SmallVector<mlir::Value> results = LowerSegOpKernelBody(
+          Values results = LowerSegOpKernelBody(
               loc, args, affine_reads, iterSpace, pSegMap.body, local);
 
+          assert(results.size() == outputs.size());
           mlir::linalg::YieldOp::create(builder, loc, results);
         });
 
-    return op.getResult(0);
+    return op.getResults();
   }
 
   // TODO Same limitations as SegMap, probably.
-  mlir::Value LowerSegRed(SegRed pSegRed, Ctx &ctx) {
+  Values LowerSegRed(const SegRed &pSegRed, Ctx &ctx) {
     IterationSpace iterSpace = LowerSegSpace(pSegRed.space, ctx);
+    int64_t rank = std::ssize(iterSpace);
+    if (rank == 0)
+      Undefined();
 
     std::vector<AffineRead> affine_reads =
         FindSegOpAffineReads(iterSpace, pSegRed.body);
 
-    mlir::SmallVector<mlir::Value> inputs;
+    Values inputs;
     for (auto &read : affine_reads)
       inputs.push_back(ctx.subexps.lookup(read.array.name));
 
-    // Map the iteration space to each input's dimensions.
-    mlir::SmallVector<mlir::AffineMap> indexingMaps;
-    for (const auto &read : affine_reads) {
-      indexingMaps.push_back(read.indexMap);
-    }
-
-    // Map the iteration space to the output's dimensions.
-    auto rank = pSegRed.space.dims.size();
-    if (rank == 0) {
-      Undefined();
-    }
-    mlir::SmallVector<mlir::AffineExpr> outDims;
-    for (auto i = 0; i < rank - 1; ++i) {
-      outDims.push_back(mlir::getAffineDimExpr(i, &context));
-    }
-    indexingMaps.push_back(mlir::AffineMap::get(rank, 0, outDims, &context));
-
-    auto iterTypes = map(iterSpace, [](const auto &) {
-      return mlir::utils::IteratorType::parallel;
-    });
-    iterTypes[rank - 1] = mlir::utils::IteratorType::reduction;
-
-    if (pSegRed.ret.size() != 1) {
-      Undefined();
-    }
     if (pSegRed.ops.size() != 1) {
       Undefined();
     }
@@ -507,23 +515,23 @@ struct FutharkCompiler {
     if (pSegBinOp.shape.dims.size() != 0) {
       Undefined();
     }
-    if (pSegBinOp.neutral.size() != 1) {
-      Undefined();
-    }
-    auto neutral = LowerSubExp(pSegBinOp.neutral[0], ctx);
-
-    auto pBaseTy = pSegBinOp.lambda.ret;
-    if (pBaseTy.size() != 1) {
-      Undefined();
+    Values neutral;
+    for (auto &e : pSegBinOp.neutral) {
+      neutral.push_back(LowerSubExp(e, ctx));
     }
 
-    auto baseTy = LowerSegOpBaseType(pBaseTy[0], ctx);
-    auto shapeTy = toShapeType(std::views::values(pSegRed.space.dims) |
-                               std::views::take(rank - 1));
-    auto returnTy = mlir::RankedTensorType::get(shapeTy, baseTy);
+    // TODO reorder statements to match segmap
 
-    mlir::SmallVector<mlir::Value> dynamicSizes;
-    auto reductionIndex = rank - 1;
+    mlir::SmallVector<mlir::Type> returnTypes;
+    for (auto ret : pSegBinOp.lambda.ret) {
+      auto baseTy = LowerSegOpBaseType(ret, ctx);
+      auto shapeTy = toShapeType(std::views::values(pSegRed.space.dims) |
+                                 std::views::take(rank - 1));
+      returnTypes.push_back(mlir::RankedTensorType::get(shapeTy, baseTy));
+    }
+
+    Values dynamicSizes;
+    int64_t reductionIndex = rank - 1;
     for (const auto &d : iterSpace) {
       if (d.index == reductionIndex)
         continue;
@@ -531,18 +539,40 @@ struct FutharkCompiler {
         dynamicSizes.push_back(mlir::arith::IndexCastOp::create(
             builder, builder.getIndexType(), d.value));
     };
-    mlir::Value output = mlir::linalg::FillOp::create(
-                             builder,
-                             mlir::ValueRange{neutral},
-                             mlir::ValueRange{mlir::tensor::EmptyOp::create(
-                                 builder, returnTy, dynamicSizes)})
-                             .result();
+    Values outputs;
+    for (auto [ty, ne] : llvm::zip_equal(returnTypes, neutral)) {
+      outputs.push_back(mlir::linalg::FillOp::create(
+                            builder,
+                            ne,
+                            mlir::ValueRange{mlir::tensor::EmptyOp::create(
+                                builder, ty, dynamicSizes)})
+                            .result());
+    }
+
+    auto iterTypes = map(iterSpace, [](const auto &) {
+      return mlir::utils::IteratorType::parallel;
+    });
+    iterTypes[rank - 1] = mlir::utils::IteratorType::reduction;
+
+    // Map the iteration space to each input's dimensions.
+    mlir::SmallVector<mlir::AffineMap> indexingMaps;
+    for (const auto &read : affine_reads) {
+      indexingMaps.push_back(read.indexMap);
+    }
+
+    // Map the iteration space to each output's dimensions.
+    mlir::SmallVector<mlir::AffineExpr> outDims;
+    for (int64_t i = 0; i < rank - 1; ++i) {
+      outDims.push_back(mlir::getAffineDimExpr(i, &context));
+    }
+    indexingMaps.append(outputs.size(),
+                        mlir::AffineMap::get(rank, 0, outDims, &context));
 
     auto op = mlir::linalg::GenericOp::create(
         builder,
-        mlir::TypeRange{returnTy},
+        returnTypes,
         inputs,
-        mlir::ValueRange{output},
+        outputs,
         indexingMaps,
         iterTypes,
         [&](mlir::OpBuilder &b, mlir::Location loc, mlir::ValueRange args) {
@@ -550,24 +580,27 @@ struct FutharkCompiler {
           builder.setInsertionPointToEnd(b.getInsertionBlock());
 
           Ctx local = ctx;
-          mlir::SmallVector<mlir::Value> returns = LowerSegOpKernelBody(
+          Values returns = LowerSegOpKernelBody(
               loc, args, affine_reads, iterSpace, pSegRed.body, local);
 
-          assert(pSegBinOp.lambda.params.size() == 2);
-          assert(pSegBinOp.lambda.params.size() == returns.size() * 2);
-          // Bind accumulator to first lambda parameter.
-          local.subexps.insert(pSegBinOp.lambda.params[0].name, args.back());
-          // Bind kernel body results second lambda parameter.
-          for (auto i = 1; i < pSegBinOp.lambda.params.size(); i++) {
-            local.subexps.insert(pSegBinOp.lambda.params[i].name,
-                                 returns[i - 1]);
+          // Bind accumulators and inputs to reduce op.
+          auto accs = args.drop_front(inputs.size());
+          assert(pSegBinOp.lambda.params.size() ==
+                 accs.size() + returns.size());
+          for (auto [param, acc] : llvm::zip(pSegBinOp.lambda.params, accs)) {
+            local.subexps.insert(param.name, acc);
+          }
+          for (auto [param, ret] : llvm::zip_equal(
+                   llvm::drop_begin(pSegBinOp.lambda.params, accs.size()),
+                   returns)) {
+            local.subexps.insert(param.name, ret);
           }
           auto results = LowerBody(pSegBinOp.lambda.body, local);
 
           mlir::linalg::YieldOp::create(builder, loc, results);
         });
 
-    return op.getResult(0);
+    return op.getResults();
   }
 
   // TODOs:
@@ -858,18 +891,18 @@ struct FutharkCompiler {
         [](const auto &) -> mlir::Type { Undefined(); });
   };
 
-  mlir::SmallVector<mlir::Value>
-  LowerSegOpKernelBody(mlir::Location loc, const mlir::ValueRange blockArgs,
-                       const std::vector<AffineRead> &affine_reads,
-                       const IterationSpace &iterSpace, const KernelBody &body,
-                       Ctx &ctx) {
+  Values LowerSegOpKernelBody(mlir::Location loc,
+                              const mlir::ValueRange blockArgs,
+                              const std::vector<AffineRead> &affine_reads,
+                              const IterationSpace &iterSpace,
+                              const KernelBody &body, Ctx &ctx) {
     std::unordered_set<std::string> skipLowering;
     for (auto &read : affine_reads)
       skipLowering.insert(read.result.name);
 
     // Lower the kernel's affine reads by binding them to the inputs.
-    for (auto i = 0; i < affine_reads.size(); i++) {
-      ctx.subexps.insert(affine_reads[i].result.name, blockArgs[i]);
+    for (auto [read, arg] : llvm::zip_equal(affine_reads, blockArgs)) {
+      ctx.subexps.insert(read.result.name, arg);
     }
     // Lower the kernel's gtids by binding them to the iteration indices.
     // TODO only do this if they're actually used
@@ -887,7 +920,7 @@ struct FutharkCompiler {
         continue;
       LowerStm(stm, ctx);
     }
-    mlir::SmallVector<mlir::Value> returns;
+    Values returns;
     for (auto &r : body.result)
       returns.push_back(LowerSubExp(r.result, ctx));
 
@@ -973,13 +1006,13 @@ struct FutharkCompiler {
     return tensor;
   }
 
-  template <typename T> static std::vector<T> Iota(size_t n, T x, T s) {
+  template <typename T> static std::vector<T> Iota(int64_t n, T x, T s) {
     std::vector<T> elems;
     if (n <= 0)
       return elems;
 
     auto currentValue = x;
-    for (auto i = 0; i < n; i++) {
+    for (int64_t i = 0; i < n; i++) {
       elems.push_back(currentValue);
       currentValue += s;
     }
