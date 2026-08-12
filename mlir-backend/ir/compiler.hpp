@@ -1,5 +1,6 @@
 #pragma once
 // Represents the state of a Futhark function
+#include "core.hpp"
 #include "debug.hpp"
 #include "error.hpp"
 #include "match.hpp"
@@ -215,26 +216,31 @@ struct FutharkCompiler {
     }
 
     if (auto *val = std::get_if<BasicOpIota>(&basicOp.v)) {
-      auto n = (uint64_t)val->n.GetIntValue();
-      uint64_t s = val->s.GetIntValue();
-      auto iota = Iota(n, (uint64_t)val->x.GetIntValue(), s);
+      return match(
+          val->n.v,
+          [&](const ConstantSubExp &c) {
+            auto n = c.GetIntValue();
+            int64_t s = val->s.GetIntValue();
+            auto iota = Iota(n, val->x.GetIntValue(), s);
 
-      // Get an array type for the iota
-      auto primType = PrimTypeInt{val->t};
-      Shape shape{};
-      shape.dims.push_back(val->n);
-      auto arrTy = Type::CreateArr(PrimType{primType}, shape);
+            // Get an array type for the iota
+            auto primType = PrimTypeInt{val->t};
+            Shape shape{};
+            shape.dims.push_back(val->n);
+            auto arrTy = Type::CreateArr(PrimType{primType}, shape);
 
-      BasicOpArrayLit arrLit{};
-      arrLit.t = arrTy;
+            BasicOpArrayLit arrLit{};
+            arrLit.t = arrTy;
 
-      for (auto v : iota) {
-        ConstantSubExp exp = {
-            PrimValue::CreateInt((int64_t)val, (uint64_t)primType.t)};
-        arrLit.values.push_back({exp});
-      }
+            for (int64_t v : iota) {
+              ConstantSubExp exp = {
+                  PrimValue::CreateInt(v, (uint64_t)primType.t)};
+              arrLit.values.push_back({exp});
+            }
 
-      return LowerArrayLit(arrLit, ctx);
+            return LowerArrayLit(arrLit, ctx);
+          },
+          [](const auto &) -> mlir::Value { Undefined(); });
     }
 
     if (auto *val = std::get_if<BasicOpConcat>(&basicOp.v)) {
