@@ -409,7 +409,7 @@ struct FutharkCompiler {
         pSegOp->v,
         [&](const SegMap &v) { return LowerSegMap(v, ctx); },
         [&](const SegRed &v) { return Values{LowerSegRed(v, ctx)}; },
-        [&](const SegScan &v) { return Values{LowerSegScan(v, ctx)}; });
+        [&](const SegScan &v) { return LowerSegScan(v, ctx); });
   }
 
   // TODO Limitations
@@ -604,16 +604,14 @@ struct FutharkCompiler {
   }
 
   // TODOs:
-  // Support multi-dim SegSpace
   // Support vector SegBinOps
   // Support multiple SegBinOps
-  // Support multiple input/output for SegBinOps
   // Support size(SegBinOp) > 0
-  //  Parallelise
-  mlir::Value LowerSegScan(SegScan pSegScan, Ctx &ctx) {
+  // Parallelise
+  // XXX: There seems to be bug in IREE forall and IREE code result in segfault.
+  // (#24775)
+  Values LowerSegScan(const SegScan &pSegScan, Ctx &ctx) {
 
-    if (pSegScan.ret.size() != 1)
-      Undefined();
     if (pSegScan.ops.size() != 1)
       Undefined();
 
@@ -621,25 +619,28 @@ struct FutharkCompiler {
 
     if (!segBinOp.shape.dims.empty())
       Undefined();
-    if (segBinOp.neutral.size() != 1)
-      Undefined();
-    if (segBinOp.lambda.ret.size() != 1)
-      Undefined();
+
+    const size_t scanValueCount = segBinOp.neutral.size();
+    const size_t outputCount = pSegScan.ret.size();
 
     IterationSpace iterSpace = LowerSegSpace(pSegScan.space, ctx);
-    auto rank = iterSpace.size();
     assert(!iterSpace.empty());
     const Dim &scanDim = iterSpace.back();
     auto beforeLastDim = std::span{iterSpace}.first(iterSpace.size() - 1);
 
     mlir::Location loc = builder.getLoc();
 
-    auto neutral = LowerSubExp(segBinOp.neutral[0], ctx);
+    Values neutrals;
+    neutrals.reserve(scanValueCount);
+    for (const SubExp &neutral : segBinOp.neutral)
+      neutrals.push_back(LowerSubExp(neutral, ctx));
 
-    // build the result tensor
-    auto elementType = LowerSegOpBaseType(pSegScan.ret[0], ctx);
     auto shape = toShapeType(std::views::values(pSegScan.space.dims));
-    auto returnTy = mlir::RankedTensorType::get(shape, elementType);
+    mlir::SmallVector<mlir::RankedTensorType> returnTypes;
+    returnTypes.reserve(outputCount);
+    for (const Type &ret : pSegScan.ret)
+      returnTypes.push_back(
+          mlir::RankedTensorType::get(shape, LowerSegOpBaseType(ret, ctx)));
 
     mlir::SmallVector<mlir::Value> dynamicSizes;
     for (auto &dim : iterSpace) {
@@ -649,8 +650,11 @@ struct FutharkCompiler {
       }
     }
 
-    mlir::Value initialOutput =
-        mlir::tensor::EmptyOp::create(builder, returnTy, dynamicSizes);
+    Values initialOutputs;
+    initialOutputs.reserve(outputCount);
+    for (mlir::RankedTensorType returnType : returnTypes)
+      initialOutputs.push_back(
+          mlir::tensor::EmptyOp::create(builder, returnType, dynamicSizes));
 
     auto zero = mlir::arith::ConstantIndexOp::create(builder, loc, 0);
     auto one = mlir::arith::ConstantIndexOp::create(builder, loc, 1);
@@ -669,11 +673,12 @@ struct FutharkCompiler {
       }
       mapUpperBounds.push_back(upperBound);
     }
-    mlir::SmallVector<mlir::Value> mapLowerBounds(beforeLastDim.size(), zero);
-    mlir::SmallVector<mlir::Value> mapSteps(beforeLastDim.size(), one);
 
-    // Each forall iteration constructs one scan row.
-    auto rowTy = mlir::RankedTensorType::get({shape.back()}, elementType);
+    mlir::SmallVector<mlir::RankedTensorType> rowTypes;
+    rowTypes.reserve(outputCount);
+    for (mlir::RankedTensorType returnType : returnTypes)
+      rowTypes.push_back(mlir::RankedTensorType::get(
+          {shape.back()}, returnType.getElementType()));
 
     mlir::SmallVector<mlir::Value> rowDynamicSizes;
     if (scanDim.isDynamic) {
@@ -684,7 +689,7 @@ struct FutharkCompiler {
         builder,
         loc,
         mapUpperBounds,
-        mlir::ValueRange{initialOutput},
+        mlir::ValueRange{initialOutputs},
         /*mapping=*/std::nullopt,
         [&](mlir::OpBuilder &forallBuilder,
             mlir::Location forallLoc,
@@ -697,7 +702,7 @@ struct FutharkCompiler {
 
           size_t mapRank = mapUpperBounds.size();
           mlir::ValueRange ivs = regionArgs.take_front(mapRank);
-          mlir::Value sharedOutput = regionArgs[mapRank];
+          mlir::ValueRange sharedOutputs = regionArgs.drop_front(mapRank);
 
           for (size_t i = 0; i < ivs.size(); i++) {
             const auto &dim = beforeLastDim[i];
@@ -709,9 +714,15 @@ struct FutharkCompiler {
             }
             local.subexps.insert(dim.id, gtid);
           }
-          // Get the row
-          mlir::Value initialRow = mlir::tensor::EmptyOp::create(
-              builder, forallLoc, rowTy, rowDynamicSizes);
+
+          Values initialRows;
+          initialRows.reserve(outputCount);
+          for (mlir::RankedTensorType rowType : rowTypes) {
+            initialRows.push_back(mlir::tensor::EmptyOp::create(
+                builder, forallLoc, rowType, rowDynamicSizes));
+          }
+          Values initialLoopValues = neutrals;
+          initialLoopValues.append(initialRows.begin(), initialRows.end());
 
           auto scanLoop = mlir::scf::ForOp::create(
               builder,
@@ -719,7 +730,7 @@ struct FutharkCompiler {
               zero,
               scanUpperBound,
               one,
-              mlir::ValueRange{neutral, initialRow},
+              initialLoopValues,
 
               [&](mlir::OpBuilder &bodyBuilder,
                   mlir::Location bodyLoc,
@@ -729,12 +740,18 @@ struct FutharkCompiler {
                 builder.setInsertionPoint(bodyBuilder.getInsertionBlock(),
                                           bodyBuilder.getInsertionPoint());
 
-                mlir::Value accumulator = iterArgs[0];
-                mlir::Value outputRow = iterArgs[1];
+                mlir::ValueRange accumulators =
+                    iterArgs.take_front(scanValueCount);
+                mlir::ValueRange outputRows =
+                    iterArgs.drop_front(scanValueCount);
+
+                Values shapedOutputRows(outputRows.begin(), outputRows.end());
                 if (!rowDynamicSizes.empty()) {
-                  outputRow =
-                      mlir::iree_compiler::IREE::Flow::TensorTieShapeOp::create(
-                          builder, bodyLoc, outputRow, rowDynamicSizes);
+                  for (mlir::Value &outputRow : shapedOutputRows) {
+                    outputRow = mlir::iree_compiler::IREE::Flow::
+                        TensorTieShapeOp::create(
+                            builder, bodyLoc, outputRow, rowDynamicSizes);
+                  }
                 }
 
                 mlir::Value gtid = scanIndex;
@@ -748,38 +765,47 @@ struct FutharkCompiler {
                 for (const Stm &stm : pSegScan.body.stms)
                   LowerStm(stm, local);
 
-                assert(pSegScan.body.result.size() == 1);
-                mlir::Value kernelResult =
-                    LowerSubExp(pSegScan.body.result[0].result, local);
+                Values kernelResults;
+                kernelResults.reserve(scanValueCount);
+                for (const KernelResult &result : pSegScan.body.result) {
+                  kernelResults.push_back(LowerSubExp(result.result, local));
+                }
 
-                assert(segBinOp.lambda.params.size() == 2);
                 Ctx lambdaCtx = local;
-                lambdaCtx.subexps.insert(segBinOp.lambda.params[0].name,
-                                         accumulator);
-                lambdaCtx.subexps.insert(segBinOp.lambda.params[1].name,
-                                         kernelResult);
-                mlir::Value nextAccumulator =
+                for (size_t i = 0; i < scanValueCount; ++i) {
+                  lambdaCtx.subexps.insert(segBinOp.lambda.params[i].name,
+                                           accumulators[i]);
+                  lambdaCtx.subexps.insert(
+                      segBinOp.lambda.params[scanValueCount + i].name,
+                      kernelResults[i]);
+                }
+                Values nextAccumulators =
                     LowerBody(segBinOp.lambda.body, lambdaCtx);
 
-                assert(pSegScan.post_op.lambda.params.size() == 1);
                 Ctx postCtx = local;
-                postCtx.subexps.insert(pSegScan.post_op.lambda.params[0].name,
-                                       nextAccumulator);
-                mlir::Value outputElement =
+                for (size_t i = 0; i < scanValueCount; ++i) {
+                  postCtx.subexps.insert(pSegScan.post_op.lambda.params[i].name,
+                                         nextAccumulators[i]);
+                }
+                Values outputElements =
                     LowerBody(pSegScan.post_op.lambda.body, postCtx);
 
-                mlir::Value nextRow =
-                    mlir::tensor::InsertOp::create(builder,
-                                                   bodyLoc,
-                                                   outputElement,
-                                                   outputRow,
-                                                   mlir::ValueRange{scanIndex});
+                Values nextRows;
+                nextRows.reserve(outputCount);
+                for (size_t i = 0; i < outputCount; ++i) {
+                  nextRows.push_back(mlir::tensor::InsertOp::create(
+                      builder,
+                      bodyLoc,
+                      outputElements[i],
+                      shapedOutputRows[i],
+                      mlir::ValueRange{scanIndex}));
+                }
 
-                auto carry = mlir::ValueRange{nextAccumulator, nextRow};
+                Values carry = nextAccumulators;
+                carry.append(nextRows.begin(), nextRows.end());
                 mlir::scf::YieldOp::create(builder, bodyLoc, carry);
               });
 
-          mlir::Value completedRow = scanLoop.getResult(1);
           mlir::SmallVector<mlir::OpFoldResult> offsets;
           mlir::SmallVector<mlir::OpFoldResult> sizes;
           mlir::SmallVector<mlir::OpFoldResult> strides;
@@ -788,13 +814,12 @@ struct FutharkCompiler {
             sizes.push_back(builder.getIndexAttr(1));
             strides.push_back(builder.getIndexAttr(1));
           }
-
           offsets.push_back(builder.getIndexAttr(0));
-
-          if (rowTy.isDynamicDim(0)) {
+          if (rowTypes.front().isDynamicDim(0)) {
             sizes.push_back(scanUpperBound);
           } else {
-            sizes.push_back(builder.getIndexAttr(rowTy.getDimSize(0)));
+            sizes.push_back(
+                builder.getIndexAttr(rowTypes.front().getDimSize(0)));
           }
           strides.push_back(builder.getIndexAttr(1));
 
@@ -802,22 +827,29 @@ struct FutharkCompiler {
 
           builder.setInsertionPointToStart(inParallel.getBody());
 
-          mlir::tensor::ParallelInsertSliceOp::create(builder,
-                                                      forallLoc,
-                                                      completedRow,
-                                                      sharedOutput,
-                                                      offsets,
-                                                      sizes,
-                                                      strides);
+          auto completedRows = scanLoop.getResults().drop_front(scanValueCount);
+          for (size_t i = 0; i < outputCount; i++) {
+            mlir::tensor::ParallelInsertSliceOp::create(builder,
+                                                        forallLoc,
+                                                        completedRows[i],
+                                                        sharedOutputs[i],
+                                                        offsets,
+                                                        sizes,
+                                                        strides);
+          }
         });
 
-    mlir::Value result = forallOp.getResult(0);
-    if (!dynamicSizes.empty()) {
-      result = mlir::iree_compiler::IREE::Flow::TensorTieShapeOp::create(
-          builder, loc, result, dynamicSizes);
+    Values results;
+    results.reserve(outputCount);
+    for (mlir::Value result : forallOp.getResults()) {
+      if (!dynamicSizes.empty()) {
+        result = mlir::iree_compiler::IREE::Flow::TensorTieShapeOp::create(
+            builder, loc, result, dynamicSizes);
+      }
+      results.push_back(result);
     }
 
-    return result;
+    return results;
   }
   // Find SegOp iteration space.
   IterationSpace LowerSegSpace(const SegSpace &space, Ctx &ctx) {
