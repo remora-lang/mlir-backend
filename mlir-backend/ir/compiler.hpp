@@ -273,7 +273,7 @@ struct FutharkCompiler {
 
       if (auto *sext = std::get_if<ConvOpSExt>(&convOp.v)) {
         auto primTy = Type::CreatePrim(PrimType::Int(sext->to));
-        return mlir::arith::ExtUIOp::create(builder, LowerTy(primTy), op0);
+        return mlir::arith::ExtSIOp::create(builder, LowerTy(primTy), op0);
       }
     }
 
