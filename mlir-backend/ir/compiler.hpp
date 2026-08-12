@@ -258,15 +258,22 @@ struct FutharkCompiler {
     if (auto *val = std::get_if<BasicOpConvOp>(&basicOp.v)) {
       auto op0 = LowerSubExp(val->op0, ctx);
       auto convOp = val->op;
-      if (auto *zext = std::get_if<ConvOpZExt>(&convOp.v)) {
-        auto primTy = Type::CreatePrim(PrimType::Int(zext->to));
-        return mlir::arith::ExtUIOp::create(builder, LowerTy(primTy), op0);
-      }
+      return match(
+          convOp.v,
+          [&](const ConvOpZExt &zext) -> mlir::Value {
+            return mlir::arith::ExtUIOp::create(
+                builder,
+                LowerTy(Type::CreatePrim(PrimType::Int(zext.to))),
+                op0);
+          },
 
-      if (auto *sext = std::get_if<ConvOpSExt>(&convOp.v)) {
-        auto primTy = Type::CreatePrim(PrimType::Int(sext->to));
-        return mlir::arith::ExtSIOp::create(builder, LowerTy(primTy), op0);
-      }
+          [&](const ConvOpSExt &sext) -> mlir::Value {
+            return mlir::arith::ExtSIOp::create(
+                builder,
+                LowerTy(Type::CreatePrim(PrimType::Int(sext.to))),
+                op0);
+          },
+          [](const auto &) -> mlir::Value { Undefined(); });
     }
 
     if (auto *val = std::get_if<BasicOpReshape>(&basicOp.v)) {
