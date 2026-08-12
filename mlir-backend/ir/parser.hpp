@@ -27,8 +27,29 @@ struct FutharkTranslationVisitor {
       fun.retType.push_back({RetType{VisitType(type)}, {}});
     for (auto param : ctx->fParam())
       fun.params.push_back(VisitFParam(param));
-    fun.body = VisitBody(ctx->pBody());
+
+    for (auto *attr : ctx->pAttr())
+      fun.attrs.attrs.push_back(VisitAttr(attr));
+
+    // Forn now, a blackbox's body is a `???` hole, so skip it.
+    bool blackbox = false;
+    for (const auto &a : fun.attrs.attrs)
+      if (auto *c = std::get_if<CompAttr>(&a.v))
+        blackbox |= c->name == "blackbox";
+    if (!blackbox)
+      fun.body = VisitBody(ctx->pBody());
     return fun;
+  }
+
+  Attr VisitAttr(FutharkParser::PAttrContext *ctx) {
+    auto ids = ctx->ID();
+    std::string name = ids[0]->getText();
+    if (ids.size() == 1)
+      return Attr{AtomAttr{name}};
+    CompAttr comp{name, {}};
+    for (size_t i = 1; i < ids.size(); ++i)
+      comp.args.push_back(Attr{AtomAttr{ids[i]->getText()}});
+    return Attr{comp};
   }
 
   EntryPoint VisitEntry(FutharkParser::PEntryContext *ctx) {

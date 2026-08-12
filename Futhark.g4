@@ -13,7 +13,9 @@ pRecordField: NUMBER ':' pType;
 
 pRank: NUMBER ID;
 
-pFunDef: (pEntry? | 'fun') ID LPARAM fParam? (',' fParam)* RPARAM ':' OPEN_BRACKET '*'? pType (',' '*'? pType)* CLOSE_BRACKET '=' OPEN_BRACKET pBody CLOSE_BRACKET;
+pFunDef: pAttr* (pEntry? | 'fun') ID LPARAM fParam? (',' fParam)* RPARAM ':' OPEN_BRACKET '*'? pType (',' '*'? pType)* CLOSE_BRACKET '=' OPEN_BRACKET pBody CLOSE_BRACKET;
+
+pAttr: '#' '[' ID ('(' (ID (',' ID)*)? ')')? ']';
 
 pEntry: ('entry') LPARAM STRING_LITERAL COMMA OPEN_BRACKET pEntryPointInput? (COMMA pEntryPointInput)* CLOSE_BRACKET COMMA (OPAQUE STRING_LITERAL | '*'? pType) RPARAM;
 
@@ -23,7 +25,8 @@ fParam: ID ':' pType;
 
 pRetTypes: '{' pType* (',' pType)* '}';
 pType: pExtShape pPrimType pAlias? #TypeShape
-    | pPrimType pAlias? #TypePrim;
+    | pPrimType pAlias? #TypePrim
+    | 'unit' #TypeUnit;
 
 pAlias: '#' '(' pAliasSet (',' pAliasSet)* ')';
 pAliasSet: '[' (NUMBER (',' NUMBER)*)? ']';
@@ -35,7 +38,9 @@ pExtShape: ('[' pSubExp* ']')+;
 pBody: pStm* 'in' OPEN_BRACKET pSubExp (',' pSubExp)* CLOSE_BRACKET #Body
     | OPEN_BRACKET pSubExp (',' pSubExp)* CLOSE_BRACKET #EmptyBody;
 
-pStm: 'let' pPat '=' pExp;
+pStm: 'let' pPat '=' pCerts? pExp;
+
+pCerts: '#' '{' (ID (',' ID)*)? '}';
 
 pPat: OPEN_BRACKET pPatElem (',' pPatElem)* CLOSE_BRACKET;
 
@@ -89,6 +94,8 @@ pBasicOp: 'replicate' '(' pExtShape ',' pSubExp ')' #BasicOpReplicate
     | pConvOp #BasicOpConv
     | 'reshape' '(' pSubExp ',' '(' (NUMBER '::' NUMBER '=>' pExtShape ';') pExtShape ')' ')'  #BasicOpReshape
     | 'rearrange' '(' pSubExp ',' '(' NUMBER (',' NUMBER)* ')' ')' #BasicOpRearrange
+    | 'assert' '(' pSubExp ',' '{' STRING_LITERAL '}' ')' #BasicOpAssert
+    | 'scratch' '(' pPrimType (',' pSubExp)* ')' #BasicOpScratch
     ;
 
 pBinOp: binaryOpcode LPARAM pSubExp ',' pSubExp RPARAM;
@@ -101,7 +108,8 @@ pSubExp: pPrimValue #ConstantSubExpression
     | ID #VarSubExp;
 
 pPrimValue: NUMBER INTEGER_TYPE #PrimValueInteger
-    | FLOAT FLOAT_TYPE #PrimValueFloat;
+    | FLOAT FLOAT_TYPE #PrimValueFloat
+    | ('true' | 'false') #PrimValueBool;
 
 pPrimType: INTEGER_TYPE #PrimTypeInteger
  | FLOAT_TYPE #PrimTypeFloat;
