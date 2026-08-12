@@ -279,6 +279,8 @@ struct FutharkCompiler {
       reassociations.push_back(ranges);
 
       auto prevTy = llvm::dyn_cast<mlir::RankedTensorType>(op0.getType());
+      if (!prevTy)
+        Undefined();
       for (int64_t i = val->dimEnd; i < std::ssize(prevTy.getShape()); i++) {
         reassociations.push_back({i});
       }
@@ -297,6 +299,8 @@ struct FutharkCompiler {
     if (auto *val = std::get_if<BasicOpRearrange>(&basicOp.v)) {
       auto op = LowerSubExp(val->arr.name, ctx);
       auto tensorTy = llvm::dyn_cast<mlir::RankedTensorType>(op.getType());
+      if (!tensorTy)
+        Undefined();
 
       std::vector<int64_t> dims = tensorTy.getShape();
       std::reverse(dims.begin(), dims.end());
