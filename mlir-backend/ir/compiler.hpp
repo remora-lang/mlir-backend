@@ -629,7 +629,7 @@ mlir::Value LowerSegScan(SegScan pSegScan, Ctx &ctx) {
   if (!scanUpperBound.getType().isIndex()) {
     scanUpperBound = mlir::arith::IndexCastOp::create(builder, loc, builder.getIndexType(), scanUpperBound);
   }
-  mlir::SmallVector<mlir::Value> mapUpperBounds;
+  mlir::SmallVector<mlir::OpFoldResult> mapUpperBounds;
   for (auto &dim : beforeLastDim) {
     mlir::Value upperBound = dim.value;
     if (!upperBound.getType().isIndex()) {
@@ -639,28 +639,39 @@ mlir::Value LowerSegScan(SegScan pSegScan, Ctx &ctx) {
   }
   mlir::SmallVector<mlir::Value> mapLowerBounds(beforeLastDim.size(), zero);
   mlir::SmallVector<mlir::Value> mapSteps(beforeLastDim.size(), one);
+  
+  // Each forall iteration constructs one scan row.
+  auto rowTy = mlir::RankedTensorType::get(
+      {shape.back()}, elementType);
+
+  mlir::SmallVector<mlir::Value> rowDynamicSizes;
+  if (scanDim.isDynamic) {
+    rowDynamicSizes.push_back(scanUpperBound);
+  }
 
 
-  auto outerLoopNest = mlir::scf::buildLoopNest(
+  auto forallOp = mlir::scf::ForallOp::create(
     builder,
     loc,
-    mapLowerBounds,
     mapUpperBounds,
-    mapSteps,
     mlir::ValueRange{initialOutput},
-    [&](mlir::OpBuilder &OuterBodybuilder,
-        mlir::Location loc,
-        mlir::ValueRange ivs,
-        mlir::ValueRange outerIterArgs)
-        -> mlir::scf::ValueVector {
+    /*mapping=*/std::nullopt,
+    [&](mlir::OpBuilder &forallBuilder,
+        mlir::Location forallLoc,
+        mlir::ValueRange regionArgs)
+      {
         
         mlir::OpBuilder::InsertionGuard outerGuard(builder);
         builder.setInsertionPoint(
-        OuterBodybuilder.getInsertionBlock(),
-        OuterBodybuilder.getInsertionPoint());
+        forallBuilder.getInsertionBlock(),
+        forallBuilder.getInsertionPoint());
         
         Ctx local = ctx;
         
+      size_t mapRank = mapUpperBounds.size();
+      mlir::ValueRange ivs = regionArgs.take_front(mapRank);
+      mlir::Value sharedOutput = regionArgs[mapRank];
+
       for (size_t i = 0; i < ivs.size(); i++) {
         const auto &dim = beforeLastDim[i];
         mlir::Value gtid = ivs[i];
@@ -670,19 +681,20 @@ mlir::Value LowerSegScan(SegScan pSegScan, Ctx &ctx) {
         }
         local.subexps.insert(dim.id, gtid);
       }
-      mlir::Value outerOutput = outerIterArgs[0];
+      // get the row
+      mlir::Value initialRow = mlir::tensor::EmptyOp::create(builder,forallLoc,rowTy,rowDynamicSizes);
 
       auto scanLoop = mlir::scf::ForOp::create(
         builder,
-        loc,
+        forallLoc,
         zero,
         scanUpperBound,
         one,
-        mlir::ValueRange{neutral, outerOutput},
+        mlir::ValueRange{neutral, initialRow},
 
         [&](mlir::OpBuilder &bodyBuilder,
             mlir::Location bodyLoc,
-            mlir::Value inductionVar,
+            mlir::Value scanIndex,
             mlir::ValueRange iterArgs) {
           mlir::OpBuilder::InsertionGuard guard(builder);
           builder.setInsertionPoint(
@@ -690,19 +702,19 @@ mlir::Value LowerSegScan(SegScan pSegScan, Ctx &ctx) {
               bodyBuilder.getInsertionPoint());
 
           mlir::Value accumulator = iterArgs[0];
-          mlir::Value outputTensor = iterArgs[1];
-          if (!dynamicSizes.empty()) {
-            outputTensor =
+          mlir::Value outputRow = iterArgs[1];
+          if (!rowDynamicSizes.empty()) {
+            outputRow =
                 mlir::iree_compiler::IREE::Flow::TensorTieShapeOp::create(
                     builder,
                     bodyLoc,
-                    outputTensor,
-                    dynamicSizes);
+                    outputRow,
+                    rowDynamicSizes);
           }
 
-          mlir::Value gtid = inductionVar;
+          mlir::Value gtid = scanIndex;
           if (gtid.getType() != scanDim.value.getType()) {
-            gtid = mlir::arith::IndexCastOp::create(builder,bodyLoc,scanDim.value.getType(),inductionVar);
+            gtid = mlir::arith::IndexCastOp::create(builder,bodyLoc,scanDim.value.getType(),scanIndex);
           }
           local.subexps.insert(scanDim.id, gtid);
 
@@ -723,26 +735,59 @@ mlir::Value LowerSegScan(SegScan pSegScan, Ctx &ctx) {
           Ctx postCtx = local;
           postCtx.subexps.insert(pSegScan.post_op.lambda.params[0].name,nextAccumulator);
           mlir::Value outputElement = LowerBody(pSegScan.post_op.lambda.body, postCtx);
-          
-          mlir::SmallVector<mlir::Value> outputIndices(ivs.begin(), ivs.end());
-          outputIndices.push_back(inductionVar);
-          
-          mlir::Value nextOutput =
+                    
+          mlir::Value nextRow =
               mlir::tensor::InsertOp::create(
                   builder,
                   bodyLoc,
                   outputElement,
-                  outputTensor,
-                  outputIndices);
+                  outputRow,
+                  mlir::ValueRange{scanIndex});
 
-          auto carry = mlir::ValueRange{nextAccumulator,nextOutput};
+          auto carry = mlir::ValueRange{nextAccumulator,nextRow};
           mlir::scf::YieldOp::create(builder,bodyLoc,carry);
         });
-      return {scanLoop.getResult(1)};    
+      
+        mlir::Value completedRow = scanLoop.getResult(1);
+        mlir::SmallVector<mlir::OpFoldResult> offsets;
+        mlir::SmallVector<mlir::OpFoldResult> sizes;
+        mlir::SmallVector<mlir::OpFoldResult> strides;
+        for (mlir::Value mapIndex : ivs) {
+          offsets.push_back(mapIndex);
+          sizes.push_back(builder.getIndexAttr(1));
+          strides.push_back(builder.getIndexAttr(1));
+        }
+
+      offsets.push_back(builder.getIndexAttr(0));
+
+      if (rowTy.isDynamicDim(0)) {
+        sizes.push_back(scanUpperBound);
+      } else {
+        sizes.push_back(
+            builder.getIndexAttr(rowTy.getDimSize(0)));
+      }
+      strides.push_back(builder.getIndexAttr(1));
+
+      auto inParallel =
+          mlir::scf::InParallelOp::create(
+              builder,
+              forallLoc);
+
+      builder.setInsertionPointToStart(
+          inParallel.getBody());
+
+      mlir::tensor::ParallelInsertSliceOp::create(
+          builder,
+          forallLoc,
+          completedRow,
+          sharedOutput,
+          offsets,
+          sizes,
+          strides);
+
     });
 
-  // result 0 is the accumulator. result 1 is the output tensor.
-  mlir::Value result = outerLoopNest.results[0];
+  mlir::Value result = forallOp.getResult(0);
   if (!dynamicSizes.empty()) {
     result =
         mlir::iree_compiler::IREE::Flow::TensorTieShapeOp::create(
