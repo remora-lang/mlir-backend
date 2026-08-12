@@ -114,6 +114,22 @@ struct FutharkCompiler {
     if (functions.find(fun) != functions.end())
       return functions[fun];
 
+    llvm::errs() << "FUN " << fun.name << "\n";
+    for (auto attr : fun.attrs.attrs) {
+      match(
+          attr.v,
+          [&](const AtomAttr &attr) { PrintValue(attr.name); },
+          [&](const CompAttr &attr) {
+            PrintValue(attr.name);
+            match(
+                attr.args[0].v,
+                [&](const AtomAttr &attr) { PrintValue(attr.name); },
+                [](const auto &) {});
+          },
+          [](const auto &) { llvm::errs() << "other\n"; });
+    }
+    llvm::errs() << "\n";
+
     auto lastPos = builder.saveInsertionPoint();
     builder.setInsertionPointToEnd(module.getBody());
 
