@@ -104,8 +104,15 @@
 
     runIree = pkgs.writeShellScriptBin "run-iree" ''
       set -euo pipefail
+
+      vulkan=0
+      if [ "''${1:-}" = "--vulkan" ]; then
+        vulkan=1
+        shift
+      fi
+
       if [ "$#" -lt 1 ]; then
-        echo "usage: run-iree FILE.fut|FILE.fut_gpu [iree-run-module arguments...]" >&2
+        echo "usage: run-iree [--vulkan] FILE.fut|FILE.fut_gpu [iree-run-module arguments...]" >&2
         exit 2
       fi
 
@@ -120,14 +127,22 @@
       vmfb_file="out/$name.vmfb"
       ${compile}/bin/compile "$file" > "$mlir_file"
 
-      ./build/iree/tools/iree-compile "$mlir_file" \
-        --iree-hal-target-device=local \
-        --iree-hal-local-target-device-backends=llvm-cpu \
-        -o "$vmfb_file"
+      if [ "$vulkan" = 1 ]; then
+        ./build/iree/tools/iree-compile "$mlir_file" \
+          --iree-hal-target-device=vulkan \
+          -o "$vmfb_file"
+        device=vulkan
+      else
+        ./build/iree/tools/iree-compile "$mlir_file" \
+          --iree-hal-target-device=local \
+          --iree-hal-local-target-device-backends=llvm-cpu \
+          -o "$vmfb_file"
+        device=local-task
+      fi
 
       exec ./build/iree/tools/iree-run-module \
         --module="$vmfb_file" \
-        --device=local-task \
+        --device="$device" \
         --function=entry_main \
         "$@"
     '';
@@ -173,7 +188,7 @@
     in {
       package = mlir-backend;
 
-      devShell = pkgs.mkShell {
+      devShell = pkgs.mkShell ({
         inputsFrom = [ mlir-backend ];
 
         packages = with pkgs; [
@@ -197,8 +212,12 @@
           # On Darwin the stdenv is already clang-based; a second clang here
           # is redundant and can clash with the stdenv/llvmPackages_22 clang.
           clang
+          vulkan-loader
         ];
-      };
+      } // pkgs.lib.optionalAttrs (!pkgs.stdenv.isDarwin) {
+        IREE_HAL_VULKAN_LIBVULKAN_PATH = "${pkgs.vulkan-loader}/lib";
+        VK_ICD_FILENAMES = "/run/opengl-driver/share/vulkan/icd.d/nvidia_icd.json";
+      });
     };
   in {
     packages = forAllSystems (pkgs: { default = (perSystem pkgs).package; });
