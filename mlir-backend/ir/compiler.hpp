@@ -2,6 +2,7 @@
 // Represents the state of a Futhark function
 #include "debug.hpp"
 #include "error.hpp"
+#include "iree/compiler/Dialect/Flow/IR/FlowOps.h"
 #include "match.hpp"
 #include "segop.hpp"
 #include "syntax.hpp"
@@ -11,7 +12,6 @@
 #include <mlir/Dialect/Tensor/IR/Tensor.h>
 #include <mlir/IR/AffineMap.h>
 #include <mlir/IR/BuiltinTypeInterfaces.h>
-#include "iree/compiler/Dialect/Flow/IR/FlowOps.h"
 #include <optional>
 #include <ranges>
 #include <source_location>
@@ -570,235 +570,222 @@ struct FutharkCompiler {
     return op.getResult(0);
   }
 
-// TODOs: 
-// Support multi-dim SegSpace
-// Support vector SegBinOps
-// Support multiple SegBinOps
-// Support multiple input/output for SegBinOps
-// Support size(SegBinOp) > 0
-//  Parallelise
-mlir::Value LowerSegScan(SegScan pSegScan, Ctx &ctx) {
+  // TODOs:
+  // Support multi-dim SegSpace
+  // Support vector SegBinOps
+  // Support multiple SegBinOps
+  // Support multiple input/output for SegBinOps
+  // Support size(SegBinOp) > 0
+  //  Parallelise
+  mlir::Value LowerSegScan(SegScan pSegScan, Ctx &ctx) {
 
-  if (pSegScan.ret.size() != 1)
-    Undefined();
-  if (pSegScan.ops.size() != 1)
-    Undefined();
+    if (pSegScan.ret.size() != 1)
+      Undefined();
+    if (pSegScan.ops.size() != 1)
+      Undefined();
 
-  const SegBinOp &segBinOp = pSegScan.ops[0];
+    const SegBinOp &segBinOp = pSegScan.ops[0];
 
-  if (!segBinOp.shape.dims.empty())
-    Undefined();
-  if (segBinOp.neutral.size() != 1)
-    Undefined();
-  if (segBinOp.lambda.ret.size() != 1)
-    Undefined();
+    if (!segBinOp.shape.dims.empty())
+      Undefined();
+    if (segBinOp.neutral.size() != 1)
+      Undefined();
+    if (segBinOp.lambda.ret.size() != 1)
+      Undefined();
 
-  IterationSpace iterSpace = LowerSegSpace(pSegScan.space, ctx);
-  auto rank = iterSpace.size();
-  assert(!iterSpace.empty());
-  const Dim& scanDim = iterSpace.back();
-  auto beforeLastDim = std::span{iterSpace}.first(iterSpace.size() - 1);
+    IterationSpace iterSpace = LowerSegSpace(pSegScan.space, ctx);
+    auto rank = iterSpace.size();
+    assert(!iterSpace.empty());
+    const Dim &scanDim = iterSpace.back();
+    auto beforeLastDim = std::span{iterSpace}.first(iterSpace.size() - 1);
 
+    mlir::Location loc = builder.getLoc();
 
-  mlir::Location loc = builder.getLoc();
+    auto neutral = LowerSubExp(segBinOp.neutral[0], ctx);
 
-  auto neutral = LowerSubExp(segBinOp.neutral[0], ctx);
+    // build the result tensor
+    auto elementType = LowerSegOpBaseType(pSegScan.ret[0], ctx);
+    auto shape = toShapeType(std::views::values(pSegScan.space.dims));
+    auto returnTy = mlir::RankedTensorType::get(shape, elementType);
 
-  // build the result tensor
-  auto elementType = LowerSegOpBaseType(pSegScan.ret[0], ctx);
-  auto shape = toShapeType(std::views::values(pSegScan.space.dims));
-  auto returnTy  = mlir::RankedTensorType::get(shape, elementType);
-
-  mlir::SmallVector<mlir::Value> dynamicSizes;
-  for (auto &dim : iterSpace) {
-    if (dim.isDynamic) {
-      dynamicSizes.push_back(
-          mlir::arith::IndexCastOp::create(
-              builder,
-              builder.getIndexType(),
-              dim.value));
-    }
-  }
-
-  mlir::Value initialOutput = mlir::tensor::EmptyOp::create(builder, returnTy , dynamicSizes);
-
-  auto zero = mlir::arith::ConstantIndexOp::create(builder, loc, 0);
-  auto one = mlir::arith::ConstantIndexOp::create(builder, loc, 1);
-
-  mlir::Value scanUpperBound = scanDim.value;
-  if (!scanUpperBound.getType().isIndex()) {
-    scanUpperBound = mlir::arith::IndexCastOp::create(builder, loc, builder.getIndexType(), scanUpperBound);
-  }
-  mlir::SmallVector<mlir::OpFoldResult> mapUpperBounds;
-  for (auto &dim : beforeLastDim) {
-    mlir::Value upperBound = dim.value;
-    if (!upperBound.getType().isIndex()) {
-      upperBound = mlir::arith::IndexCastOp::create(builder, loc, builder.getIndexType(), upperBound);
-    }
-    mapUpperBounds.push_back(upperBound);
-  }
-  mlir::SmallVector<mlir::Value> mapLowerBounds(beforeLastDim.size(), zero);
-  mlir::SmallVector<mlir::Value> mapSteps(beforeLastDim.size(), one);
-  
-  // Each forall iteration constructs one scan row.
-  auto rowTy = mlir::RankedTensorType::get(
-      {shape.back()}, elementType);
-
-  mlir::SmallVector<mlir::Value> rowDynamicSizes;
-  if (scanDim.isDynamic) {
-    rowDynamicSizes.push_back(scanUpperBound);
-  }
-
-
-  auto forallOp = mlir::scf::ForallOp::create(
-    builder,
-    loc,
-    mapUpperBounds,
-    mlir::ValueRange{initialOutput},
-    /*mapping=*/std::nullopt,
-    [&](mlir::OpBuilder &forallBuilder,
-        mlir::Location forallLoc,
-        mlir::ValueRange regionArgs)
-      {
-        
-        mlir::OpBuilder::InsertionGuard outerGuard(builder);
-        builder.setInsertionPoint(
-        forallBuilder.getInsertionBlock(),
-        forallBuilder.getInsertionPoint());
-        
-        Ctx local = ctx;
-        
-      size_t mapRank = mapUpperBounds.size();
-      mlir::ValueRange ivs = regionArgs.take_front(mapRank);
-      mlir::Value sharedOutput = regionArgs[mapRank];
-
-      for (size_t i = 0; i < ivs.size(); i++) {
-        const auto &dim = beforeLastDim[i];
-        mlir::Value gtid = ivs[i];
-
-        if (gtid.getType() != dim.value.getType()) {
-          gtid = mlir::arith::IndexCastOp::create(builder,loc,dim.value.getType(),gtid);
-        }
-        local.subexps.insert(dim.id, gtid);
+    mlir::SmallVector<mlir::Value> dynamicSizes;
+    for (auto &dim : iterSpace) {
+      if (dim.isDynamic) {
+        dynamicSizes.push_back(mlir::arith::IndexCastOp::create(
+            builder, builder.getIndexType(), dim.value));
       }
-      // get the row
-      mlir::Value initialRow = mlir::tensor::EmptyOp::create(builder,forallLoc,rowTy,rowDynamicSizes);
+    }
 
-      auto scanLoop = mlir::scf::ForOp::create(
+    mlir::Value initialOutput =
+        mlir::tensor::EmptyOp::create(builder, returnTy, dynamicSizes);
+
+    auto zero = mlir::arith::ConstantIndexOp::create(builder, loc, 0);
+    auto one = mlir::arith::ConstantIndexOp::create(builder, loc, 1);
+
+    mlir::Value scanUpperBound = scanDim.value;
+    if (!scanUpperBound.getType().isIndex()) {
+      scanUpperBound = mlir::arith::IndexCastOp::create(
+          builder, loc, builder.getIndexType(), scanUpperBound);
+    }
+    mlir::SmallVector<mlir::OpFoldResult> mapUpperBounds;
+    for (auto &dim : beforeLastDim) {
+      mlir::Value upperBound = dim.value;
+      if (!upperBound.getType().isIndex()) {
+        upperBound = mlir::arith::IndexCastOp::create(
+            builder, loc, builder.getIndexType(), upperBound);
+      }
+      mapUpperBounds.push_back(upperBound);
+    }
+    mlir::SmallVector<mlir::Value> mapLowerBounds(beforeLastDim.size(), zero);
+    mlir::SmallVector<mlir::Value> mapSteps(beforeLastDim.size(), one);
+
+    // Each forall iteration constructs one scan row.
+    auto rowTy = mlir::RankedTensorType::get({shape.back()}, elementType);
+
+    mlir::SmallVector<mlir::Value> rowDynamicSizes;
+    if (scanDim.isDynamic) {
+      rowDynamicSizes.push_back(scanUpperBound);
+    }
+
+    auto forallOp = mlir::scf::ForallOp::create(
         builder,
-        forallLoc,
-        zero,
-        scanUpperBound,
-        one,
-        mlir::ValueRange{neutral, initialRow},
+        loc,
+        mapUpperBounds,
+        mlir::ValueRange{initialOutput},
+        /*mapping=*/std::nullopt,
+        [&](mlir::OpBuilder &forallBuilder,
+            mlir::Location forallLoc,
+            mlir::ValueRange regionArgs) {
+          mlir::OpBuilder::InsertionGuard outerGuard(builder);
+          builder.setInsertionPoint(forallBuilder.getInsertionBlock(),
+                                    forallBuilder.getInsertionPoint());
 
-        [&](mlir::OpBuilder &bodyBuilder,
-            mlir::Location bodyLoc,
-            mlir::Value scanIndex,
-            mlir::ValueRange iterArgs) {
-          mlir::OpBuilder::InsertionGuard guard(builder);
-          builder.setInsertionPoint(
-              bodyBuilder.getInsertionBlock(),
-              bodyBuilder.getInsertionPoint());
+          Ctx local = ctx;
 
-          mlir::Value accumulator = iterArgs[0];
-          mlir::Value outputRow = iterArgs[1];
-          if (!rowDynamicSizes.empty()) {
-            outputRow =
-                mlir::iree_compiler::IREE::Flow::TensorTieShapeOp::create(
-                    builder,
-                    bodyLoc,
-                    outputRow,
-                    rowDynamicSizes);
+          size_t mapRank = mapUpperBounds.size();
+          mlir::ValueRange ivs = regionArgs.take_front(mapRank);
+          mlir::Value sharedOutput = regionArgs[mapRank];
+
+          for (size_t i = 0; i < ivs.size(); i++) {
+            const auto &dim = beforeLastDim[i];
+            mlir::Value gtid = ivs[i];
+
+            if (gtid.getType() != dim.value.getType()) {
+              gtid = mlir::arith::IndexCastOp::create(
+                  builder, loc, dim.value.getType(), gtid);
+            }
+            local.subexps.insert(dim.id, gtid);
           }
+          // Get the row
+          mlir::Value initialRow = mlir::tensor::EmptyOp::create(
+              builder, forallLoc, rowTy, rowDynamicSizes);
 
-          mlir::Value gtid = scanIndex;
-          if (gtid.getType() != scanDim.value.getType()) {
-            gtid = mlir::arith::IndexCastOp::create(builder,bodyLoc,scanDim.value.getType(),scanIndex);
-          }
-          local.subexps.insert(scanDim.id, gtid);
-
-          // Lower the kernel body
-          for (const Stm &stm : pSegScan.body.stms)
-            LowerStm(stm, local);
-
-          assert(pSegScan.body.result.size() == 1);
-          mlir::Value kernelResult = LowerSubExp(pSegScan.body.result[0].result, local);
-
-          assert(segBinOp.lambda.params.size() == 2);
-          Ctx lambdaCtx = local;
-          lambdaCtx.subexps.insert(segBinOp.lambda.params[0].name, accumulator);
-          lambdaCtx.subexps.insert(segBinOp.lambda.params[1].name, kernelResult);
-          mlir::Value nextAccumulator = LowerBody(segBinOp.lambda.body, lambdaCtx);
-
-          assert(pSegScan.post_op.lambda.params.size() == 1);
-          Ctx postCtx = local;
-          postCtx.subexps.insert(pSegScan.post_op.lambda.params[0].name,nextAccumulator);
-          mlir::Value outputElement = LowerBody(pSegScan.post_op.lambda.body, postCtx);
-                    
-          mlir::Value nextRow =
-              mlir::tensor::InsertOp::create(
-                  builder,
-                  bodyLoc,
-                  outputElement,
-                  outputRow,
-                  mlir::ValueRange{scanIndex});
-
-          auto carry = mlir::ValueRange{nextAccumulator,nextRow};
-          mlir::scf::YieldOp::create(builder,bodyLoc,carry);
-        });
-      
-        mlir::Value completedRow = scanLoop.getResult(1);
-        mlir::SmallVector<mlir::OpFoldResult> offsets;
-        mlir::SmallVector<mlir::OpFoldResult> sizes;
-        mlir::SmallVector<mlir::OpFoldResult> strides;
-        for (mlir::Value mapIndex : ivs) {
-          offsets.push_back(mapIndex);
-          sizes.push_back(builder.getIndexAttr(1));
-          strides.push_back(builder.getIndexAttr(1));
-        }
-
-      offsets.push_back(builder.getIndexAttr(0));
-
-      if (rowTy.isDynamicDim(0)) {
-        sizes.push_back(scanUpperBound);
-      } else {
-        sizes.push_back(
-            builder.getIndexAttr(rowTy.getDimSize(0)));
-      }
-      strides.push_back(builder.getIndexAttr(1));
-
-      auto inParallel =
-          mlir::scf::InParallelOp::create(
+          auto scanLoop = mlir::scf::ForOp::create(
               builder,
-              forallLoc);
+              forallLoc,
+              zero,
+              scanUpperBound,
+              one,
+              mlir::ValueRange{neutral, initialRow},
 
-      builder.setInsertionPointToStart(
-          inParallel.getBody());
+              [&](mlir::OpBuilder &bodyBuilder,
+                  mlir::Location bodyLoc,
+                  mlir::Value scanIndex,
+                  mlir::ValueRange iterArgs) {
+                mlir::OpBuilder::InsertionGuard guard(builder);
+                builder.setInsertionPoint(bodyBuilder.getInsertionBlock(),
+                                          bodyBuilder.getInsertionPoint());
 
-      mlir::tensor::ParallelInsertSliceOp::create(
-          builder,
-          forallLoc,
-          completedRow,
-          sharedOutput,
-          offsets,
-          sizes,
-          strides);
+                mlir::Value accumulator = iterArgs[0];
+                mlir::Value outputRow = iterArgs[1];
+                if (!rowDynamicSizes.empty()) {
+                  outputRow =
+                      mlir::iree_compiler::IREE::Flow::TensorTieShapeOp::create(
+                          builder, bodyLoc, outputRow, rowDynamicSizes);
+                }
 
-    });
+                mlir::Value gtid = scanIndex;
+                if (gtid.getType() != scanDim.value.getType()) {
+                  gtid = mlir::arith::IndexCastOp::create(
+                      builder, bodyLoc, scanDim.value.getType(), scanIndex);
+                }
+                local.subexps.insert(scanDim.id, gtid);
 
-  mlir::Value result = forallOp.getResult(0);
-  if (!dynamicSizes.empty()) {
-    result =
-        mlir::iree_compiler::IREE::Flow::TensorTieShapeOp::create(
-            builder,
-            loc,
-            result,
-            dynamicSizes);
-}
+                // Lower the kernel body
+                for (const Stm &stm : pSegScan.body.stms)
+                  LowerStm(stm, local);
 
-  return result;
-}
+                assert(pSegScan.body.result.size() == 1);
+                mlir::Value kernelResult =
+                    LowerSubExp(pSegScan.body.result[0].result, local);
+
+                assert(segBinOp.lambda.params.size() == 2);
+                Ctx lambdaCtx = local;
+                lambdaCtx.subexps.insert(segBinOp.lambda.params[0].name,
+                                         accumulator);
+                lambdaCtx.subexps.insert(segBinOp.lambda.params[1].name,
+                                         kernelResult);
+                mlir::Value nextAccumulator =
+                    LowerBody(segBinOp.lambda.body, lambdaCtx);
+
+                assert(pSegScan.post_op.lambda.params.size() == 1);
+                Ctx postCtx = local;
+                postCtx.subexps.insert(pSegScan.post_op.lambda.params[0].name,
+                                       nextAccumulator);
+                mlir::Value outputElement =
+                    LowerBody(pSegScan.post_op.lambda.body, postCtx);
+
+                mlir::Value nextRow =
+                    mlir::tensor::InsertOp::create(builder,
+                                                   bodyLoc,
+                                                   outputElement,
+                                                   outputRow,
+                                                   mlir::ValueRange{scanIndex});
+
+                auto carry = mlir::ValueRange{nextAccumulator, nextRow};
+                mlir::scf::YieldOp::create(builder, bodyLoc, carry);
+              });
+
+          mlir::Value completedRow = scanLoop.getResult(1);
+          mlir::SmallVector<mlir::OpFoldResult> offsets;
+          mlir::SmallVector<mlir::OpFoldResult> sizes;
+          mlir::SmallVector<mlir::OpFoldResult> strides;
+          for (mlir::Value mapIndex : ivs) {
+            offsets.push_back(mapIndex);
+            sizes.push_back(builder.getIndexAttr(1));
+            strides.push_back(builder.getIndexAttr(1));
+          }
+
+          offsets.push_back(builder.getIndexAttr(0));
+
+          if (rowTy.isDynamicDim(0)) {
+            sizes.push_back(scanUpperBound);
+          } else {
+            sizes.push_back(builder.getIndexAttr(rowTy.getDimSize(0)));
+          }
+          strides.push_back(builder.getIndexAttr(1));
+
+          auto inParallel = mlir::scf::InParallelOp::create(builder, forallLoc);
+
+          builder.setInsertionPointToStart(inParallel.getBody());
+
+          mlir::tensor::ParallelInsertSliceOp::create(builder,
+                                                      forallLoc,
+                                                      completedRow,
+                                                      sharedOutput,
+                                                      offsets,
+                                                      sizes,
+                                                      strides);
+        });
+
+    mlir::Value result = forallOp.getResult(0);
+    if (!dynamicSizes.empty()) {
+      result = mlir::iree_compiler::IREE::Flow::TensorTieShapeOp::create(
+          builder, loc, result, dynamicSizes);
+    }
+
+    return result;
+  }
   // Find SegOp iteration space.
   IterationSpace LowerSegSpace(const SegSpace &space, Ctx &ctx) {
     IterationSpace iterSpace;
