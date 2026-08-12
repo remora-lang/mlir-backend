@@ -71,7 +71,7 @@
           -DMOCHA_IREE_SOURCE_DIR=${iree}
       fi
       cmake --build build ''${jobs:+-j "$jobs"} \
-        --target mlir-backend iree-compile iree-run-module
+        --target mlir-backend iree-compile iree-run-module iree-benchmark-module
       ln -sfn build/compile_commands.json compile_commands.json
     '';
 
@@ -128,8 +128,10 @@
       ${compile}/bin/compile "$file" > "$mlir_file"
 
       if [ "$vulkan" = 1 ]; then
+        # sm_89 = Ada Lovelace (RTX 40xx)
         ./build/iree/tools/iree-compile "$mlir_file" \
           --iree-hal-target-device=vulkan \
+          --iree-vulkan-target=sm_89 \
           -o "$vmfb_file"
         device=vulkan
       else
@@ -141,6 +143,53 @@
       fi
 
       exec ./build/iree/tools/iree-run-module \
+        --module="$vmfb_file" \
+        --device="$device" \
+        --function=entry_main \
+        "$@"
+    '';
+
+    iree-benchmark = pkgs.writeShellScriptBin "iree-benchmark" ''
+      set -euo pipefail
+
+      vulkan=0
+      if [ "''${1:-}" = "--vulkan" ]; then
+        vulkan=1
+        shift
+      fi
+
+      if [ "$#" -lt 1 ]; then
+        echo "usage: iree-benchmark [--vulkan] FILE.fut|FILE.fut_gpu [iree-benchmark-module arguments...]" >&2
+        exit 2
+      fi
+
+      file="$1"
+      shift
+      name=$(basename "$file")
+      name=''${name%.fut_gpu}
+      name=''${name%.fut}
+      mkdir -p out
+
+      mlir_file="out/$name.mlir"
+      vmfb_file="out/$name.vmfb"
+      ${compile}/bin/compile "$file" > "$mlir_file"
+
+      if [ "$vulkan" = 1 ]; then
+        # sm_89 = Ada Lovelace (RTX 40xx)
+        ./build/iree/tools/iree-compile "$mlir_file" \
+          --iree-hal-target-device=vulkan \
+          --iree-vulkan-target=sm_89 \
+          -o "$vmfb_file"
+        device=vulkan
+      else
+        ./build/iree/tools/iree-compile "$mlir_file" \
+          --iree-hal-target-device=local \
+          --iree-hal-local-target-device-backends=llvm-cpu \
+          -o "$vmfb_file"
+        device=local-task
+      fi
+
+      exec ./build/iree/tools/iree-benchmark-module \
         --module="$vmfb_file" \
         --device="$device" \
         --function=entry_main \
@@ -205,6 +254,7 @@
           ireeRunModule
           runIree
           run-tests
+          iree-benchmark
           futhark-test
           llvmPackages_22.lldb
         ] ++ pkgs.lib.optionals (!pkgs.stdenv.isDarwin) [
