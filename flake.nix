@@ -132,6 +132,7 @@
         ./build/iree/tools/iree-compile "$mlir_file" \
           --iree-hal-target-device=vulkan \
           --iree-vulkan-target=sm_89 \
+          --iree-dispatch-creation-enable-split-reduction \
           -o "$vmfb_file"
         device=vulkan
       else
@@ -179,6 +180,7 @@
         ./build/iree/tools/iree-compile "$mlir_file" \
           --iree-hal-target-device=vulkan \
           --iree-vulkan-target=sm_89 \
+          --iree-dispatch-creation-enable-split-reduction \
           -o "$vmfb_file"
         device=vulkan
       else
