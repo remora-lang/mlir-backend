@@ -167,37 +167,23 @@ struct FutharkCompiler {
   }
 
   Values LowerExp(const Exp &exp, Ctx &ctx) {
-    if (auto *val = std::get_if<ExpBasicOp>(&exp.v)) {
-      return {LowerBasicOp(val->op, ctx)};
-    }
+    return match(
+        exp.v,
+        [&](const ExpBasicOp &e) { return Values{LowerBasicOp(e.op, ctx)}; },
+        [&](const ExpSubExp &e) { return Values{LowerSubExp(e.subExp, ctx)}; },
+        [&](const ExpHostOp &e) { return LowerHostOp(e.op, ctx); },
+        [&](const ExpApply &e) -> Values {
+          auto func = GetFunction(prog, e.fname);
+          auto llvmFunc = LowerFunction(func);
 
-    if (auto *val = std::get_if<ExpSubExp>(&exp.v)) {
-      return {LowerSubExp(val->subExp, ctx)};
-    }
+          Values args;
+          for (int64_t i = 0; i < std::ssize(func.params); i++) {
+            args.push_back(LowerSubExp(e.args[i].first, ctx));
+          }
 
-    if (auto *val = std::get_if<ExpHostOp>(&exp.v)) {
-      return {LowerHostOp(val->op, ctx)};
-    }
-
-    if (auto *val = std::get_if<ExpApply>(&exp.v)) {
-      auto func = GetFunction(prog, val->fname);
-      auto llvmFunc = LowerFunction(func);
-
-      std::vector<mlir::Value> args;
-      for (int64_t i = 0; i < std::ssize(func.params); i++) {
-        auto [subExp, diet] = val->args[i];
-        args.push_back(LowerSubExp(subExp, ctx));
-      }
-
-      auto call = mlir::func::CallOp::create(builder, llvmFunc, args);
-      return call->getResults();
-    }
-
-    if (auto *val = std::get_if<ExpBasicOp>(&exp.v)) {
-      return {LowerBasicOp(val->op, ctx)};
-    }
-
-    Unreachable();
+          auto call = mlir::func::CallOp::create(builder, llvmFunc, args);
+          return call->getResults();
+        });
   }
 
   mlir::Value LowerBasicOp(const BasicOp &basicOp, Ctx &ctx) {
