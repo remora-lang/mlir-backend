@@ -193,6 +193,20 @@ struct Attrs {
   std::vector<Attr> attrs;
 };
 
+// Returns the first "blackbox" attribute.
+inline std::optional<AtomAttr> GetBlackBoxAttr(const Attrs &attrs) {
+  for (const auto &attr : attrs.attrs) {
+    if (auto *a = std::get_if<CompAttr>(&attr.v)) {
+      if (a->name == "blackbox" && a->args.size() == 1) {
+        if (auto *v = std::get_if<AtomAttr>(&a->args[0].v)) {
+          return *v;
+        }
+      }
+    }
+  }
+  return std::nullopt;
+}
+
 template <typename Dec> struct Param {
   Attrs attrs;
   std::string name;

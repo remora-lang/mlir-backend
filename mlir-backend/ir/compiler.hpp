@@ -128,22 +128,6 @@ struct FutharkCompiler {
     if (functions.find(fun) != functions.end())
       return functions[fun];
 
-    llvm::errs() << "FUN " << fun.name << "\n";
-    for (auto attr : fun.attrs.attrs) {
-      match(
-          attr.v,
-          [&](const AtomAttr &attr) { PrintValue(attr.name); },
-          [&](const CompAttr &attr) {
-            PrintValue(attr.name);
-            match(
-                attr.args[0].v,
-                [&](const AtomAttr &attr) { PrintValue(attr.name); },
-                [](const auto &) {});
-          },
-          [](const auto &) { llvm::errs() << "other\n"; });
-    }
-    llvm::errs() << "\n";
-
     mlir::OpBuilder::InsertionGuard guard(builder);
     builder.setInsertionPointToEnd(module.getBody());
 
@@ -178,8 +162,16 @@ struct FutharkCompiler {
       ctx.subexps.insert(param.name, arg);
     }
 
-    auto retValue = LowerBody(fun.body, ctx);
-    mlir::func::ReturnOp::create(builder, builder.getUnknownLoc(), retValue);
+    Values ret;
+    if (auto blackbox = GetBlackBoxAttr(fun.attrs)) {
+      llvm::errs() << "FUN " << blackbox->name << "\n";
+      ret = LowerBody(fun.body, ctx);
+      Undefined();
+    } else {
+      ret = LowerBody(fun.body, ctx);
+    }
+
+    mlir::func::ReturnOp::create(builder, builder.getUnknownLoc(), ret);
     return func;
   }
 

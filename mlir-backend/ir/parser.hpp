@@ -33,13 +33,7 @@ struct FutharkTranslationVisitor {
     for (auto *attr : ctx->pAttr())
       fun.attrs.attrs.push_back(VisitAttr(attr));
 
-    // Forn now, a blackbox's body is a `???` hole, so skip it.
-    bool blackbox = false;
-    for (const auto &a : fun.attrs.attrs)
-      if (auto *c = std::get_if<CompAttr>(&a.v))
-        blackbox |= c->name == "blackbox";
-    if (!blackbox)
-      fun.body = VisitBody(ctx->pBody());
+    fun.body = VisitBody(ctx->pBody());
     return fun;
   }
 
