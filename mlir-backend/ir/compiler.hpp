@@ -394,6 +394,21 @@ struct FutharkCompiler {
       return *broadcasted.getResult().begin();
     }
 
+    if (auto *val = std::get_if<BasicOpScratch>(&basicOp.v)) {
+      auto baseTy = LowerPrimType(val->type);
+      auto shapeTy = toShapeType(val->dims);
+      Values dynamicSizes;
+      for (auto [d, t] : llvm::zip_equal(val->dims, shapeTy)) {
+        if (mlir::ShapedType::isDynamic(t)) {
+          auto v = LowerSubExp(d, ctx);
+          dynamicSizes.push_back(mlir::arith::IndexCastOp::create(
+              builder, builder.getIndexType(), v));
+        }
+      }
+      return mlir::tensor::EmptyOp::create(
+          builder, mlir::RankedTensorType::get(shapeTy, baseTy), dynamicSizes);
+    }
+
     Undefined();
   }
 

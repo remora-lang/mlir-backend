@@ -372,6 +372,15 @@ struct FutharkTranslationVisitor {
     return {iota};
   }
 
+  BasicOpScratch
+  VisitBasicOpScratch(FutharkParser::BasicOpScratchContext *ctx) {
+    BasicOpScratch scratch;
+    scratch.type = VisitPrimType(ctx->pPrimType());
+    for (auto subExp : ctx->pSubExp())
+      scratch.dims.push_back(VisitSubExp(subExp));
+    return scratch;
+  }
+
   BasicOpConvOp VisitBasicOpConvOp(FutharkParser::BasicOpConvContext *ctx) {
     ConvOp op;
     op.v = ConvOpSExt{
