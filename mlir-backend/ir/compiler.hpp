@@ -167,6 +167,13 @@ struct FutharkCompiler {
     auto entry = func.addEntryBlock();
     builder.setInsertionPointToStart(entry);
 
+    // Replicate all top-level constants in the function's block.
+    // Eventually we might want global-scope constants, but for cheap constants
+    // this should be fine.
+    for (auto &stm : prog.consts) {
+      LowerStm(stm, ctx);
+    }
+
     for (auto [param, arg] : llvm::zip_equal(fun.params, func.getArguments())) {
       ctx.subexps.insert(param.name, arg);
     }

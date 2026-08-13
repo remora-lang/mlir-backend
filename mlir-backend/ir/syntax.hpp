@@ -287,6 +287,9 @@ struct FunDefHasher {
 
 struct Prog {
   Rep rep;
+  // Top-level constants that are in scope for all functions.
   std::vector<Stm> consts;
+  // Top-level functions. Unlike in the Futhark compiler these are not in scope
+  // in the definitions of the constants.
   std::vector<FunDef> funs;
 };

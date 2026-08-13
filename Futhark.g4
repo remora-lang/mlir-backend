@@ -1,6 +1,6 @@
 grammar Futhark;
 
-root: header? pFunDef+ EOF;
+root: header? pStm* pFunDef+ EOF;
 
 header: 'name_source' '{' NUMBER '}' 'types' '{' pTypeBind* '}';
 

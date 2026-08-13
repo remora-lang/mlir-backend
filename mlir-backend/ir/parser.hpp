@@ -10,6 +10,8 @@ using namespace antlr4;
 struct FutharkTranslationVisitor {
   Prog VisitProg(FutharkParser::RootContext *ctx) {
     Prog prog;
+    for (auto stm : ctx->pStm())
+      prog.consts.push_back(VisitStm(stm));
     for (auto f : ctx->pFunDef()) {
       prog.funs.push_back(VisitFunDef(f));
     }
