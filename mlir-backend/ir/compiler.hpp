@@ -19,7 +19,9 @@
 #include <variant>
 
 template <typename K, typename V> class Env {
-  std::unordered_map<K, V> env;
+  using env_t = std::unordered_map<K, V>;
+
+  env_t env;
 
 public:
   void insert(const K &name, V v) { env.insert_or_assign(name, v); }
@@ -35,7 +37,19 @@ public:
                       name));
     return v->second;
   }
+
+  env_t::const_iterator begin() const { return env.cbegin(); }
+
+  env_t::const_iterator end() const { return env.cend(); }
 };
+
+inline void PrintValue(const Env<std::string, mlir::Value> &env) {
+  llvm::errs() << "Env {\n";
+  for (const auto &[k, v] : env) {
+    llvm::errs() << "  " << k << " : " << v << "\n";
+  }
+  llvm::errs() << "}\n";
+}
 
 struct Ctx {
   Env<std::string, mlir::Value> subexps;
