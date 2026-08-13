@@ -183,7 +183,7 @@
     '';
 
     gpu-ir = pkgs.writeShellScriptBin "gpu-ir" ''
-      futhark dev --remove-black-box-bodies --gpu --strip-provenance --no-grid --simplify "$1"
+      futhark dev --gpu --strip-provenance --no-grid --simplify "$1"
     '';
 
     run-tests = pkgs.writeShellScriptBin "run-tests" ''
