@@ -394,7 +394,7 @@ struct FutharkCompiler {
       return *broadcasted.getResult().begin();
     }
 
-    Unreachable();
+    Undefined();
   }
 
   mlir::Value LowerSubExp(SubExp subExp, Ctx &ctx) {
@@ -406,7 +406,7 @@ struct FutharkCompiler {
       return LowerPrimValue(val->v, ctx);
     }
 
-    Unreachable();
+    Undefined();
   }
 
   mlir::Value LowerSubExp(std::string vname, Ctx &ctx) {
@@ -745,7 +745,7 @@ struct FutharkCompiler {
           builder, builder.getFloatAttr(t, GetValue(*val)));
     }
 
-    Unreachable();
+    Undefined();
   }
 
   mlir::Value LowerBinOp(BinOp binOp, mlir::Value op0, mlir::Value op1,
@@ -797,7 +797,7 @@ struct FutharkCompiler {
       return mlir::arith::MulFOp::create(builder, {op0, op1}).getResult();
     }
 
-    Unreachable();
+    Undefined();
   }
 
   mlir::Value LowerArrayLit(BasicOpArrayLit arrayLit, Ctx &ctx) {
@@ -838,7 +838,7 @@ struct FutharkCompiler {
       return LowerTypeArray(*val);
     }
 
-    Unreachable();
+    Undefined();
   }
 
   mlir::Type LowerPrimType(PrimType t) {
@@ -854,7 +854,7 @@ struct FutharkCompiler {
       return LowerPrimTypeBool(*val);
     }
 
-    Unreachable();
+    Undefined();
   }
 
   mlir::Type LowerPrimTypeInt(PrimTypeInt primTypeInt) {
@@ -886,7 +886,7 @@ struct FutharkCompiler {
       return builder.getF32Type();
     if (width == 64)
       return builder.getF64Type();
-    Unreachable();
+    Undefined();
   }
 
   static FunDef GetFunction(Prog &prog, std::string fname) {
@@ -895,6 +895,6 @@ struct FutharkCompiler {
         return f;
     }
 
-    Unreachable();
+    Undefined();
   }
 };

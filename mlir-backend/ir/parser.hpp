@@ -94,7 +94,7 @@ struct FutharkTranslationVisitor {
       return PrimType::Float32();
     if (name == "f64")
       return PrimType::Float64();
-    Unreachable();
+    Undefined();
   }
 
   ShapeBase<SubExp> VisitExtShape(FutharkParser::PExtShapeContext *ctx) {
@@ -118,7 +118,7 @@ struct FutharkTranslationVisitor {
     if (auto *pEmptyBody = dynamic_cast<FutharkParser::EmptyBodyContext *>(ctx))
       return {VisitEmptyBody(pEmptyBody)};
 
-    Unreachable();
+    Undefined();
   }
 
   Body VisitNormalBody(FutharkParser::BodyContext *ctx) {
@@ -171,7 +171,7 @@ struct FutharkTranslationVisitor {
       return {VisitSizeOp(pSizeOp->pSizeOp())};
     if (auto *pSubExp = dynamic_cast<FutharkParser::ExpSubExpContext *>(ctx))
       return {VisitExpSubExp(pSubExp)};
-    Unreachable();
+    Undefined();
   }
 
   Exp VisitSizeOp(FutharkParser::PSizeOpContext *ctx) {
@@ -226,8 +226,11 @@ struct FutharkTranslationVisitor {
     if (auto *pFlatIndex =
             dynamic_cast<FutharkParser::BasicOpRearrangeContext *>(ctx))
       return {VisitBasicOpRearrange(pFlatIndex)};
+    if (auto *pScratch =
+            dynamic_cast<FutharkParser::BasicOpScratchContext *>(ctx))
+      return {VisitBasicOpScratch(pScratch)};
 
-    Unreachable();
+    Undefined();
   }
 
   BasicOpArrayLit
@@ -291,7 +294,7 @@ struct FutharkTranslationVisitor {
     if (name == "mul_nw")
       return {BinOpMul{intTy}};
 
-    Unreachable();
+    Undefined();
   }
 
   BasicOpConcat VisitBasicOpConcat(FutharkParser::BasicOpConcatContext *ctx) {
@@ -365,7 +368,7 @@ struct FutharkTranslationVisitor {
     else if (text == "iota64")
       iota.t = IntType::Int64;
     else
-      Unreachable();
+      Undefined();
     return {iota};
   }
 
@@ -407,7 +410,7 @@ struct FutharkTranslationVisitor {
       return {ExpHostOp{HostOp{std::make_shared<SegOp>(VisitSegRed(pSegRed))}}};
     if (auto *pSegScan = dynamic_cast<FutharkParser::SegScanContext *>(segop))
       return {ExpHostOp{HostOp{std::make_shared<SegOp>(VisitSegScan(pSegScan))}}};
-    Unreachable();
+    Undefined();
   }
 
   SegOp VisitSegMap(FutharkParser::SegMapContext *ctx) {
@@ -473,7 +476,7 @@ struct FutharkTranslationVisitor {
             dynamic_cast<FutharkParser::EmptyKernelBodyContext *>(ctx))
       return {VisitEmptyKernelBody(pEmptyKernelBody)};
 
-    Unreachable();
+    Undefined();
   }
 
   KernelBody VisitNormalKernelBody(FutharkParser::KernelBodyContext *ctx) {
@@ -511,7 +514,7 @@ struct FutharkTranslationVisitor {
     if (auto *pVar = dynamic_cast<FutharkParser::VarSubExpContext *>(ctx))
       return {VarSubExp{VisitId(pVar->ID())}};
 
-    Unreachable();
+    Undefined();
   }
 
   PrimValue VisitPrimValue(FutharkParser::PPrimValueContext *ctx) {
@@ -522,7 +525,7 @@ struct FutharkTranslationVisitor {
             dynamic_cast<FutharkParser::PrimValueFloatContext *>(ctx))
       return {VisitPrimValueFloat(pFloat)};
 
-    Unreachable();
+    Undefined();
   }
 
   IntValue VisitPrimValueInteger(FutharkParser::PrimValueIntegerContext *ctx) {
@@ -537,7 +540,7 @@ struct FutharkTranslationVisitor {
     if (w == "i64")
       return IntValue{Int64Value{(int64_t)v}};
 
-    Unreachable();
+    Undefined();
   }
 
   FloatValue VisitPrimValueFloat(FutharkParser::PrimValueFloatContext *ctx) {
@@ -550,7 +553,7 @@ struct FutharkTranslationVisitor {
     if (w == "f64")
       return FloatValue{Float64Value{(double)v}};
 
-    Unreachable();
+    Undefined();
   }
 
   std::string VisitId(antlr4::tree::TerminalNode *ctx) {
