@@ -1,5 +1,6 @@
 #pragma once
 // Represents the state of a Futhark function
+#include "blackbox.hpp"
 #include "core.hpp"
 #include "debug.hpp"
 #include "error.hpp"
@@ -162,18 +163,22 @@ struct FutharkCompiler {
       ctx.subexps.insert(param.name, arg);
     }
 
-    Values ret;
-    if (auto blackbox = GetBlackBoxAttr(fun.attrs)) {
-      llvm::errs() << "FUN " << blackbox->name << "\n";
-      ret = LowerBody(fun.body, ctx);
-      Undefined();
-    } else {
-      ret = LowerBody(fun.body, ctx);
-    }
+    auto blackbox = MaybeBlackBox(fun.attrs);
+    Values ret = blackbox ? LowerBlackBox(blackbox.value(), fun, ctx)
+                          : LowerBody(fun.body, ctx);
 
     mlir::func::ReturnOp::create(builder, builder.getUnknownLoc(), ret);
     return func;
   }
+
+  Values LowerBlackBox(BlackBox box, const FunDef &fun, Ctx &ctx) {
+    switch (box) {
+    case BlackBox::MatMul:
+      return LowerMatMul(fun, ctx);
+    }
+  }
+
+  Values LowerMatMul(const FunDef &fun, Ctx &ctx) { Undefined(); }
 
   Values LowerBody(Body body, Ctx &ctx) {
     for (auto &stm : body.stms) {
