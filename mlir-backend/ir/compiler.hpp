@@ -144,7 +144,7 @@ struct FutharkCompiler {
     }
     llvm::errs() << "\n";
 
-    auto lastPos = builder.saveInsertionPoint();
+    mlir::OpBuilder::InsertionGuard guard(builder);
     builder.setInsertionPointToEnd(module.getBody());
 
     std::vector<mlir::Type> retTypes;
@@ -180,7 +180,6 @@ struct FutharkCompiler {
 
     auto retValue = LowerBody(fun.body, ctx);
     mlir::func::ReturnOp::create(builder, builder.getUnknownLoc(), retValue);
-    builder.restoreInsertionPoint(lastPos);
     return func;
   }
 
