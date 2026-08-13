@@ -102,7 +102,11 @@
       exec ./build/iree/tools/iree-run-module "$@"
     '';
 
-    runIree = pkgs.writeShellScriptBin "run-iree" ''
+    # Shared body for run-iree/iree-benchmark: parse an optional backend flag,
+    # compile FILE.fut -> out/$name.vmfb for that backend, and set $vmfb_file
+    # and $device for the caller's final exec. Expects $prog (program name, for
+    # usage) and $tool (downstream iree tool name, for usage) to be set first.
+    ireeSetup = ''
       set -euo pipefail
 
       target=local
@@ -112,7 +116,7 @@
       esac
 
       if [ "$#" -lt 1 ]; then
-        echo "usage: run-iree [--vulkan|--metal] FILE.fut|FILE.fut_gpu [iree-run-module arguments...]" >&2
+        echo "usage: $prog [--vulkan|--metal] FILE.fut|FILE.fut_gpu [$tool arguments...]" >&2
         exit 2
       fi
 
@@ -127,32 +131,40 @@
       vmfb_file="out/$name.vmfb"
       ${compile}/bin/compile "$file" > "$mlir_file"
 
-      if [ "$target" = vulkan ]; then
-        # sm_89 = Ada Lovelace (RTX 40xx)
-        ./build/iree/tools/iree-compile "$mlir_file" \
-          --iree-hal-target-device=vulkan \
-          --iree-vulkan-target=sm_89 \
-          --iree-dispatch-creation-enable-split-reduction \
-          -o "$vmfb_file"
-        device=vulkan
-      elif [ "$target" = metal ]; then
-        # Embed MSL source instead of a .metallib so we don't need Xcode's
-        # `metal`/`metallib` tools (absent from the nix apple-sdk xcrun); the
-        # Metal runtime compiles the source once at module load.
-        ./build/iree/tools/iree-compile "$mlir_file" \
-          --iree-hal-target-device=metal \
-          --iree-metal-compile-to-metallib=false \
-          --iree-dispatch-creation-enable-split-reduction \
-          -o "$vmfb_file"
-        device=metal
-      else
-        ./build/iree/tools/iree-compile "$mlir_file" \
-          --iree-hal-target-device=local \
-          --iree-hal-local-target-device-backends=llvm-cpu \
-          -o "$vmfb_file"
-        device=local-task
-      fi
+      case "$target" in
+        vulkan)
+          # sm_89 = Ada Lovelace (RTX 40xx)
+          ./build/iree/tools/iree-compile "$mlir_file" \
+            --iree-hal-target-device=vulkan \
+            --iree-vulkan-target=sm_89 \
+            --iree-dispatch-creation-enable-split-reduction \
+            -o "$vmfb_file"
+          device=vulkan
+          ;;
+        metal)
+          # Embed MSL source instead of a .metallib so we don't need Xcode's
+          # `metal`/`metallib` tools (absent from the nix apple-sdk xcrun); the
+          # Metal runtime compiles the source once at module load.
+          ./build/iree/tools/iree-compile "$mlir_file" \
+            --iree-hal-target-device=metal \
+            --iree-metal-compile-to-metallib=false \
+            --iree-dispatch-creation-enable-split-reduction \
+            -o "$vmfb_file"
+          device=metal
+          ;;
+        *)
+          ./build/iree/tools/iree-compile "$mlir_file" \
+            --iree-hal-target-device=local \
+            --iree-hal-local-target-device-backends=llvm-cpu \
+            -o "$vmfb_file"
+          device=local-task
+          ;;
+      esac
+    '';
 
+    runIree = pkgs.writeShellScriptBin "run-iree" ''
+      prog=run-iree tool=iree-run-module
+      ${ireeSetup}
       exec ./build/iree/tools/iree-run-module \
         --module="$vmfb_file" \
         --device="$device" \
@@ -161,56 +173,8 @@
     '';
 
     iree-benchmark = pkgs.writeShellScriptBin "iree-benchmark" ''
-      set -euo pipefail
-
-      target=local
-      case "''${1:-}" in
-        --vulkan) target=vulkan; shift ;;
-        --metal) target=metal; shift ;;
-      esac
-
-      if [ "$#" -lt 1 ]; then
-        echo "usage: iree-benchmark [--vulkan|--metal] FILE.fut|FILE.fut_gpu [iree-benchmark-module arguments...]" >&2
-        exit 2
-      fi
-
-      file="$1"
-      shift
-      name=$(basename "$file")
-      name=''${name%.fut_gpu}
-      name=''${name%.fut}
-      mkdir -p out
-
-      mlir_file="out/$name.mlir"
-      vmfb_file="out/$name.vmfb"
-      ${compile}/bin/compile "$file" > "$mlir_file"
-
-      if [ "$target" = vulkan ]; then
-        # sm_89 = Ada Lovelace (RTX 40xx)
-        ./build/iree/tools/iree-compile "$mlir_file" \
-          --iree-hal-target-device=vulkan \
-          --iree-vulkan-target=sm_89 \
-          --iree-dispatch-creation-enable-split-reduction \
-          -o "$vmfb_file"
-        device=vulkan
-      elif [ "$target" = metal ]; then
-        # Embed MSL source instead of a .metallib so we don't need Xcode's
-        # `metal`/`metallib` tools (absent from the nix apple-sdk xcrun); the
-        # Metal runtime compiles the source once at module load.
-        ./build/iree/tools/iree-compile "$mlir_file" \
-          --iree-hal-target-device=metal \
-          --iree-metal-compile-to-metallib=false \
-          --iree-dispatch-creation-enable-split-reduction \
-          -o "$vmfb_file"
-        device=metal
-      else
-        ./build/iree/tools/iree-compile "$mlir_file" \
-          --iree-hal-target-device=local \
-          --iree-hal-local-target-device-backends=llvm-cpu \
-          -o "$vmfb_file"
-        device=local-task
-      fi
-
+      prog=iree-benchmark tool=iree-benchmark-module
+      ${ireeSetup}
       exec ./build/iree/tools/iree-benchmark-module \
         --module="$vmfb_file" \
         --device="$device" \
