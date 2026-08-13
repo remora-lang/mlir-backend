@@ -630,7 +630,7 @@ struct FutharkCompiler {
     for (const auto &[id, dim] : space.dims) {
       auto d = LowerSubExp(dim, ctx);
       iterSpace.push_back(
-          Dim{id, d, toShapeType(dim) == mlir::ShapedType::kDynamic, i});
+          Dim{id, d, mlir::ShapedType::isDynamic(toShapeType(dim)), i});
       ++i;
     }
     return iterSpace;
