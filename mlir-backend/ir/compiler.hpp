@@ -406,7 +406,7 @@ struct FutharkCompiler {
     return match(
         pSegOp->v,
         [&](const SegMap &v) { return LowerSegMap(v, ctx); },
-        [&](const SegRed &v) { return Values{LowerSegRed(v, ctx)}; },
+        [&](const SegRed &v) { return LowerSegRed(v, ctx); },
         [&](const SegScan &v) { return Values{LowerSegScan(v, ctx)}; });
   }
 
