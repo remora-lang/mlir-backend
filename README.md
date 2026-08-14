@@ -2,7 +2,7 @@
 
 `mlir-backend` is an MLIR based backend for the Remora programming language.
 
-# Building
+# Building and testing
 
 ## With nix
 
@@ -14,6 +14,19 @@ build
 The shell also includes scripts to compile programs (`run`) and clean up the build (`clean`).
 
 Pins latest release of LLVM 22 that's available in nixpkgs-unstable.
+
+Test cases are Futhark `-- input`/`-- output` blocks in `mlir-backend/tests/`.
+Run them (via the IREE pipeline) from the repo root:
+
+```
+run-tests              # all annotated tests
+run-tests FILE.fut     # one file
+```
+
+Verify test specifications using Futhark's C backend:
+```
+futhark-test
+```
 
 ## Without nix
 
