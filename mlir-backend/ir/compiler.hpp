@@ -7,8 +7,10 @@
 #include "iree/compiler/Dialect/Flow/IR/FlowOps.h"
 #include "match.hpp"
 #include "mlir/IR/BuiltinTypes.h"
+#include "mlir/IR/Matchers.h"
 #include "segop.hpp"
 #include "syntax.hpp"
+#include "llvm/Support/ErrorHandling.h"
 #include <format>
 #include <iterator>
 #include <mlir/Dialect/Arith/IR/Arith.h>
@@ -85,6 +87,8 @@ template <typename T, typename F> auto map(const std::vector<T> &xs, F f) {
   return out;
 }
 
+using LLVMShapeTypeRef = llvm::ArrayRef<int64_t>;
+
 inline int64_t toShapeType(SubExp dim) {
   return match(
       dim.v,
@@ -136,11 +140,11 @@ struct FutharkCompiler {
     builder.setInsertionPointToEnd(module.getBody());
 
     std::vector<mlir::Type> retTypes;
-    std::vector<mlir::Type> inputTypes;
     for (auto t : fun.retType) {
       retTypes.push_back(LowerTy(t.first.v));
     }
 
+    std::vector<mlir::Type> inputTypes;
     for (auto t : fun.params) {
       inputTypes.push_back(LowerTy(t.dec.v));
     }
@@ -150,6 +154,10 @@ struct FutharkCompiler {
         mlir::func::FuncOp::create(builder.getUnknownLoc(), fun.name, fType);
     builder.insert(func);
     functions[fun] = func;
+
+    if (!fun.entry) {
+      func.setPrivate();
+    }
 
     Ctx ctx;
     auto entry = func.addEntryBlock();
@@ -167,21 +175,61 @@ struct FutharkCompiler {
     }
 
     auto blackbox = MaybeBlackBox(fun.attrs);
-    Values ret = blackbox ? LowerBlackBox(blackbox.value(), fun, ctx)
+    Values ret = blackbox ? LowerBlackBox(blackbox.value(), func, ctx)
                           : LowerBody(fun.body, ctx);
 
     mlir::func::ReturnOp::create(builder, builder.getUnknownLoc(), ret);
     return func;
   }
 
-  Values LowerBlackBox(BlackBox box, const FunDef &fun, Ctx &ctx) {
+  Values LowerBlackBox(BlackBox box, mlir::func::FuncOp &f, Ctx &ctx) {
     switch (box) {
     case BlackBox::MatMul:
-      return LowerMatMul(fun, ctx);
+      return LowerMatMul(f, ctx);
     }
+    llvm_unreachable("LowerBlackBox");
   }
 
-  Values LowerMatMul(const FunDef &fun, Ctx &ctx) { Undefined(); }
+  Values LowerMatMul(mlir::func::FuncOp &f, Ctx &ctx) {
+    // Signature is (d0, d1, d3, A : [d4][d5]t, B : [d5][d6]t) -> [d4][d6]t
+    // Where d0 d1 d3 are equal to d4 d5 d6 somehow, depending on the order
+    // specified by the user in the Futhark source/IR. So we disregard the size
+    // parameters entirely and grab them from the matrix arguments A and B.
+    assert(f.getArguments().size() == 5);
+    assert(f.getResultTypes().size() == 1);
+    auto args = f.getArguments();
+    auto x = args[3];
+    auto y = args[4];
+    auto m = mlir::tensor::DimOp::create(builder, x, 0).getResult();
+    auto n = mlir::tensor::DimOp::create(builder, y, 1).getResult();
+
+    // Create the output matrix.
+    auto z_type =
+        llvm::TypeSwitch<mlir::Type, mlir::RankedTensorType>(
+            f.getResultTypes()[0])
+            .Case<mlir::RankedTensorType>([](auto t) { return t; })
+            .Default([](auto) -> mlir::RankedTensorType { Undefined(); });
+    Values dynamicSizes;
+    for (auto [d, t] :
+         llvm::zip_equal(std::vector<mlir::Value>{m, n}, z_type.getShape())) {
+      if (mlir::ShapedType::isDynamic(t))
+        dynamicSizes.push_back(d);
+    }
+    auto zero = mlir::arith::ConstantOp::create(
+        builder, builder.getZeroAttr(z_type.getElementType()));
+    auto z = mlir::linalg::FillOp::create(
+                 builder,
+                 mlir::ValueRange{zero},
+                 mlir::ValueRange{mlir::tensor::EmptyOp::create(
+                     builder, z_type, dynamicSizes)})
+                 .result();
+
+    return mlir::linalg::MatmulOp::create(builder,
+                                          builder.getLoc(),
+                                          mlir::ValueRange{x, y},
+                                          mlir::ValueRange{z})
+        .getResults();
+  }
 
   Values LowerBody(Body body, Ctx &ctx) {
     for (auto &stm : body.stms) {
