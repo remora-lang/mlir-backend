@@ -16,10 +16,16 @@
   let
     systems = [ "x86_64-linux" "aarch64-darwin" ];
     forAllSystems = f: nixpkgs.lib.genAttrs systems (system:
-      f (import nixpkgs { inherit system; }));
+      f (import nixpkgs {
+        inherit system;
+        config.allowUnfree = true;
+      }));
 
     perSystem = pkgs:
     let
+      cudatoolkit = pkgs.cudaPackages_12.cudatoolkit;
+      cudaDepsDir = if pkgs.stdenv.isDarwin then "" else "${cudatoolkit}";
+
       mlir-backend = pkgs.stdenv.mkDerivation {
       pname = "futhark-mlir-backend";
       version = "dev";
@@ -38,7 +44,11 @@
 
       buildInputs = with pkgs; [
         antlr4.runtime.cpp
+      ] ++ pkgs.lib.optionals (!pkgs.stdenv.isDarwin) [
+        cudatoolkit
       ];
+
+      IREE_CUDA_DEPS_DIR = cudaDepsDir;
 
       cmakeFlags = [
         "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON"
@@ -59,6 +69,7 @@
     build = pkgs.writeShellScriptBin "build" ''
       set -euo pipefail
       jobs=''${1:-}
+      ${nixpkgs.lib.optionalString (cudaDepsDir != "") ''export IREE_CUDA_DEPS_DIR=${cudaDepsDir}''}
       export CCACHE_BASEDIR="$PWD"
       export CCACHE_NOHASHDIR=1
       export CCACHE_SLOPPINESS=include_file_mtime,include_file_ctime,time_macros,pch_defines
@@ -113,10 +124,11 @@
       case "''${1:-}" in
         --vulkan) target=vulkan; shift ;;
         --metal) target=metal; shift ;;
+        --cuda) target=cuda; shift ;;
       esac
 
       if [ "$#" -lt 1 ]; then
-        echo "usage: $prog [--vulkan|--metal] FILE.fut|FILE.fut_gpu [$tool arguments...]" >&2
+        echo "usage: $prog [--vulkan|--metal|--cuda] FILE.fut|FILE.fut_gpu [$tool arguments...]" >&2
         exit 2
       fi
 
@@ -151,6 +163,13 @@
             --iree-dispatch-creation-enable-split-reduction \
             -o "$vmfb_file"
           device=metal
+          ;;
+        cuda)
+          ./build/iree/tools/iree-compile "$mlir_file" \
+            --iree-hal-target-device=cuda \
+            --iree-cuda-target=sm_89 \
+            -o "$vmfb_file"
+          device=cuda
           ;;
         *)
           ./build/iree/tools/iree-compile "$mlir_file" \
@@ -253,6 +272,8 @@
       } // pkgs.lib.optionalAttrs (!pkgs.stdenv.isDarwin) {
         IREE_HAL_VULKAN_LIBVULKAN_PATH = "${pkgs.vulkan-loader}/lib";
         VK_ICD_FILENAMES = "/run/opengl-driver/share/vulkan/icd.d/nvidia_icd.json";
+        LD_LIBRARY_PATH = "/run/opengl-driver/lib";
+        IREE_CUDA_DEPS_DIR = cudaDepsDir;
       });
     };
   in {

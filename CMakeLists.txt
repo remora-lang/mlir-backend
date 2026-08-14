@@ -6,6 +6,9 @@ project(mocha LANGUAGES CXX C)
 set(IREE_BUILD_COMPILER ON)
 set(IREE_BUILD_BUNDLED_LLVM ON)
 
+set(IREE_TARGET_BACKEND_CUDA ON)
+set(IREE_HAL_DRIVER_CUDA ON)
+
 # Disable components not needed by this backend.
 set(IREE_BUILD_TESTS OFF)
 set(IREE_BUILD_SAMPLES OFF)
