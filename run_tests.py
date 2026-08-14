@@ -109,16 +109,29 @@ def _shape(value):
 
 
 def _marshal(value):
-    """One Futhark value -> list of iree-run-module `--input` argument strings."""
+    """One Futhark value -> (leading i64 size args, payload arg string)."""
     if not isinstance(value, list):
-        return [_strip_suffix(value)]
+        return [], _strip_suffix(value)
     dims = _shape(value)
     leaves = list(_leaves(value))
     etype = _elem_type(leaves[0])
     flat = " ".join(_strip_suffix(t) for t in leaves)
     tensor = "x".join(str(d) for d in dims) + f"x{etype}=" + flat
-    # Dynamic dimensions are passed as explicit leading i64 args, then the array.
-    return [str(d) for d in dims] + [tensor]
+    return [str(d) for d in dims], tensor
+
+
+def _dedup_sizes(sizes):
+    """Drop a size equal to its predecessor: shared dims (e.g. matmul's k) pass once.
+
+    Wrongly merges two distinct size params that are adjacent and equal at
+    runtime (e.g. a `[k][k]` array).
+    """
+    out = []
+    for d in sizes:
+        if out and out[-1] == d:
+            continue
+        out.append(d)
+    return out
 
 
 # --- IREE output parsing -----------------------------------------------------
@@ -167,9 +180,12 @@ def _read_cases(path):
 
 def _run_case(path, input_str, output_str):
     values = _parse_values(_tokenize(input_str))
-    flags = []
+    sizes, payloads = [], []
     for v in values:
-        flags += [f"--input={a}" for a in _marshal(v)]
+        ds, payload = _marshal(v)
+        sizes += ds
+        payloads.append(payload)
+    flags = [f"--input={a}" for a in _dedup_sizes(sizes) + payloads]
     proc = subprocess.run(
         ["run-iree", path, *flags],
         capture_output=True, text=True,
