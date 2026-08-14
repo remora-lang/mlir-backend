@@ -53,6 +53,7 @@
       cmakeFlags = [
         "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON"
         "-DMOCHA_IREE_SOURCE_DIR=${iree}"
+        "-DIREE_ENABLE_LIBBACKTRACE=OFF"
       ];
 
       # Optional if your executable is somewhere unusual.
