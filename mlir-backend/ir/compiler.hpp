@@ -620,8 +620,8 @@ struct FutharkCompiler {
     if (!segBinOp.shape.dims.empty())
       Undefined();
 
-    const size_t scanValueCount = segBinOp.neutral.size();
-    const size_t outputCount = pSegScan.ret.size();
+    const int64_t scanValueCount = segBinOp.neutral.size();
+    const int64_t outputCount = pSegScan.ret.size();
 
     IterationSpace iterSpace = LowerSegSpace(pSegScan.space, ctx);
     assert(!iterSpace.empty());
@@ -700,11 +700,11 @@ struct FutharkCompiler {
 
           Ctx local = ctx;
 
-          size_t mapRank = mapUpperBounds.size();
+          int64_t mapRank = mapUpperBounds.size();
           mlir::ValueRange ivs = regionArgs.take_front(mapRank);
           mlir::ValueRange sharedOutputs = regionArgs.drop_front(mapRank);
 
-          for (size_t i = 0; i < ivs.size(); i++) {
+          for (int64_t i = 0; i < std::ssize(ivs); i++) {
             const auto &dim = beforeLastDim[i];
             mlir::Value gtid = ivs[i];
 
@@ -772,7 +772,7 @@ struct FutharkCompiler {
                 }
 
                 Ctx lambdaCtx = local;
-                for (size_t i = 0; i < scanValueCount; ++i) {
+                for (int64_t i = 0; i < scanValueCount; ++i) {
                   lambdaCtx.subexps.insert(segBinOp.lambda.params[i].name,
                                            accumulators[i]);
                   lambdaCtx.subexps.insert(
@@ -783,7 +783,7 @@ struct FutharkCompiler {
                     LowerBody(segBinOp.lambda.body, lambdaCtx);
 
                 Ctx postCtx = local;
-                for (size_t i = 0; i < scanValueCount; ++i) {
+                for (int64_t i = 0; i < scanValueCount; ++i) {
                   postCtx.subexps.insert(pSegScan.post_op.lambda.params[i].name,
                                          nextAccumulators[i]);
                 }
@@ -792,7 +792,7 @@ struct FutharkCompiler {
 
                 Values nextRows;
                 nextRows.reserve(outputCount);
-                for (size_t i = 0; i < outputCount; ++i) {
+                for (int64_t i = 0; i < outputCount; ++i) {
                   nextRows.push_back(mlir::tensor::InsertOp::create(
                       builder,
                       bodyLoc,
@@ -828,7 +828,7 @@ struct FutharkCompiler {
           builder.setInsertionPointToStart(inParallel.getBody());
 
           auto completedRows = scanLoop.getResults().drop_front(scanValueCount);
-          for (size_t i = 0; i < outputCount; i++) {
+          for (int64_t i = 0; i < outputCount; i++) {
             mlir::tensor::ParallelInsertSliceOp::create(builder,
                                                         forallLoc,
                                                         completedRows[i],
