@@ -54,6 +54,8 @@
         "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON"
         "-DMOCHA_IREE_SOURCE_DIR=${iree}"
         "-DIREE_ENABLE_LIBBACKTRACE=OFF"
+      ] ++ pkgs.lib.optionals pkgs.stdenv.isLinux [
+        "-DMOCHA_ENABLE_CUDA=ON"
       ];
 
       # Optional if your executable is somewhere unusual.
@@ -74,12 +76,15 @@
       export CCACHE_BASEDIR="$PWD"
       export CCACHE_NOHASHDIR=1
       export CCACHE_SLOPPINESS=include_file_mtime,include_file_ctime,time_macros,pch_defines
+      cuda_flag="-DMOCHA_ENABLE_CUDA=OFF"
+      if [ -n "''${CUDA:-}" ]; then cuda_flag="-DMOCHA_ENABLE_CUDA=ON"; fi
       if [ ! -f build/build.ninja ]; then
         cmake -S . -B build -G Ninja \
           -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
           -DCMAKE_BUILD_TYPE=Release \
           -DCMAKE_C_COMPILER_LAUNCHER=ccache \
           -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+          $cuda_flag \
           -DMOCHA_IREE_SOURCE_DIR=${iree}
       fi
       cmake --build build ''${jobs:+-j "$jobs"} \

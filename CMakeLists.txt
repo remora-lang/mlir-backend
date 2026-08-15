@@ -6,8 +6,9 @@ project(mocha LANGUAGES CXX C)
 set(IREE_BUILD_COMPILER ON)
 set(IREE_BUILD_BUNDLED_LLVM ON)
 
-set(IREE_TARGET_BACKEND_CUDA ON)
-set(IREE_HAL_DRIVER_CUDA ON)
+option(MOCHA_ENABLE_CUDA "Build the IREE CUDA target backend and HAL driver" OFF)
+set(IREE_TARGET_BACKEND_CUDA ${MOCHA_ENABLE_CUDA})
+set(IREE_HAL_DRIVER_CUDA ${MOCHA_ENABLE_CUDA})
 
 # Disable components not needed by this backend.
 set(IREE_BUILD_TESTS OFF)
