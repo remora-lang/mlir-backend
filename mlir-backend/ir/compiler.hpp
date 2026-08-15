@@ -624,7 +624,8 @@ struct FutharkCompiler {
     const int64_t outputCount = pSegScan.ret.size();
 
     IterationSpace iterSpace = LowerSegSpace(pSegScan.space, ctx);
-    assert(!iterSpace.empty());
+    if (iterSpace.size() == 0)
+      Undefined();
     const Dim &scanDim = iterSpace.back();
     auto beforeLastDim = std::span{iterSpace}.first(iterSpace.size() - 1);
 
@@ -656,13 +657,13 @@ struct FutharkCompiler {
       initialOutputs.push_back(
           mlir::tensor::EmptyOp::create(builder, returnType, dynamicSizes));
 
-    auto zero = mlir::arith::ConstantIndexOp::create(builder, loc, 0);
-    auto one = mlir::arith::ConstantIndexOp::create(builder, loc, 1);
+    auto zero = mlir::arith::ConstantIndexOp::create(builder, 0);
+    auto one = mlir::arith::ConstantIndexOp::create(builder, 1);
 
     mlir::Value scanUpperBound = scanDim.value;
     if (!scanUpperBound.getType().isIndex()) {
       scanUpperBound = mlir::arith::IndexCastOp::create(
-          builder, loc, builder.getIndexType(), scanUpperBound);
+          builder, builder.getIndexType(), scanUpperBound);
     }
     mlir::SmallVector<mlir::OpFoldResult> mapUpperBounds;
     for (auto &dim : beforeLastDim) {
@@ -771,13 +772,18 @@ struct FutharkCompiler {
                   kernelResults.push_back(LowerSubExp(result.result, local));
                 }
 
+                assert(segBinOp.lambda.params.size() ==
+                       accumulators.size() + kernelResults.size());
                 Ctx lambdaCtx = local;
-                for (int64_t i = 0; i < scanValueCount; ++i) {
-                  lambdaCtx.subexps.insert(segBinOp.lambda.params[i].name,
-                                           accumulators[i]);
-                  lambdaCtx.subexps.insert(
-                      segBinOp.lambda.params[scanValueCount + i].name,
-                      kernelResults[i]);
+                for (auto [param, acc] :
+                     llvm::zip(segBinOp.lambda.params, accumulators)) {
+                  lambdaCtx.subexps.insert(param.name, acc);
+                }
+                for (auto [param, ret] :
+                     llvm::zip_equal(llvm::drop_begin(segBinOp.lambda.params,
+                                                      accumulators.size()),
+                                     kernelResults)) {
+                  lambdaCtx.subexps.insert(param.name, ret);
                 }
                 Values nextAccumulators =
                     LowerBody(segBinOp.lambda.body, lambdaCtx);
