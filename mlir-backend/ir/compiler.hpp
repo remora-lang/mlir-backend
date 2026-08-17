@@ -309,31 +309,44 @@ struct FutharkCompiler {
     }
 
     if (auto *val = std::get_if<BasicOpIota>(&basicOp.v)) {
-      return match(
-          val->n.v,
-          [&](const ConstantSubExp &c) {
-            auto n = c.GetIntValue();
-            int64_t s = val->s.GetIntValue();
-            auto iota = Iota(n, val->x.GetIntValue(), s);
+      mlir::Value n = mlir::arith::IndexCastOp::create(
+          builder, builder.getIndexType(), LowerSubExp(val->n, ctx));
+      mlir::Value x = LowerSubExp(val->x, ctx);
+      mlir::Value s = LowerSubExp(val->s, ctx);
 
-            // Get an array type for the iota
-            auto primType = PrimTypeInt{val->t};
-            Shape shape{};
-            shape.dims.push_back(val->n);
-            auto arrTy = Type::CreateArr(PrimType{primType}, shape);
+      auto elementTy = LowerTy(Type::CreatePrim(PrimType::Int(val->t)));
+      auto dimTy = toShapeType(val->n);
+      auto returnTy = mlir::RankedTensorType::get({dimTy}, elementTy);
 
-            BasicOpArrayLit arrLit{};
-            arrLit.t = arrTy;
+      auto output = mlir::tensor::EmptyOp::create(
+          builder,
+          returnTy,
+          mlir::ShapedType::isDynamic(dimTy) ? mlir::ValueRange{n}
+                                             : mlir::ValueRange{});
+      auto op = mlir::linalg::GenericOp::create(
+          builder,
+          {returnTy},
+          {},
+          {output},
+          {mlir::AffineMap::getMultiDimIdentityMap(1, &context)},
+          {mlir::utils::IteratorType::parallel},
+          [&](mlir::OpBuilder &b, mlir::Location loc, mlir::ValueRange args) {
+            mlir::OpBuilder::InsertionGuard guard(builder);
+            builder.setInsertionPointToEnd(b.getInsertionBlock());
 
-            for (int64_t v : iota) {
-              ConstantSubExp exp = {
-                  PrimValue::CreateInt(v, (uint64_t)primType.t)};
-              arrLit.values.push_back({exp});
-            }
+            auto i = mlir::arith::IndexCastOp::create(
+                builder,
+                loc,
+                elementTy,
+                mlir::linalg::IndexOp::create(builder, loc, 0));
 
-            return LowerArrayLit(arrLit, ctx);
-          },
-          [](const auto &) -> mlir::Value { Undefined(); });
+            auto offset = mlir::arith::MulIOp::create(builder, loc, i, s);
+            auto result = mlir::arith::AddIOp::create(builder, loc, x, offset);
+
+            mlir::linalg::YieldOp::create(builder, loc, {result});
+          });
+
+      return op.getResult(0);
     }
 
     if (auto *val = std::get_if<BasicOpConcat>(&basicOp.v)) {
