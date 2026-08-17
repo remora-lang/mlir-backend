@@ -6,6 +6,7 @@
 #include "error.hpp"
 #include "iree/compiler/Dialect/Flow/IR/FlowOps.h"
 #include "match.hpp"
+#include "mlir/IR/BuiltinTypes.h"
 #include "segop.hpp"
 #include "syntax.hpp"
 #include <format>
@@ -208,17 +209,38 @@ struct FutharkCompiler {
         [&](const ExpSubExp &e) { return Values{LowerSubExp(e.subExp, ctx)}; },
         [&](const ExpHostOp &e) { return LowerHostOp(e.op, ctx); },
         [&](const ExpApply &e) -> Values {
-          auto func = GetFunction(prog, e.fname);
-          auto llvmFunc = LowerFunction(func);
+          auto func = LowerFunction(GetFunction(prog, e.fname));
 
+          // Calling a function that takes a dynamically shaped tensor with a
+          // statically shaped one is a type error.
+          std::vector<mlir::Type> argTypes = func.getArgumentTypes();
           Values args;
-          for (int64_t i = 0; i < std::ssize(func.params); i++) {
-            args.push_back(LowerSubExp(e.args[i].first, ctx));
+          for (auto [arg, ty] :
+               llvm::zip_equal(std::views::elements<0>(e.args), argTypes)) {
+            args.push_back(castToType(LowerSubExp(arg, ctx), ty));
           }
 
-          auto call = mlir::func::CallOp::create(builder, llvmFunc, args);
-          return call->getResults();
+          auto call = mlir::func::CallOp::create(builder, func, args);
+
+          Values results;
+          for (auto [v, ty] : llvm::zip_equal(
+                   call->getResults(), std::views::elements<0>(e.retTypes))) {
+            results.push_back(castToType(v, LowerTy(ty.v)));
+          }
+          return results;
         });
+  }
+
+  // Casts the type of `value` to `type` if they are compatible
+  // (e.g., a tensor's static dimension is cast to a dynamic one).
+  mlir::Value castToType(mlir::Value value, mlir::Type type) {
+    if (value.getType() == type) {
+      return value;
+    }
+    if (mlir::tensor::CastOp::areCastCompatible(value.getType(), type)) {
+      return mlir::tensor::CastOp::create(builder, type, value);
+    }
+    Undefined();
   }
 
   mlir::Value LowerBasicOp(const BasicOp &basicOp, Ctx &ctx) {
