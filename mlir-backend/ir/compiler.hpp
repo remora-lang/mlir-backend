@@ -7,8 +7,8 @@
 #include "iree/compiler/Dialect/Flow/IR/FlowOps.h"
 #include "match.hpp"
 #include "mlir/IR/BuiltinTypes.h"
-#include "mlir/IR/Matchers.h"
 #include "segop.hpp"
+#include "stablehlo/dialect/StablehloOps.h"
 #include "syntax.hpp"
 #include "llvm/Support/ErrorHandling.h"
 #include <format>
@@ -128,6 +128,7 @@ struct FutharkCompiler {
     context.getOrLoadDialect<mlir::index::IndexDialect>();
     context.getOrLoadDialect<mlir::BuiltinDialect>();
     context.getOrLoadDialect<mlir::func::FuncDialect>();
+    context.getOrLoadDialect<mlir::stablehlo::StablehloDialect>();
     module = mlir::ModuleOp::create(builder.getUnknownLoc());
     builder.setInsertionPointToStart(module.getBody());
   }

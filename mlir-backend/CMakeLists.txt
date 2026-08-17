@@ -23,6 +23,8 @@ set(LIBS
   MLIRSupport
   MLIRTensorDialect
 
+  StablehloOps
+
   iree::compiler::Dialect::LinalgExt::IR
   iree::compiler::Dialect::Flow::IR
 )
