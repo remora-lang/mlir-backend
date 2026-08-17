@@ -26,6 +26,7 @@ fParam: ID ':' pType;
 pRetTypes: '{' pType* (',' pType)* '}';
 pType: pExtShape pPrimType pAlias? #TypeShape
     | pPrimType pAlias? #TypePrim
+    | pExtShape 'unit' pAlias? #TypeUnitArray
     | 'unit' #TypeUnit;
 
 pAlias: '#' '(' pAliasSet (',' pAliasSet)* ')';
@@ -51,7 +52,14 @@ pExp: pApply #ExpApply
     | pBasicOp #ExpBasicOp
     | pSegOp #ExpSegOp
     | pSizeOp #ExpSizeOp
+    | 'if' pSubExp 'then' pCaseBody 'else' pCaseBody ':' pTypes #ExpIf
+    | 'gpu' ':' pTypes pCaseBody #ExpGpuBody
     | pSubExp #ExpSubExp;
+
+// A branch/kernel body delimited by braces, as printed for `if` arms and
+// `gpu` bodies: either `{ stms in {results} }` or just `{ results }`.
+pCaseBody: OPEN_BRACKET pStm* 'in' OPEN_BRACKET pSubExp (',' pSubExp)* CLOSE_BRACKET CLOSE_BRACKET #CaseBodyFull
+         | OPEN_BRACKET pSubExp (',' pSubExp)* CLOSE_BRACKET #CaseBodyResult;
 
 pSizeOp: 'get_size' '(' ID ',' ID ')';
 
@@ -91,14 +99,23 @@ pBasicOp: 'replicate' '(' pExtShape ',' pSubExp ')' #BasicOpReplicate
     | CONCAT '(' pSubExp ',' pSubExp ',' pSubExp ')' #BasicOpConcat
     | IOTA '(' pSubExp ',' pSubExp ',' pSubExp ')' #BasicOpIota
     | pBinOp #BasicOpBinary
+    | pCmpOp #BasicOpCmp
     | pConvOp #BasicOpConv
     | 'reshape' '(' pSubExp ',' '(' (NUMBER '::' NUMBER '=>' pExtShape ';') pExtShape ')' ')'  #BasicOpReshape
     | 'rearrange' '(' pSubExp ',' '(' NUMBER (',' NUMBER)* ')' ')' #BasicOpRearrange
-    | 'assert' '(' pSubExp ',' '{' STRING_LITERAL '}' ')' #BasicOpAssert
+    | 'assert' '(' pSubExp ',' '{' pErrPart (',' pErrPart)* '}' ')' #BasicOpAssert
     | 'scratch' '(' pPrimType (',' pSubExp)* ')' #BasicOpScratch
     ;
 
+// An interpolated assertion error message: literal chunks interleaved with
+// typed subexpressions, e.g. {"a[", i : i64, "]"}.
+pErrPart: STRING_LITERAL | pSubExp ':' pPrimType;
+
 pBinOp: binaryOpcode LPARAM pSubExp ',' pSubExp RPARAM;
+
+pCmpOp: cmpOpcode LPARAM pSubExp ',' pSubExp RPARAM;
+
+cmpOpcode: CMPEQ | CMPSLT | CMPSLE | CMPULT | CMPULE;
 
 binaryOpcode: ADD | ADDNW | FADD | SUB | SUBNW | FSUB | MUL | MULNW | FMUL | UDIV | UDIVUP | SDIV | SDIVUP | FDIV | FMOD | UMOD | SMOD | SQUOT | SREM | SMIN | UMIN | FMIN | SMAX | UMAX | FMAX | SHL | LSHR | ASHR | AND | OR | XOR | POW | FPOW | LOGAND | LOGOR;
 
@@ -112,7 +129,8 @@ pPrimValue: NUMBER INTEGER_TYPE #PrimValueInteger
     | ('true' | 'false') #PrimValueBool;
 
 pPrimType: INTEGER_TYPE #PrimTypeInteger
- | FLOAT_TYPE #PrimTypeFloat;
+ | FLOAT_TYPE #PrimTypeFloat
+ | 'bool' #PrimTypeBool;
 
 INTEGER_TYPE: 'i8' | 'i16' | 'i32' | 'i64';
 FLOAT_TYPE: 'f16' | 'f32' | 'f64';
@@ -159,10 +177,18 @@ FPOW: 'fpow' NUMBER;
 LOGAND: 'logand' NUMBER;
 LOGOR: 'logor' NUMBER;
 
+// Comparison operators. eq_ carries a type name (eq_i64, eq_f32, eq_bool);
+// the ordered comparisons carry a bit width.
+CMPEQ: 'eq_' [a-z] [a-z0-9]*;
+CMPSLT: 'slt' NUMBER;
+CMPSLE: 'sle' NUMBER;
+CMPULT: 'ult' NUMBER;
+CMPULE: 'ule' NUMBER;
+
 FLOAT   : (DIGIT+ '.' DIGIT+) ;
 fragment DIGIT  : [0-9];
 
-STRING_LITERAL: '"' ~'"'* '"';
+STRING_LITERAL: '"' ( '\\' . | ~["\\] )* '"';
 
 OPAQUE: '*'? 'opaque';
 

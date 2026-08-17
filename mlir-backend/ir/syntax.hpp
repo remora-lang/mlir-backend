@@ -228,8 +228,16 @@ struct ExpHostOp {
   HostOp op;
 };
 
+// NOTE: Futhark has a more general "Match".
+struct ExpIf {
+  SubExp cond;
+  std::shared_ptr<Body> then_body;
+  std::shared_ptr<Body> else_body;
+  std::vector<Type> retType;
+};
+
 struct Exp {
-  std::variant<ExpBasicOp, ExpApply, ExpHostOp, ExpSubExp> v;
+  std::variant<ExpBasicOp, ExpApply, ExpHostOp, ExpSubExp, ExpIf> v;
 };
 
 struct Stm {

@@ -276,7 +276,8 @@ struct FutharkCompiler {
             results.push_back(castToType(v, LowerTy(ty.v)));
           }
           return results;
-        });
+        },
+        [&](const ExpIf &e) -> Values { Undefined(); });
   }
 
   // Casts the type of `value` to `type` if they are compatible
@@ -478,6 +479,10 @@ struct FutharkCompiler {
           builder, mlir::RankedTensorType::get(shapeTy, baseTy), dynamicSizes);
     }
 
+    if (std::get_if<BasicOpCmpOp>(&basicOp.v)) {
+      Undefined();
+    }
+
     Undefined();
   }
 
@@ -501,7 +506,8 @@ struct FutharkCompiler {
     return match(
         op.v,
         [&](const SizeOp &v) { return Values{LowerSizeOp(v, ctx)}; },
-        [&](const std::shared_ptr<SegOp> &v) { return LowerSegOp(v, ctx); });
+        [&](const std::shared_ptr<SegOp> &v) { return LowerSegOp(v, ctx); },
+        [&](const GPUBody &) -> Values { Undefined(); });
   }
 
   mlir::Value LowerSizeOp(const SizeOp &sizeOp, Ctx &ctx) { Undefined(); }

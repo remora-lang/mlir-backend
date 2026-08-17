@@ -1,8 +1,10 @@
 #pragma once
 // src/Futhark/IR/GPU/Op.hs with rep SOAC
 #include "core.hpp"
+#include <memory>
 
 struct SegOp;
+struct Body;
 
 using Name = std::string;
 
@@ -38,7 +40,14 @@ struct SizeOp {
   std::variant<GetSize, GetSizeMax, CmpSizeLe, CalcNumBlocks> v;
 };
 
-// OtherOp (SOAC) is omitted: we assume post-unstream GPU IR, which has no SOACs.
+// A body evaluated sequentially on a single device thread.
+struct GPUBody {
+  std::vector<Type> retType;
+  std::shared_ptr<Body> body;
+};
+
+// OtherOp (SOAC) is omitted: we assume post-unstream GPU IR, which has no
+// SOACs.
 struct HostOp {
-  std::variant<std::shared_ptr<SegOp>, SizeOp> v;
+  std::variant<std::shared_ptr<SegOp>, SizeOp, GPUBody> v;
 };

@@ -58,6 +58,12 @@ struct FutharkTranslationVisitor {
       return VisitTypePrim(pPrim);
     if (auto *pShape = dynamic_cast<FutharkParser::TypeShapeContext *>(ctx))
       return VisitTypeShape(pShape);
+    if (auto *pUnitArr =
+            dynamic_cast<FutharkParser::TypeUnitArrayContext *>(ctx))
+      return Type::CreateArr(PrimType{PrimTypeUnit{}},
+                             VisitExtShape(pUnitArr->pExtShape()));
+    if (dynamic_cast<FutharkParser::TypeUnitContext *>(ctx))
+      return Type::CreatePrim(PrimType{PrimTypeUnit{}});
     Undefined();
   }
 
@@ -88,6 +94,8 @@ struct FutharkTranslationVisitor {
       return PrimType::Float32();
     if (name == "f64")
       return PrimType::Float64();
+    if (name == "bool")
+      return {PrimTypeBool{}};
     Undefined();
   }
 
@@ -163,8 +171,49 @@ struct FutharkTranslationVisitor {
       return {VisitExpBasicOp(pBasicOp)};
     if (auto *pSizeOp = dynamic_cast<FutharkParser::ExpSizeOpContext *>(ctx))
       return {VisitSizeOp(pSizeOp->pSizeOp())};
+    if (auto *pIf = dynamic_cast<FutharkParser::ExpIfContext *>(ctx))
+      return VisitExpIf(pIf);
+    if (auto *pGpu = dynamic_cast<FutharkParser::ExpGpuBodyContext *>(ctx))
+      return VisitExpGpuBody(pGpu);
     if (auto *pSubExp = dynamic_cast<FutharkParser::ExpSubExpContext *>(ctx))
       return {VisitExpSubExp(pSubExp)};
+    Undefined();
+  }
+
+  Exp VisitExpIf(FutharkParser::ExpIfContext *ctx) {
+    ExpIf e;
+    e.cond = VisitSubExp(ctx->pSubExp());
+    e.then_body =
+        std::make_shared<Body>(VisitCaseBody(ctx->pCaseBody(0)));
+    e.else_body =
+        std::make_shared<Body>(VisitCaseBody(ctx->pCaseBody(1)));
+    for (auto t : ctx->pTypes()->pType())
+      e.retType.push_back(VisitType(t));
+    return {e};
+  }
+
+  Exp VisitExpGpuBody(FutharkParser::ExpGpuBodyContext *ctx) {
+    GPUBody g;
+    for (auto t : ctx->pTypes()->pType())
+      g.retType.push_back(VisitType(t));
+    g.body = std::make_shared<Body>(VisitCaseBody(ctx->pCaseBody()));
+    return {ExpHostOp{HostOp{g}}};
+  }
+
+  Body VisitCaseBody(FutharkParser::PCaseBodyContext *ctx) {
+    Body b;
+    if (auto *full = dynamic_cast<FutharkParser::CaseBodyFullContext *>(ctx)) {
+      for (auto stm : full->pStm())
+        b.stms.push_back(VisitStm(stm));
+      for (auto se : full->pSubExp())
+        b.result.push_back(VisitSubExp(se));
+      return b;
+    }
+    if (auto *res = dynamic_cast<FutharkParser::CaseBodyResultContext *>(ctx)) {
+      for (auto se : res->pSubExp())
+        b.result.push_back(VisitSubExp(se));
+      return b;
+    }
     Undefined();
   }
 
@@ -223,6 +272,42 @@ struct FutharkTranslationVisitor {
     if (auto *pScratch =
             dynamic_cast<FutharkParser::BasicOpScratchContext *>(ctx))
       return {VisitBasicOpScratch(pScratch)};
+    if (auto *pCmp = dynamic_cast<FutharkParser::BasicOpCmpContext *>(ctx)) {
+      auto pc = pCmp->pCmpOp();
+      auto op0 = VisitSubExp(pc->pSubExp(0));
+      auto op1 = VisitSubExp(pc->pSubExp(1));
+      return {BasicOpCmpOp{VisitCmpOp(pc), op0, op1}};
+    }
+    if (dynamic_cast<FutharkParser::BasicOpAssertContext *>(ctx))
+      return {BasicOpAssert{}};
+
+    Undefined();
+  }
+
+  CmpOp VisitCmpOp(FutharkParser::PCmpOpContext *ctx) {
+    auto str = ctx->cmpOpcode()->getText();
+    auto it = std::find_if(str.begin(), str.end(), ::isdigit);
+    int width = it == str.end() ? 0 : std::stoi(str.substr(std::distance(str.begin(), it)));
+    IntType intTy = width == 8    ? IntType::Int8
+                    : width == 16 ? IntType::Int16
+                    : width == 32 ? IntType::Int32
+                                  : IntType::Int64;
+
+    if (str.rfind("eq_", 0) == 0) {
+      if (str.find("bool") != std::string::npos)
+        return {CmpOpEq{PrimType{PrimTypeBool{}}}};
+      if (str.find('f') != std::string::npos)
+        return {CmpOpEq{PrimType::Float(width)}};
+      return {CmpOpEq{PrimType::Int(width)}};
+    }
+    if (str.rfind("slt", 0) == 0)
+      return {CmpOpSlt{intTy}};
+    if (str.rfind("sle", 0) == 0)
+      return {CmpOpSle{intTy}};
+    if (str.rfind("ult", 0) == 0)
+      return {CmpOpUlt{intTy}};
+    if (str.rfind("ule", 0) == 0)
+      return {CmpOpUle{intTy}};
 
     Undefined();
   }
@@ -274,6 +359,8 @@ struct FutharkTranslationVisitor {
       return {BinOpSub{intTy}};
     if (name == "sdiv_up")
       return {BinOpSDivUp{intTy}};
+    if (name == "sdiv")
+      return {BinOpSDiv{intTy}};
     if (name == "fsub")
       return {BinOpFSub{floatTy}};
     if (name == "mul")
