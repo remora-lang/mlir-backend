@@ -5,11 +5,14 @@
 #include <optional>
 #include <string>
 
-enum class BlackBox { MatMul };
+enum class BlackBox { MatMul, DotGeneral };
 
 inline BlackBox ToBlackBox(const std::string &name) {
   if (name == "matmul") {
     return BlackBox::MatMul;
+  }
+  if (name == "dot_general") {
+    return BlackBox::DotGeneral;
   }
   Undefined();
 }
