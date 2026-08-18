@@ -134,7 +134,10 @@ struct FutharkCompiler {
     builder.setInsertionPointToStart(module.getBody());
   }
 
-  mlir::func::FuncOp LowerFunction(const FunDef &fun) {
+  std::variant<mlir::func::FuncOp, BlackBox> LowerFunction(const FunDef &fun) {
+    if (auto blackbox = MaybeBlackBox(fun.attrs))
+      return blackbox.value();
+
     if (functions.find(fun) != functions.end())
       return functions[fun];
 
@@ -176,39 +179,106 @@ struct FutharkCompiler {
       ctx.subexps.insert(param.name, arg);
     }
 
-    auto blackbox = MaybeBlackBox(fun.attrs);
-    Values ret = blackbox ? LowerBlackBox(blackbox.value(), func, ctx)
-                          : LowerBody(fun.body, ctx);
+    Values ret = LowerBody(fun.body, ctx);
 
     mlir::func::ReturnOp::create(builder, builder.getUnknownLoc(), ret);
     return func;
   }
 
-  Values LowerBlackBox(BlackBox box, mlir::func::FuncOp &f, Ctx &ctx) {
-    switch (box) {
-    case BlackBox::MatMul:
-      return LowerMatMul(f, ctx);
-    case BlackBox::DotGeneral:
-      return LowerDotGeneral(f, ctx);
+  Values LowerBody(Body body, Ctx &ctx) {
+    for (auto &stm : body.stms) {
+      LowerStm(stm, ctx);
     }
-    llvm_unreachable("LowerBlackBox");
+    Values results;
+    for (auto &res : body.result) {
+      results.push_back(LowerSubExp(res, ctx));
+    }
+    return results;
   }
 
-  Values LowerMatMul(mlir::func::FuncOp &f, Ctx &ctx) {
+  void LowerStm(const Stm &stm, Ctx &ctx) {
+    auto vs = LowerExp(stm.exp, ctx);
+    for (auto [elem, value] : llvm::zip_equal(stm.pat.elems, vs)) {
+      ctx.subexps.insert(elem.name.name, value);
+    }
+  }
+
+  Values LowerExp(const Exp &exp, Ctx &ctx) {
+    return match(
+        exp.v,
+        [&](const ExpBasicOp &e) { return Values{LowerBasicOp(e.op, ctx)}; },
+        [&](const ExpSubExp &e) { return Values{LowerSubExp(e.subExp, ctx)}; },
+        [&](const ExpHostOp &e) { return LowerHostOp(e.op, ctx); },
+        [&](const ExpApply &e) -> Values {
+          auto fun = GetFunction(prog, e.fname);
+          Values args;
+          for (auto arg : std::views::elements<0>(e.args)) {
+            args.push_back(LowerSubExp(arg, ctx));
+          }
+          mlir::SmallVector<mlir::Type> retTypes;
+          for (auto ty : std::views::elements<0>(e.retTypes)) {
+            retTypes.push_back(LowerTy(ty.v));
+          }
+          return match(
+              LowerFunction(fun),
+              [&](mlir::func::FuncOp func) {
+                // Calling a function that takes a dynamically shaped tensor
+                // with a statically shaped one is a type error.
+                for (auto [v, ty] :
+                     llvm::zip_equal(args, func.getArgumentTypes())) {
+                  args.push_back(castToType(v, ty));
+                }
+
+                auto call = mlir::func::CallOp::create(builder, func, args);
+
+                Values results;
+                for (auto [v, ty] :
+                     llvm::zip_equal(call->getResults(), retTypes)) {
+                  results.push_back(castToType(v, ty));
+                }
+                return results;
+              },
+              [&](BlackBox b) {
+                switch (b) {
+                case BlackBox::MatMul:
+                  return LowerMatMul(args, retTypes, ctx);
+                case BlackBox::DotGeneral:
+                  return LowerDotGeneral(args, retTypes, ctx);
+                }
+                llvm_unreachable("LowerBlackBox");
+              });
+        },
+        [&](const ExpIf &e) -> Values { Undefined(); });
+  }
+
+  // Casts the type of `value` to `type` if they are compatible
+  // (e.g., a tensor's static dimension is cast to a dynamic one).
+  mlir::Value castToType(mlir::Value value, mlir::Type type) {
+    if (value.getType() == type) {
+      return value;
+    }
+    if (mlir::tensor::CastOp::areCastCompatible(value.getType(), type)) {
+      return mlir::tensor::CastOp::create(builder, type, value);
+    }
+    Undefined();
+  }
+
+  // TODO move these under lower HostOp
+  Values LowerMatMul(mlir::ValueRange args, mlir::TypeRange retTypes,
+                     Ctx &ctx) {
     // Signature is (d0, d1, d3, A : [d4][d5]t, B : [d5][d6]t) -> [d4][d6]t
     // Where d0 d1 d3 are equal to d4 d5 d6 somehow, depending on the order
     // specified by the user in the Futhark source/IR. So we disregard the size
     // parameters entirely and grab them from the matrix arguments A and B.
-    assert(f.getArguments().size() == 5);
-    assert(f.getResultTypes().size() == 1);
-    auto args = f.getArguments();
+    assert(args.size() == 5);
+    assert(retTypes.size() == 1);
     auto x = args[3];
     auto y = args[4];
     auto m = mlir::tensor::DimOp::create(builder, x, 0).getResult();
     auto n = mlir::tensor::DimOp::create(builder, y, 1).getResult();
 
     // Create the output matrix.
-    auto z_type = getShapedType(f.getResultTypes()[0]);
+    auto z_type = getShapedType(retTypes[0]);
     Values dynamicSizes;
     for (auto [d, t] :
          llvm::zip_equal(std::vector<mlir::Value>{m, n}, z_type.getShape())) {
@@ -231,7 +301,8 @@ struct FutharkCompiler {
         .getResults();
   }
 
-  Values LowerDotGeneral(mlir::func::FuncOp &f, Ctx &ctx) {
+  Values LowerDotGeneral(mlir::ValueRange args, mlir::TypeRange retTypes,
+                         Ctx &ctx) {
     // StableHLO dot_general
     //
     // The following signature is without support for
@@ -272,20 +343,21 @@ struct FutharkCompiler {
     //                         + dim(rhs, rhs_result_dimensions)
     // (C13) element_type(lhs) = element_type(rhs)
 
-    assert(f.getResultTypes().size() == 1);
-    auto args = [&](int i) {
+    assert(args.size() >= 6);
+    assert(retTypes.size() == 1);
+    auto getArg = [&](int i) {
       // We don't know how many size parameters will be passed,
       // but they are always preprended, so we index from the back.
-      return f.getArguments()[f.getNumArguments() - 6 + i];
+      return args[args.size() - 6 + i];
     };
-    auto lhs = args(0);
-    auto rhs = args(1);
+    auto lhs = getArg(0);
+    auto rhs = getArg(1);
 
     // Dimension arguments are tensor literals of integer constants.
-    auto lhsBatchingDimensions = getConstantIntTensor(args(2));
-    auto rhsBatchingDimensions = getConstantIntTensor(args(3));
-    auto lhsContractingDimensions = getConstantIntTensor(args(4));
-    auto rhsContractingDimensions = getConstantIntTensor(args(5));
+    auto lhsBatchingDimensions = getConstantIntTensor(getArg(2));
+    auto rhsBatchingDimensions = getConstantIntTensor(getArg(3));
+    auto lhsContractingDimensions = getConstantIntTensor(getArg(4));
+    auto rhsContractingDimensions = getConstantIntTensor(getArg(5));
 
     // auto lhsAxes = llvm::concat<in64_t>(lhsBatchingDimensions,
     // lhsContractingDimensions);
@@ -364,69 +436,11 @@ struct FutharkCompiler {
     mlir::DenseIntElementsAttr attr;
     llvm::errs() << "getConstantIntTensor ";
     PrintValue(x);
+    auto shapeTy = getShapedType(x.getType());
+    if (shapeTy.hasStaticShape() && shapeTy.getNumElements() == 0)
+      return {};
     if (mlir::matchPattern(x, mlir::m_Constant(&attr))) {
       return llvm::to_vector(attr.getValues<int64_t>());
-    }
-    Undefined();
-  }
-
-  Values LowerBody(Body body, Ctx &ctx) {
-    for (auto &stm : body.stms) {
-      LowerStm(stm, ctx);
-    }
-    Values results;
-    for (auto &res : body.result) {
-      results.push_back(LowerSubExp(res, ctx));
-    }
-    return results;
-  }
-
-  void LowerStm(const Stm &stm, Ctx &ctx) {
-    auto vs = LowerExp(stm.exp, ctx);
-    assert(stm.pat.elems.size() == vs.size());
-    for (auto [elem, value] : llvm::zip_equal(stm.pat.elems, vs)) {
-      ctx.subexps.insert(elem.name.name, value);
-    }
-  }
-
-  Values LowerExp(const Exp &exp, Ctx &ctx) {
-    return match(
-        exp.v,
-        [&](const ExpBasicOp &e) { return Values{LowerBasicOp(e.op, ctx)}; },
-        [&](const ExpSubExp &e) { return Values{LowerSubExp(e.subExp, ctx)}; },
-        [&](const ExpHostOp &e) { return LowerHostOp(e.op, ctx); },
-        [&](const ExpApply &e) -> Values {
-          auto func = LowerFunction(GetFunction(prog, e.fname));
-
-          // Calling a function that takes a dynamically shaped tensor with a
-          // statically shaped one is a type error.
-          std::vector<mlir::Type> argTypes = func.getArgumentTypes();
-          Values args;
-          for (auto [arg, ty] :
-               llvm::zip_equal(std::views::elements<0>(e.args), argTypes)) {
-            args.push_back(castToType(LowerSubExp(arg, ctx), ty));
-          }
-
-          auto call = mlir::func::CallOp::create(builder, func, args);
-
-          Values results;
-          for (auto [v, ty] : llvm::zip_equal(
-                   call->getResults(), std::views::elements<0>(e.retTypes))) {
-            results.push_back(castToType(v, LowerTy(ty.v)));
-          }
-          return results;
-        },
-        [&](const ExpIf &e) -> Values { Undefined(); });
-  }
-
-  // Casts the type of `value` to `type` if they are compatible
-  // (e.g., a tensor's static dimension is cast to a dynamic one).
-  mlir::Value castToType(mlir::Value value, mlir::Type type) {
-    if (value.getType() == type) {
-      return value;
-    }
-    if (mlir::tensor::CastOp::areCastCompatible(value.getType(), type)) {
-      return mlir::tensor::CastOp::create(builder, type, value);
     }
     Undefined();
   }
