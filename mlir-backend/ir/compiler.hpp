@@ -1240,8 +1240,7 @@ struct FutharkCompiler {
   }
 
   mlir::Value LowerPrimValue(PrimValue value, Ctx &ctx) {
-    auto attr = getPrimValueAttr(value);
-    return mlir::arith::ConstantOp::create(builder, attr);
+    return mlir::arith::ConstantOp::create(builder, getPrimValueAttr(value));
   }
 
   mlir::TypedAttr getPrimValueAttr(PrimValue value) {
