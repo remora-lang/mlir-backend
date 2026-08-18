@@ -1226,20 +1226,23 @@ struct FutharkCompiler {
   }
 
   mlir::Value LowerPrimValue(PrimValue value, Ctx &ctx) {
-    auto v = value.v;
-    if (auto *val = std::get_if<IntValue>(&v)) {
-      auto t = builder.getIntegerType(GetWidth(*val));
-      return mlir::arith::ConstantOp::create(
-          builder, builder.getIntegerAttr(t, GetValue(*val)));
-    }
+    auto attr = getPrimValueAttr(value);
+    return mlir::arith::ConstantOp::create(builder, attr);
+  }
 
-    if (auto *val = std::get_if<FloatValue>(&v)) {
-      auto t = GetFloatType(builder, GetWidth(*val));
-      return mlir::arith::ConstantOp::create(
-          builder, builder.getFloatAttr(t, GetValue(*val)));
-    }
-
-    Undefined();
+  mlir::TypedAttr getPrimValueAttr(PrimValue value) {
+    return match(
+        value.v,
+        [&](const IntValue &val) -> mlir::TypedAttr {
+          return builder.getIntegerAttr(builder.getIntegerType(GetWidth(val)),
+                                        GetValue(val));
+        },
+        [&](const FloatValue &val) -> mlir::TypedAttr {
+          return builder.getFloatAttr(GetFloatType(builder, GetWidth(val)),
+                                      GetValue(val));
+        },
+        [&](const BoolValue &) -> mlir::TypedAttr { Undefined(); },
+        [&](const UnitValue &) -> mlir::TypedAttr { Undefined(); });
   }
 
   mlir::Value LowerBinOp(BinOp binOp, mlir::Value op0, mlir::Value op1,
@@ -1296,12 +1299,28 @@ struct FutharkCompiler {
 
   mlir::Value LowerArrayLit(BasicOpArrayLit arrayLit, Ctx &ctx) {
     auto tensorTy = LowerTy(arrayLit.t);
-    auto values = std::vector<mlir::Value>();
-    for (auto subExp : arrayLit.values)
-      values.push_back(LowerSubExp(subExp, ctx));
-    auto tensor =
-        mlir::tensor::FromElementsOp::create(builder, tensorTy, values);
-    return tensor;
+    bool allConstants = true;
+    auto attrs = mlir::SmallVector<mlir::Attribute>();
+    for (auto subExp : arrayLit.values) {
+      auto *c = std::get_if<ConstantSubExp>(&subExp.v);
+      if (!c) {
+        allConstants = false;
+        break;
+      }
+      attrs.push_back(getPrimValueAttr(c->v));
+    }
+
+    if (allConstants) {
+      return mlir::arith::ConstantOp::create(
+          builder,
+          mlir::DenseElementsAttr::get(getShapedType(tensorTy), attrs));
+    } else {
+      auto values = mlir::SmallVector<mlir::Value>();
+      for (auto subExp : arrayLit.values) {
+        values.push_back(LowerSubExp(subExp, ctx));
+      }
+      return mlir::tensor::FromElementsOp::create(builder, tensorTy, values);
+    }
   }
 
   template <typename T> static std::vector<T> Iota(int64_t n, T x, T s) {
