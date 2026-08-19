@@ -241,9 +241,9 @@ struct FutharkCompiler {
           for (auto ty : std::views::elements<0>(e.retTypes)) {
             retTypes.push_back(LowerTy(ty.v));
           }
-          return match(
+          auto returns = match(
               LowerFunction(fun),
-              [&](mlir::func::FuncOp func) {
+              [&](mlir::func::FuncOp func) -> Values {
                 // Calling a function that takes a dynamically shaped tensor
                 // with a statically shaped one is a type error.
                 Values args;
@@ -255,12 +255,7 @@ struct FutharkCompiler {
 
                 auto call = mlir::func::CallOp::create(builder, func, args);
 
-                Values results;
-                for (auto [v, ty] :
-                     llvm::zip_equal(call->getResults(), retTypes)) {
-                  results.push_back(castToType(v, ty));
-                }
-                return results;
+                return call->getResults();
               },
               [&](BlackBox b) {
                 Values args;
@@ -276,18 +271,29 @@ struct FutharkCompiler {
                 }
                 llvm_unreachable("LowerBlackBox");
               });
+
+          Values results;
+          for (auto [v, ty] : llvm::zip_equal(returns, retTypes)) {
+            results.push_back(castToType(v, ty));
+          }
+          return results;
         },
         [&](const ExpIf &e) -> Values { Undefined(); });
   }
 
   // Casts the type of `value` to `type` if they are compatible
-  // (e.g., a tensor's static dimension is cast to a dynamic one).
+  // (e.g., a tensor's static dimension is cast to a dynamic one
+  // or a 0-D tensor is cast to a scalar).
   mlir::Value castToType(mlir::Value value, mlir::Type type) {
     if (value.getType() == type) {
       return value;
     }
     if (mlir::tensor::CastOp::areCastCompatible(value.getType(), type)) {
       return mlir::tensor::CastOp::create(builder, type, value);
+    }
+    if (mlir::isa<mlir::ShapedType>(value.getType()) &&
+        getShapedType(value.getType()).getRank() == 0 && type.isIntOrFloat()) {
+      return mlir::tensor::ExtractOp::create(builder, value, {});
     }
     Undefined();
   }
@@ -463,8 +469,6 @@ struct FutharkCompiler {
 
   mlir::SmallVector<int64_t> getConstantIntTensor(const mlir::Value &x) {
     mlir::DenseIntElementsAttr attr;
-    llvm::errs() << "getConstantIntTensor ";
-    PrintValue(x);
     auto shapeTy = getShapedType(x.getType());
     if (shapeTy.hasStaticShape() && shapeTy.getNumElements() == 0)
       return {};
