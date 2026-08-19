@@ -192,7 +192,7 @@ struct BasicOp {
                BasicOpAssert, BasicOpIndex, BasicOpUpdate, BasicOpFlatIndex,
                BasicOpFlatUpdate, BasicOpConcat, BasicOpManifest, BasicOpIota,
                BasicOpReplicate, BasicOpScratch, BasicOpReshape,
-               BasicOpRearrange, BasicOpUpdate>
+               BasicOpRearrange, BasicOpUpdateAcc>
       v;
 };
 
@@ -228,6 +228,17 @@ struct ExpHostOp {
   HostOp op;
 };
 
+struct WithAccInput {
+  Shape ispace;
+  std::vector<VName> arrays;
+  std::optional<std::pair<std::shared_ptr<Lambda>, std::vector<SubExp>>> op;
+};
+
+struct ExpWithAcc {
+  std::vector<WithAccInput> inputs;
+  std::shared_ptr<Lambda> lambda;
+};
+
 // NOTE: Futhark has a more general "Match".
 struct ExpIf {
   SubExp cond;
@@ -237,7 +248,7 @@ struct ExpIf {
 };
 
 struct Exp {
-  std::variant<ExpBasicOp, ExpApply, ExpHostOp, ExpSubExp, ExpIf> v;
+  std::variant<ExpBasicOp, ExpApply, ExpHostOp, ExpSubExp, ExpIf, ExpWithAcc> v;
 };
 
 struct Stm {

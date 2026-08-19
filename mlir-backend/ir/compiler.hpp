@@ -278,7 +278,8 @@ struct FutharkCompiler {
           }
           return results;
         },
-        [&](const ExpIf &e) -> Values { Undefined(); });
+        [&](const ExpIf &e) -> Values { Undefined(); },
+        [&](const ExpWithAcc &e) -> Values { Undefined(); });
   }
 
   // Casts the type of `value` to `type` if they are compatible
@@ -297,6 +298,10 @@ struct FutharkCompiler {
     if (auto *val = std::get_if<BasicOpSubExp>(&basicOp.v)) {
       return LowerSubExp(val->subExp, ctx);
     }
+    
+    if (auto *val = std::get_if<BasicOpUpdateAcc>(&basicOp.v)) {
+      Undefined();
+     }
 
     if (auto *val = std::get_if<BasicOpBinOp>(&basicOp.v)) {
       auto op0 = LowerSubExp(val->op0, ctx);

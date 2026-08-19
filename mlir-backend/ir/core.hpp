@@ -103,7 +103,7 @@ template <typename ShapeT, typename UT> struct TypePrim {
 };
 
 template <typename ShapeT, typename UT> struct TypeAcc {
-  PrimType t;
+  VName cert;
   Shape ispace;
   std::vector<Type> ts;
   UT u;
@@ -137,6 +137,12 @@ struct Type {
   static Type CreateArr(PrimType primType, Shape shape) {
     auto arr = TypeArray<Shape, NoUniqueness>{primType, shape, NoUniqueness{}};
     auto typeBase = TypeBase<Shape, NoUniqueness>{arr};
+    return Type{typeBase};
+  }
+
+  static Type CreateAcc(VName cert, Shape ispace, std::vector<Type> ts) {
+    auto acc = TypeAcc<Shape, NoUniqueness>{cert, ispace, ts, NoUniqueness{}};
+    auto typeBase = TypeBase<Shape, NoUniqueness>{acc};
     return Type{typeBase};
   }
 };

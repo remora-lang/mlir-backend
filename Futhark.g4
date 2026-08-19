@@ -27,7 +27,8 @@ pRetTypes: '{' pType* (',' pType)* '}';
 pType: pExtShape pPrimType pAlias? #TypeShape
     | pPrimType pAlias? #TypePrim
     | pExtShape 'unit' pAlias? #TypeUnitArray
-    | 'unit' #TypeUnit;
+    | 'unit' #TypeUnit
+    | 'acc' '(' ID ',' pExtShape ',' pTypes ')' #TypeAcc;
 
 pAlias: '#' '(' pAliasSet (',' pAliasSet)* ')';
 pAliasSet: '[' (NUMBER (',' NUMBER)*)? ']';
@@ -54,6 +55,7 @@ pExp: pApply #ExpApply
     | pSizeOp #ExpSizeOp
     | 'if' pSubExp 'then' pCaseBody 'else' pCaseBody ':' pTypes #ExpIf
     | 'gpu' ':' pTypes pCaseBody #ExpGpuBody
+    | pWithAcc #ExpWithAcc
     | pSubExp #ExpSubExp;
 
 // A branch/kernel body delimited by braces, as printed for `if` arms and
@@ -62,6 +64,12 @@ pCaseBody: OPEN_BRACKET pStm* 'in' OPEN_BRACKET pSubExp (',' pSubExp)* CLOSE_BRA
          | OPEN_BRACKET pSubExp (',' pSubExp)* CLOSE_BRACKET #CaseBodyResult;
 
 pSizeOp: 'get_size' '(' ID ',' ID ')';
+
+pWithAcc: 'with_acc' '(' '{' pWithAccInput (',' pWithAccInput)* '}' ',' pLambda ')';
+
+pWithAccInput: '(' pExtShape ',' '{' ID (',' ID)* '}' (',' pWithAccOp)? ')';
+
+pWithAccOp: '(' pLambda ',' '{' (pSubExp (',' pSubExp)*)? '}' ')';
 
 // This is specialised to a certain form of seg ops.
 pSegOp : 'segmap' '(' 'thread' ';' ';' ')' pSegSpace ':' pTypes '{' pKernelBody '}' #SegMap
@@ -105,6 +113,7 @@ pBasicOp: 'replicate' '(' pExtShape ',' pSubExp ')' #BasicOpReplicate
     | 'rearrange' '(' pSubExp ',' '(' NUMBER (',' NUMBER)* ')' ')' #BasicOpRearrange
     | 'assert' '(' pSubExp ',' '{' pErrPart (',' pErrPart)* '}' ')' #BasicOpAssert
     | 'scratch' '(' pPrimType (',' pSubExp)* ')' #BasicOpScratch
+    | 'update_acc' '(' ID ',' '{' pSubExp '}' ',' '{' pSubExp '}' ')' #BasicOpUpdateAcc
     ;
 
 // An interpolated assertion error message: literal chunks interleaved with
