@@ -1,7 +1,7 @@
 #pragma once
 
-#include "core.hpp"
-#include "error.hpp"
+#include "ir/core.hpp"
+#include "utils.hpp"
 #include <optional>
 #include <string>
 

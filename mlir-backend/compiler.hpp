@@ -1,16 +1,14 @@
 #pragma once
 // Represents the state of a Futhark function
-#include "blackbox.hpp"
-#include "core.hpp"
-#include "debug.hpp"
-#include "error.hpp"
+#include "ir/core.hpp"
+#include "ir/segop.hpp"
+#include "ir/syntax.hpp"
 #include "iree/compiler/Dialect/Flow/IR/FlowOps.h"
-#include "match.hpp"
+#include "blackbox.hpp"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/Matchers.h"
-#include "segop.hpp"
 #include "stablehlo/dialect/StablehloOps.h"
-#include "syntax.hpp"
+#include "utils.hpp"
 #include "llvm/Support/ErrorHandling.h"
 #include <format>
 #include <iterator>
@@ -298,7 +296,6 @@ struct FutharkCompiler {
     Undefined();
   }
 
-  // TODO move these under lower HostOp
   Values LowerMatMul(mlir::ValueRange args, mlir::TypeRange retTypes,
                      Ctx &ctx) {
     // Signature is (d0, d1, d3, A : [d4][d5]t, B : [d5][d6]t) -> [d4][d6]t

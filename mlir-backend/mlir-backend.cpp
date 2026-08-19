@@ -12,7 +12,7 @@
 #include "ir/core.hpp"
 #include "ir/syntax.hpp"
 #include "ir/parser.hpp"
-#include "ir/compiler.hpp"
+#include "compiler.hpp"
 #include <config.h>
 
 int main(int argc, char *argv[]) {
