@@ -187,9 +187,50 @@
       esac
     '';
 
+    # run-iree [--compile-only|--run-only] [--vulkan|...] FILE [iree args...]
+    #
+    # The test runner needs entry_main's signature (written to out/$name.mlir
+    # during compilation) *before* it can build the --input flags. So the two
+    # phases are separable: --compile-only produces out/$name.{mlir,vmfb} and
+    # exits; --run-only skips compilation and runs the already-built vmfb. With
+    # neither flag it compiles and runs, as before.
     runIree = pkgs.writeShellScriptBin "run-iree" ''
       prog=run-iree tool=iree-run-module
+
+      phase=both
+      case "''${1:-}" in
+        --compile-only) phase=compile; shift ;;
+        --run-only)     phase=run;     shift ;;
+      esac
+
+      if [ "$phase" = run ]; then
+        # No compilation: reconstruct the vmfb path/device from FILE and run.
+        # The backend flag is accepted for parity with the matching
+        # --compile-only invocation; it only selects the device here.
+        device=local-task
+        case "''${1:-}" in
+          --vulkan) device=vulkan; shift ;;
+          --metal)  device=metal;  shift ;;
+          --cuda)   device=cuda;   shift ;;
+        esac
+        file="''${1:?usage: $prog --run-only FILE [args...]}"
+        shift
+        name=$(basename "$file")
+        name=''${name%.fut_gpu}
+        name=''${name%.fut}
+        exec ./build/iree/tools/iree-run-module \
+          --module="out/$name.vmfb" \
+          --device="$device" \
+          --function=entry_main \
+          "$@"
+      fi
+
       ${ireeSetup}
+
+      if [ "$phase" = compile ]; then
+        exit 0
+      fi
+
       exec ./build/iree/tools/iree-run-module \
         --module="$vmfb_file" \
         --device="$device" \
