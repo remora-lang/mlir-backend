@@ -1,15 +1,18 @@
 #pragma once
 
-#include "core.hpp"
-#include "error.hpp"
+#include "ir/core.hpp"
+#include "utils.hpp"
 #include <optional>
 #include <string>
 
-enum class BlackBox { MatMul };
+enum class BlackBox { MatMul, DotGeneral };
 
 inline BlackBox ToBlackBox(const std::string &name) {
   if (name == "matmul") {
     return BlackBox::MatMul;
+  }
+  if (name == "dot_general") {
+    return BlackBox::DotGeneral;
   }
   Undefined();
 }
@@ -26,4 +29,12 @@ inline std::optional<BlackBox> MaybeBlackBox(const Attrs &attrs) {
     }
   }
   return std::nullopt;
+}
+
+inline bool IsBlackBox(const Attrs &attrs) {
+  for (const auto &attr : attrs.attrs)
+    if (auto *a = std::get_if<CompAttr>(&attr.v))
+      if (a->name == "blackbox" && a->args.size() == 1)
+        return true;
+  return false;
 }

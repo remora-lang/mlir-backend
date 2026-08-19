@@ -1,9 +1,9 @@
 #pragma once
 #include "FutharkLexer.h"
 #include "FutharkParser.h"
-#include "error.hpp"
 #include "segop.hpp"
 #include "syntax.hpp"
+#include "utils.hpp"
 
 using namespace antlr4;
 
@@ -197,10 +197,8 @@ struct FutharkTranslationVisitor {
   Exp VisitExpIf(FutharkParser::ExpIfContext *ctx) {
     ExpIf e;
     e.cond = VisitSubExp(ctx->pSubExp());
-    e.then_body =
-        std::make_shared<Body>(VisitCaseBody(ctx->pCaseBody(0)));
-    e.else_body =
-        std::make_shared<Body>(VisitCaseBody(ctx->pCaseBody(1)));
+    e.then_body = std::make_shared<Body>(VisitCaseBody(ctx->pCaseBody(0)));
+    e.else_body = std::make_shared<Body>(VisitCaseBody(ctx->pCaseBody(1)));
     for (auto t : ctx->pTypes()->pType())
       e.retType.push_back(VisitType(t));
     return {e};
@@ -314,7 +312,9 @@ struct FutharkTranslationVisitor {
   CmpOp VisitCmpOp(FutharkParser::PCmpOpContext *ctx) {
     auto str = ctx->cmpOpcode()->getText();
     auto it = std::find_if(str.begin(), str.end(), ::isdigit);
-    int width = it == str.end() ? 0 : std::stoi(str.substr(std::distance(str.begin(), it)));
+    int width = it == str.end()
+                    ? 0
+                    : std::stoi(str.substr(std::distance(str.begin(), it)));
     IntType intTy = width == 8    ? IntType::Int8
                     : width == 16 ? IntType::Int16
                     : width == 32 ? IntType::Int32
@@ -551,7 +551,8 @@ struct FutharkTranslationVisitor {
     if (auto *pSegRed = dynamic_cast<FutharkParser::SegRedContext *>(segop))
       return {ExpHostOp{HostOp{std::make_shared<SegOp>(VisitSegRed(pSegRed))}}};
     if (auto *pSegScan = dynamic_cast<FutharkParser::SegScanContext *>(segop))
-      return {ExpHostOp{HostOp{std::make_shared<SegOp>(VisitSegScan(pSegScan))}}};
+      return {
+          ExpHostOp{HostOp{std::make_shared<SegOp>(VisitSegScan(pSegScan))}}};
     Undefined();
   }
 

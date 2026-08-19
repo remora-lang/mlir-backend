@@ -40,8 +40,9 @@ configure_file(
     ${CMAKE_CURRENT_BINARY_DIR}/config.h
 )
 
-target_include_directories(mlir-backend PRIVATE 
+target_include_directories(mlir-backend PRIVATE
     ${CMAKE_CURRENT_BINARY_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}
 )
 
 message(STATUS "Build type of mlir-backend is : ${CMAKE_BUILD_TYPE}")

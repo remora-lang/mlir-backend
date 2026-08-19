@@ -7,11 +7,12 @@ Each test is a `.fut` file carrying a Futhark-style test block:
     -- input { [1i32, 2i32, 3i32, 4i32] }
     -- output { 10i32 }
 
-The runner marshals the `input` values into `iree-run-module` flags (deriving
-array shapes and the leading dynamic-dimension `i64` sizes from the literals),
-runs the file through `run-iree`, and checks the printed result matches
-`output`. Comparison is on the flat sequence of numeric values, ignoring type
-suffixes and formatting.
+The runner compiles the file (`run-iree --compile-only`), reads `entry_main`'s
+signature and its `futhark.*` ABI attributes from the emitted `out/$name.mlir`,
+binds the `input` values to those parameters (resolving leading `i64` size args
+by symbol from the array shapes), then runs the built module (`run-iree
+--run-only`) and checks the printed result matches `output`. Comparison is on
+the flat sequence of numeric values, ignoring type suffixes and formatting.
 
 Supported literals: signed-int scalars and rectangular int arrays (1D/2D) with
 explicit type suffixes (`i32`/`i64`/...). Anything we can't handle (floats,
@@ -108,30 +109,91 @@ def _shape(value):
     return dims
 
 
-def _marshal(value):
-    """One Futhark value -> (leading i64 size args, payload arg string)."""
+def _payload(value):
+    """One Futhark value -> its `iree-run-module` payload string (no size args)."""
     if not isinstance(value, list):
-        return [], _strip_suffix(value)
+        return _strip_suffix(value)
     dims = _shape(value)
     leaves = list(_leaves(value))
     etype = _elem_type(leaves[0])
     flat = " ".join(_strip_suffix(t) for t in leaves)
-    tensor = "x".join(str(d) for d in dims) + f"x{etype}=" + flat
-    return [str(d) for d in dims], tensor
+    return "x".join(str(d) for d in dims) + f"x{etype}=" + flat
 
 
-def _dedup_sizes(sizes):
-    """Drop a size equal to its predecessor: shared dims (e.g. matmul's k) pass once.
+# --- entry-point signature (ABI reflection) ----------------------------------
+#
+# The compiled `out/$name.mlir` carries `entry_main`'s parameter list. The
+# backend annotates each tensor (array) parameter with a `futhark.size_args`
+# attribute: one entry per dimension giving the *parameter index* that supplies
+# that dimension's extent, or -1 for a statically-sized dimension. Example:
+#   %arg0: i64, %arg1: i64, %arg2: i64,
+#   %arg3: tensor<?x?xf32> {futhark.size_args = [0, 1]},  # dims from args 0 and 1
+#   %arg4: tensor<?x?xf32> {futhark.size_args = [1, 2]}    # (arg1 shared w/ arg3)
+# Size parameters are always prepended, so we classify by arity rather than by
+# "is this arg referenced": the leading (num_params - num_test_values) params
+# are the derived sizes, resolved from the array shapes via `size_args`; the
+# rest consume the test inputs in order. This is exactly what lets us tell
+# `f [n] (x: [n])` (n derived) from `f (n: i64) (x: [n])` (n supplied), which
+# have identical signatures.
 
-    Wrongly merges two distinct size params that are adjacent and equal at
-    runtime (e.g. a `[k][k]` array).
+_BRACKETS = {"(": ")", "[": "]", "{": "}", "<": ">"}
+_OPENERS, _CLOSERS = set(_BRACKETS), set(_BRACKETS.values())
+
+
+def _match_paren(text, start):
+    """Index of the `)` matching the `(` at `text[start]`."""
+    depth = 0
+    for j in range(start, len(text)):
+        c = text[j]
+        if c in _OPENERS:
+            depth += 1
+        elif c in _CLOSERS:
+            depth -= 1
+            if depth == 0:
+                return j
+    raise Unsupported("unterminated entry_main parameter list")
+
+
+def _split_top_level(s):
+    """Split on commas that are not nested inside any bracket."""
+    parts, depth, cur = [], 0, ""
+    for c in s:
+        if c in _OPENERS:
+            depth += 1
+        elif c in _CLOSERS:
+            depth -= 1
+        if c == "," and depth == 0:
+            parts.append(cur)
+            cur = ""
+        else:
+            cur += c
+    parts.append(cur)
+    return [p.strip() for p in parts if p.strip()]
+
+
+def _classify_param(param):
+    """Map one entry_main parameter string to ('array', size_args) | ('scalar', None).
+
+    `size_args` is the list of parameter indices feeding each dimension (-1 for a
+    static dimension). Integer type suffixes (`: i64`) are ignored.
     """
-    out = []
-    for d in sizes:
-        if out and out[-1] == d:
-            continue
-        out.append(d)
-    return out
+    m = re.search(r"futhark\.size_args\s*=\s*(\[[^\]]*\]|array<[^>]*>)", param)
+    if not m:
+        return "scalar", None
+    refs = [int(x) for x in re.findall(r"(?<![A-Za-z0-9])-?\d+", m.group(1))]
+    return "array", refs
+
+
+def _entry_params(mlir_path):
+    """Ordered list of ('array', size_args) | ('scalar', None) for entry_main."""
+    text = open(mlir_path).read()
+    key = "@entry_main("
+    i = text.find(key)
+    if i < 0:
+        raise Unsupported(f"no entry_main in {mlir_path}")
+    lparen = i + len(key) - 1
+    inner = text[lparen + 1 : _match_paren(text, lparen)]
+    return [_classify_param(p) for p in _split_top_level(inner)]
 
 
 # --- IREE output parsing -----------------------------------------------------
@@ -178,21 +240,69 @@ def _read_cases(path):
 
 # --- driver ------------------------------------------------------------------
 
+def _out_mlir(path):
+    """The `out/$name.mlir` path run-iree writes when compiling `path`."""
+    name = re.sub(r"\.fut(_gpu)?$", "", path.rsplit("/", 1)[-1])
+    return f"out/{name}.mlir"
+
+
+def _fail(proc, prog):
+    tail = proc.stderr.strip().splitlines()[-3:]
+    return False, f"{prog} failed:\n    " + "\n    ".join(tail)
+
+
+def _build_flags(params, values):
+    """Bind Futhark `values` to entry_main `params` -> ordered --input flags.
+
+    Sizes are always prepended, so the leading `len(params) - len(values)`
+    parameters are the derived sizes; the rest consume the test values in order.
+    Each derived size is resolved from the shape of an array whose `size_args`
+    references its parameter index.
+    """
+    n_sizes = len(params) - len(values)
+    if n_sizes < 0:
+        raise Unsupported(
+            f"entry_main has {len(params)} params but test supplies "
+            f"{len(values)} values"
+        )
+    # The trailing params consume the test values positionally.
+    bound = dict(zip(range(n_sizes, len(params)), values))
+    # Resolve each size param's value from an array that references it.
+    size_val = {}
+    for i, (kind, refs) in enumerate(params):
+        if kind != "array" or i not in bound:
+            continue
+        for dim, ref in enumerate(refs):
+            if ref >= 0:
+                size_val[ref] = _shape(bound[i])[dim]
+    flags = []
+    for i, (kind, _) in enumerate(params):
+        if i < n_sizes:
+            if i not in size_val:
+                raise Unsupported(f"could not resolve size for param {i}")
+            flags.append(f"--input={size_val[i]}")
+        else:
+            flags.append(f"--input={_payload(bound[i])}")
+    return flags
+
+
 def _run_case(path, input_str, output_str):
     values = _parse_values(_tokenize(input_str))
-    sizes, payloads = [], []
-    for v in values:
-        ds, payload = _marshal(v)
-        sizes += ds
-        payloads.append(payload)
-    flags = [f"--input={a}" for a in _dedup_sizes(sizes) + payloads]
+    # Phase 1: compile so entry_main's signature is available on disk.
+    comp = subprocess.run(
+        ["run-iree", "--compile-only", path],
+        capture_output=True, text=True,
+    )
+    if comp.returncode != 0:
+        return _fail(comp, "compile")
+    flags = _build_flags(_entry_params(_out_mlir(path)), values)
+    # Phase 2: run the already-built module with the bound inputs.
     proc = subprocess.run(
-        ["run-iree", path, *flags],
+        ["run-iree", "--run-only", path, *flags],
         capture_output=True, text=True,
     )
     if proc.returncode != 0:
-        tail = proc.stderr.strip().splitlines()[-3:]
-        return False, "run-iree failed:\n    " + "\n    ".join(tail)
+        return _fail(proc, "run-iree")
     actual = _iree_output_values(proc.stdout)
     expected = _expected_values(output_str)
     if actual != expected:
