@@ -80,22 +80,6 @@ struct AffineRead {
   mlir::AffineMap indexMap;
 };
 
-template <typename R>
-concept Iterable = std::ranges::input_range<R>;
-
-template <std::ranges::input_range R>
-using element_t = std::ranges::range_value_t<R>;
-
-template <Iterable R, std::invocable<element_t<R>> F>
-auto map(const R &xs, F f) {
-  std::vector<std::invoke_result_t<F, element_t<R>>> out;
-  for (const auto &x : xs)
-    out.push_back(f(x));
-  return out;
-}
-
-using LLVMShapeTypeRef = llvm::ArrayRef<int64_t>;
-
 inline int64_t toShapeType(SubExp dim) {
   return match(
       dim.v,
@@ -103,8 +87,11 @@ inline int64_t toShapeType(SubExp dim) {
       [&](const VarSubExp &) { return mlir::ShapedType::kDynamic; });
 }
 
-template <Iterable R>
-  requires std::same_as<element_t<R>, SubExp>
+template <typename R, typename V>
+concept Iterable = std::ranges::input_range<R> &&
+                   std::same_as<std::ranges::range_value_t<R>, V>;
+
+template <Iterable<SubExp> R>
 inline std::vector<int64_t> toShapeType(const R &dims) {
   std::vector<int64_t> dimsTy;
   for (auto &d : dims)
@@ -736,9 +723,8 @@ struct FutharkCompiler {
           mlir::tensor::EmptyOp::create(builder, ty, dynamicSizes));
     }
 
-    auto iterTypes = map(iterSpace, [](const auto &) {
-      return mlir::utils::IteratorType::parallel;
-    });
+    std::vector iterTypes(iterSpace.size(),
+                          mlir::utils::IteratorType::parallel);
 
     // Map the iteration space to each input's dimensions.
     mlir::SmallVector<mlir::AffineMap> indexingMaps;
@@ -829,9 +815,8 @@ struct FutharkCompiler {
                             .result());
     }
 
-    auto iterTypes = map(iterSpace, [](const auto &) {
-      return mlir::utils::IteratorType::parallel;
-    });
+    std::vector iterTypes(iterSpace.size(),
+                          mlir::utils::IteratorType::parallel);
     iterTypes[rank - 1] = mlir::utils::IteratorType::reduction;
 
     // Map the iteration space to each input's dimensions.
