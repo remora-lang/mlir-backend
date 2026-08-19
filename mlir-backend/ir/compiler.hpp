@@ -138,13 +138,13 @@ struct FutharkCompiler {
     builder.setInsertionPointToEnd(module.getBody());
 
     std::vector<mlir::Type> retTypes;
-    for (auto t : fun.retType) {
+    for (const auto &t : fun.retType) {
       retTypes.push_back(LowerTy(t.first.v));
     }
 
     std::vector<mlir::Type> inputTypes;
-    for (auto t : fun.params) {
-      inputTypes.push_back(LowerTy(t.dec.v));
+    for (const auto &param : fun.params) {
+      inputTypes.push_back(LowerTy(param.dec.v));
     }
 
     auto fType = builder.getFunctionType(inputTypes, retTypes);
@@ -155,6 +155,39 @@ struct FutharkCompiler {
 
     if (!fun.entry) {
       func.setPrivate();
+    }
+
+    // Annotate function arguments with size type information
+    // by mapping tensor dimensions to function argument positions.
+    //
+    // For example, our test runner must infer the values of size parameters:
+    //   -- ==
+    //   -- input { [...] }
+    //   -- output { ... }
+    //   entry f [n] [m] (x: [n][10][m]f32)
+    // has GPU IR with additional arguments n and m
+    //   entry ("f", {n : i64, m : i64, x : [n][10][m]i64}, ...)
+    // so we annotate x with "futhark.size_args = [0, -1, 1]" in MLIR
+    // where -1 denotes a static dimension.
+    if (fun.entry) {
+      std::unordered_map<std::string, int> argPosition;
+      for (auto [i, param] : llvm::enumerate(fun.params)) {
+        argPosition[param.name] = i;
+
+        if (auto *arr =
+                std::get_if<TypeArray<Shape, NoUniqueness>>(&param.dec.v.t.v)) {
+          mlir::SmallVector<int64_t> pos;
+          for (const auto &d : arr->shape.dims)
+            pos.push_back(match(
+                d.v,
+                [&](const VarSubExp &) {
+                  return argPosition.at(d.GetVName().name);
+                },
+                [&](const ConstantSubExp &) { return -1; }));
+
+          func.setArgAttr(i, "futhark.size_args", builder.getI64ArrayAttr(pos));
+        }
+      }
     }
 
     Ctx ctx;
