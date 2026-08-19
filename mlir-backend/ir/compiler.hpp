@@ -204,10 +204,6 @@ struct FutharkCompiler {
         [&](const ExpHostOp &e) { return LowerHostOp(e.op, ctx); },
         [&](const ExpApply &e) -> Values {
           auto fun = GetFunction(prog, e.fname);
-          Values args;
-          for (auto arg : std::views::elements<0>(e.args)) {
-            args.push_back(LowerSubExp(arg, ctx));
-          }
           mlir::SmallVector<mlir::Type> retTypes;
           for (auto ty : std::views::elements<0>(e.retTypes)) {
             retTypes.push_back(LowerTy(ty.v));
@@ -217,9 +213,11 @@ struct FutharkCompiler {
               [&](mlir::func::FuncOp func) {
                 // Calling a function that takes a dynamically shaped tensor
                 // with a statically shaped one is a type error.
-                for (auto [v, ty] :
-                     llvm::zip_equal(args, func.getArgumentTypes())) {
-                  args.push_back(castToType(v, ty));
+                Values args;
+                for (auto [arg, ty] :
+                     llvm::zip_equal(std::views::elements<0>(e.args),
+                                     func.getArgumentTypes())) {
+                  args.push_back(castToType(LowerSubExp(arg, ctx), ty));
                 }
 
                 auto call = mlir::func::CallOp::create(builder, func, args);
@@ -232,6 +230,11 @@ struct FutharkCompiler {
                 return results;
               },
               [&](BlackBox b) {
+                Values args;
+                for (auto arg : std::views::elements<0>(e.args)) {
+                  args.push_back(LowerSubExp(arg, ctx));
+                }
+
                 switch (b) {
                 case BlackBox::MatMul:
                   return LowerMatMul(args, retTypes, ctx);
