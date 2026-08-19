@@ -80,9 +80,15 @@ struct AffineRead {
   mlir::AffineMap indexMap;
 };
 
-template <typename T, typename F> auto map(const std::vector<T> &xs, F f) {
-  std::vector<decltype(f(xs[0]))> out;
-  out.reserve(xs.size());
+template <typename R>
+concept Iterable = std::ranges::input_range<R>;
+
+template <std::ranges::input_range R>
+using element_t = std::ranges::range_value_t<R>;
+
+template <Iterable R, std::invocable<element_t<R>> F>
+auto map(const R &xs, F f) {
+  std::vector<std::invoke_result_t<F, element_t<R>>> out;
   for (const auto &x : xs)
     out.push_back(f(x));
   return out;
@@ -97,8 +103,8 @@ inline int64_t toShapeType(SubExp dim) {
       [&](const VarSubExp &) { return mlir::ShapedType::kDynamic; });
 }
 
-template <std::ranges::range R>
-  requires std::same_as<std::ranges::range_value_t<R>, SubExp>
+template <Iterable R>
+  requires std::same_as<element_t<R>, SubExp>
 inline std::vector<int64_t> toShapeType(const R &dims) {
   std::vector<int64_t> dimsTy;
   for (auto &d : dims)
