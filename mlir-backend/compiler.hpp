@@ -85,6 +85,11 @@ inline int64_t toShapeType(SubExp dim) {
       [&](const VarSubExp &) { return mlir::ShapedType::kDynamic; });
 }
 
+inline bool IsUnitType(const Type &type) {
+  auto *prim = std::get_if<TypePrim<Shape, NoUniqueness>>(&type.t.v);
+  return prim && std::holds_alternative<PrimTypeUnit>(prim->t.v);
+}
+
 template <typename R, typename V>
 concept Iterable = std::ranges::input_range<R> &&
                    std::same_as<std::ranges::range_value_t<R>, V>;
@@ -139,9 +144,12 @@ struct FutharkCompiler {
     for (const auto &t : fun.retType) {
       retTypes.push_back(LowerTy(t.first.v));
     }
-
+    // TODO: Maybe this is not a way to go
+    auto runtimeParams = fun.params | std::views::filter([](const auto &param) {
+                           return !IsUnitType(param.dec.v);
+                         });
     std::vector<mlir::Type> inputTypes;
-    for (const auto &param : fun.params) {
+    for (const auto &param : runtimeParams) {
       inputTypes.push_back(LowerTy(param.dec.v));
     }
 
@@ -169,7 +177,7 @@ struct FutharkCompiler {
     // where -1 denotes a static dimension.
     if (fun.entry) {
       std::unordered_map<std::string, int> argPosition;
-      for (auto [i, param] : llvm::enumerate(fun.params)) {
+      for (auto [i, param] : llvm::enumerate(runtimeParams)) {
         argPosition[param.name] = i;
 
         if (auto *arr =
@@ -199,7 +207,8 @@ struct FutharkCompiler {
       LowerStm(stm, ctx);
     }
 
-    for (auto [param, arg] : llvm::zip_equal(fun.params, func.getArguments())) {
+    for (auto [param, arg] :
+         llvm::zip_equal(runtimeParams, func.getArguments())) {
       ctx.subexps.insert(param.name, arg);
     }
 
