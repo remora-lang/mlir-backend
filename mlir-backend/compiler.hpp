@@ -289,8 +289,8 @@ struct FutharkCompiler {
     if (mlir::tensor::CastOp::areCastCompatible(value.getType(), type)) {
       return mlir::tensor::CastOp::create(builder, type, value);
     }
-    if (mlir::isa<mlir::ShapedType>(value.getType()) &&
-        getShapedType(value.getType()).getRank() == 0 && type.isIntOrFloat()) {
+    if (mlir::isa<mlir::RankedTensorType>(value.getType()) &&
+        getRankedType(value.getType()).getRank() == 0 && type.isIntOrFloat()) {
       return mlir::tensor::ExtractOp::create(builder, value, {});
     }
     Undefined();
@@ -310,7 +310,7 @@ struct FutharkCompiler {
     auto n = mlir::tensor::DimOp::create(builder, y, 1).getResult();
 
     // Create the output matrix.
-    auto z_type = getShapedType(retTypes[0]);
+    auto z_type = getRankedType(retTypes[0]);
     Values dynamicSizes;
     for (auto [d, t] :
          llvm::zip_equal(std::vector<mlir::Value>{m, n}, z_type.getShape())) {
@@ -372,9 +372,9 @@ struct FutharkCompiler {
     auto lhsContractingDimensions = getConstantIntTensor(getArg(4));
     auto rhsContractingDimensions = getConstantIntTensor(getArg(5));
 
-    auto lhsType = getShapedType(lhs.getType());
+    auto lhsType = getRankedType(lhs.getType());
     auto lhsShape = lhsType.getShape();
-    auto rhsShape = getShapedType(rhs.getType()).getShape();
+    auto rhsShape = getRankedType(rhs.getType()).getShape();
 
     mlir::SmallVector<int64_t> lhsResultDimensions;
     for (auto d : llvm::enumerate(lhsShape))
@@ -411,15 +411,15 @@ struct FutharkCompiler {
     return op->getResults();
   }
 
-  mlir::ShapedType getShapedType(const mlir::Type &ty) {
-    if (auto t = mlir::dyn_cast<mlir::ShapedType>(ty))
+  mlir::RankedTensorType getRankedType(const mlir::Type &ty) {
+    if (auto t = mlir::dyn_cast<mlir::RankedTensorType>(ty))
       return t;
     Undefined();
   }
 
   mlir::SmallVector<int64_t> getConstantIntTensor(const mlir::Value &x) {
     mlir::DenseIntElementsAttr attr;
-    auto shapeTy = getShapedType(x.getType());
+    auto shapeTy = getRankedType(x.getType());
     if (shapeTy.hasStaticShape() && shapeTy.getNumElements() == 0)
       return {};
     if (mlir::matchPattern(x, mlir::m_Constant(&attr))) {
@@ -1307,7 +1307,7 @@ struct FutharkCompiler {
     if (allConstants) {
       return mlir::arith::ConstantOp::create(
           builder,
-          mlir::DenseElementsAttr::get(getShapedType(tensorTy), attrs));
+          mlir::DenseElementsAttr::get(getRankedType(tensorTy), attrs));
     } else {
       auto values = mlir::SmallVector<mlir::Value>();
       for (auto subExp : arrayLit.values) {
