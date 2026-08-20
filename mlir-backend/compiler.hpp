@@ -1,10 +1,10 @@
 #pragma once
 // Represents the state of a Futhark function
+#include "blackbox.hpp"
 #include "ir/core.hpp"
 #include "ir/segop.hpp"
 #include "ir/syntax.hpp"
 #include "iree/compiler/Dialect/Flow/IR/FlowOps.h"
-#include "blackbox.hpp"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/Matchers.h"
 #include "stablehlo/dialect/StablehloOps.h"
@@ -344,36 +344,17 @@ struct FutharkCompiler {
     //
     // Inputs
     // ------
+    // ...Sequence of Futhark size parameters
     // lhs: tensor
     // rhs: tensor
-    // lhs_batching_dimensions: 1d tensor constant of type si64
-    // rhs_batching_dimensions: 1d tensor constant of type si64
-    // lhs_contracting_dimensions: 1d tensor constant of type si64
-    // rhs_contracting_dimensions: 1d tensor constant of type si64
+    // lhs_batching_dimensions: 1d tensor constant of signed i64
+    // rhs_batching_dimensions: 1d tensor constant of signed i64
+    // lhs_contracting_dimensions: 1d tensor constant of signed i64
+    // rhs_contracting_dimensions: 1d tensor constant of signed i64
     //
     // Outputs
     // ------
     // result: tensor
-    //
-    //
-    // Constraints
-    // -----------
-    // (C1)  size(lhs_batching_dimensions) = size(rhs_batching_dimensions)
-    // (C2)  size(lhs_contracting_dimensions) = size(rhs_contracting_dimensions)
-    // (C3)  is_unique(lhs_batching_dimensions + rhs_batching_dimensions)
-    // (C4)  is_unique(lhs_contracting_dimensions + rhs_contracting_dimensions)
-    // (C5)  0 <= lhs_batching_dimensions < rank(lhs)
-    // (C6)  0 <= lhs_contracting_dimensions < rank(lhs)
-    // (C7)  0 <= rhs_batching_dimensions < rank(rhs)
-    // (C8)  0 <= rhs_contracting_dimensions < rank(rhs)
-    // (C9)  dim(lhs, lhs_batching_dimensions...)
-    //         = dim(rhs, rhs_batching_dimensions...)
-    // (C10) dim(lhs, lhs_contraction_dimensions...)
-    //         = dim(rhs, rhs_contraction_dimensions...)
-    // (C12) shape(result) = dim(lhs, lhs_batching_dimensions)
-    //                         + dim(lhs, lhs_result_dimensions)
-    //                         + dim(rhs, rhs_result_dimensions)
-    // (C13) element_type(lhs) = element_type(rhs)
 
     assert(args.size() >= 6);
     assert(retTypes.size() == 1);
@@ -391,36 +372,9 @@ struct FutharkCompiler {
     auto lhsContractingDimensions = getConstantIntTensor(getArg(4));
     auto rhsContractingDimensions = getConstantIntTensor(getArg(5));
 
-    // auto lhsAxes = llvm::concat<in64_t>(lhsBatchingDimensions,
-    // lhsContractingDimensions);
     auto lhsType = getShapedType(lhs.getType());
-    auto rhsType = getShapedType(rhs.getType());
     auto lhsShape = lhsType.getShape();
-    auto rhsShape = rhsType.getShape();
-
-    // C1
-    assert(lhsBatchingDimensions.size() == rhsBatchingDimensions.size());
-    // C2
-    assert(lhsContractingDimensions.size() == rhsContractingDimensions.size());
-    // C3
-    // C4
-    // C5
-    for (auto i : lhsBatchingDimensions)
-      assert(0 <= i && i < lhsType.getRank());
-    // C5
-    for (auto i : lhsContractingDimensions)
-      assert(0 <= i && i < lhsType.getRank());
-    // C7
-    for (auto i : rhsBatchingDimensions)
-      assert(0 <= i && i < rhsType.getRank());
-    // C8
-    for (auto i : rhsContractingDimensions)
-      assert(0 <= i && i < rhsType.getRank());
-    // C13
-    assert(lhsType.getElementType() == rhsType.getElementType());
-
-    // TODO
-    // C3 C4 C9 C10
+    auto rhsShape = getShapedType(rhs.getType()).getShape();
 
     mlir::SmallVector<int64_t> lhsResultDimensions;
     for (auto d : llvm::enumerate(lhsShape))
@@ -434,7 +388,6 @@ struct FutharkCompiler {
           !llvm::is_contained(rhsContractingDimensions, d.index()))
         rhsResultDimensions.push_back(d.index());
 
-    // Satisfy C12 by construction.
     mlir::SmallVector<int64_t> resultShape;
     for (auto i :
          llvm::concat<int64_t>(lhsBatchingDimensions, lhsResultDimensions))
