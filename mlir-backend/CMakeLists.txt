@@ -24,6 +24,7 @@ set(LIBS
   MLIRTensorDialect
 
   StablehloOps
+  ChloOps
 
   iree::compiler::Dialect::LinalgExt::IR
   iree::compiler::Dialect::Flow::IR

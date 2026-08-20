@@ -1,12 +1,14 @@
 #pragma once
 // Represents the state of a Futhark function
 #include "blackbox.hpp"
+#include "debug.hpp"
 #include "ir/core.hpp"
 #include "ir/segop.hpp"
 #include "ir/syntax.hpp"
 #include "iree/compiler/Dialect/Flow/IR/FlowOps.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/Matchers.h"
+#include "stablehlo/dialect/ChloOps.h"
 #include "stablehlo/dialect/StablehloOps.h"
 #include "utils.hpp"
 #include "llvm/Support/ErrorHandling.h"
@@ -121,6 +123,7 @@ struct FutharkCompiler {
     context.getOrLoadDialect<mlir::BuiltinDialect>();
     context.getOrLoadDialect<mlir::func::FuncDialect>();
     context.getOrLoadDialect<mlir::stablehlo::StablehloDialect>();
+    context.getOrLoadDialect<mlir::chlo::ChloDialect>();
     module = mlir::ModuleOp::create(builder.getUnknownLoc());
     builder.setInsertionPointToStart(module.getBody());
   }
@@ -266,6 +269,8 @@ struct FutharkCompiler {
                   return LowerMatMul(args, retTypes, ctx);
                 case BlackBox::DotGeneral:
                   return LowerDotGeneral(args, retTypes, ctx);
+                case BlackBox::RaggedDot:
+                  return LowerRaggedDot(args, retTypes, ctx);
                 }
                 llvm_unreachable("LowerBlackBox");
               });
@@ -293,6 +298,9 @@ struct FutharkCompiler {
         getRankedType(value.getType()).getRank() == 0 && type.isIntOrFloat()) {
       return mlir::tensor::ExtractOp::create(builder, value, {});
     }
+    llvm::errs() << "error: tried to cast\n\n"
+                 << value << "\n\nto type\n"
+                 << type << "\n";
     Undefined();
   }
 
@@ -344,7 +352,7 @@ struct FutharkCompiler {
     //
     // Inputs
     // ------
-    // ...Sequence of Futhark size parameters
+    // ...Futhark size parameters
     // lhs: tensor
     // rhs: tensor
     // lhs_batching_dimensions: 1d tensor constant of signed i64
@@ -356,17 +364,16 @@ struct FutharkCompiler {
     // ------
     // result: tensor
 
-    assert(args.size() >= 6);
+    auto numNonSizeArgs = 6;
+    assert(args.size() >= numNonSizeArgs);
     assert(retTypes.size() == 1);
     auto getArg = [&](int i) {
       // We don't know how many size parameters will be passed,
       // but they are always preprended, so we index from the back.
-      return args[args.size() - 6 + i];
+      return args[args.size() - numNonSizeArgs + i];
     };
     auto lhs = getArg(0);
     auto rhs = getArg(1);
-
-    // Dimension arguments are tensor literals of integer constants.
     auto lhsBatchingDimensions = getConstantIntTensor(getArg(2));
     auto rhsBatchingDimensions = getConstantIntTensor(getArg(3));
     auto lhsContractingDimensions = getConstantIntTensor(getArg(4));
@@ -376,24 +383,17 @@ struct FutharkCompiler {
     auto lhsShape = lhsType.getShape();
     auto rhsShape = getRankedType(rhs.getType()).getShape();
 
-    mlir::SmallVector<int64_t> lhsResultDimensions;
+    mlir::SmallVector<int64_t> resultShape;
+    for (auto i : lhsBatchingDimensions)
+      resultShape.push_back(lhsShape[i]);
     for (auto d : llvm::enumerate(lhsShape))
       if (!llvm::is_contained(lhsBatchingDimensions, d.index()) &&
           !llvm::is_contained(lhsContractingDimensions, d.index()))
-        lhsResultDimensions.push_back(d.index());
-
-    mlir::SmallVector<int64_t> rhsResultDimensions;
+        resultShape.push_back(lhsShape[d.index()]);
     for (auto d : llvm::enumerate(rhsShape))
       if (!llvm::is_contained(rhsBatchingDimensions, d.index()) &&
           !llvm::is_contained(rhsContractingDimensions, d.index()))
-        rhsResultDimensions.push_back(d.index());
-
-    mlir::SmallVector<int64_t> resultShape;
-    for (auto i :
-         llvm::concat<int64_t>(lhsBatchingDimensions, lhsResultDimensions))
-      resultShape.push_back(lhsShape[i]);
-    for (auto i : rhsResultDimensions)
-      resultShape.push_back(rhsShape[i]);
+        resultShape.push_back(rhsShape[d.index()]);
 
     auto op = mlir::stablehlo::DotGeneralOp::create(
         builder,
@@ -406,6 +406,124 @@ struct FutharkCompiler {
                                                       lhsContractingDimensions,
                                                       rhsContractingDimensions),
         {},
+        {});
+
+    return op->getResults();
+  }
+
+  Values LowerRaggedDot(mlir::ValueRange args, mlir::TypeRange retTypes,
+                        Ctx &ctx) {
+    // CHLO ragged_dot (without support for precision parameters)
+    //
+    // RaggedDot takes three tensor arguments (lhs, rhs, and group_sizes).
+    //
+    // Notation:
+    //   b... are batch dimensions
+    //   m... are the lhs non-contracting dimensions
+    //   k... are the contracting dimensions
+    //   n... are the rhs non-contracting dimensions
+    //   g is the number of groups
+    //   x... are,
+    //        in mode 1, non-contracting dimensions before the ragged dimension;
+    //        in mode 2, contracting dimensions before the ragged dimension;
+    //        in mode 3, the empty sequence.
+    //
+    // RaggedDot has three modes (types) depending on which dimension is ragged.
+    // Mode 1 ::
+    //   (ragged dim is one of m...) =>
+    //   (lhs: [b..., m..., k...]t) ->
+    //   (rhs: [g, b..., k..., n...]t) ->
+    //   (group_sizes: [b..., x..., g]int) ->
+    //   [b..., m..., n...]t
+    // Mode 2 ::
+    //   (ragged dim is one of k...) =>
+    //   (lhs: [b..., m..., k...]t) ->
+    //   (rhs: [b..., k..., n...]t) ->
+    //   (group_sizes: [b...,  x..., g]int) ->
+    //   [g, b..., m..., n...]t
+    // Mode 3 ::
+    //   (ragged dim is one of b...) =>
+    //   (lhs: [b..., m..., k...]t) ->
+    //   (rhs: [b..., k..., n...]t) ->
+    //   (group_sizes: [g]int) ->
+    //   [b..., m..., n...]t
+    //
+    // Like dot_general, lhs and rhs may have arbitrary batching and
+    // (non-)contracting dimensions specified by additional parameters.
+    // So the order shown here (e.g., [b..., m..., k...]) is just for
+    // presentation; they can appear in any order as specified by the
+    // *_dimensions parameters below.
+    //
+    //
+    // Inputs
+    // ------
+    // ...Futhark size parameters
+    // lhs: tensor
+    // rhs: tensor
+    // group_sizes: tensor of any integer type
+    // lhs_batching_dimensions: 1d tensor constant of signed i64
+    // rhs_batching_dimensions: 1d tensor constant of signed i64
+    // lhs_contracting_dimensions: 1d tensor constant of signed i64
+    // rhs_contracting_dimensions: 1d tensor constant of signed i64
+    // lhs_ragged_dimensions : 1d tensor constant of signed i64
+    // rhs_group_dimensions: 1d tensor constant of signed i64
+    //
+    // Outputs
+    // ------
+    // result: tensor
+
+    auto numNonSizeArgs = 9;
+    assert(args.size() >= numNonSizeArgs);
+    assert(retTypes.size() == 1);
+    auto getArg = [&](int i) {
+      // We don't know how many size parameters will be passed,
+      // but they are always preprended, so we index from the back.
+      return args[args.size() - numNonSizeArgs + i];
+    };
+    auto lhs = getArg(0);
+    auto rhs = getArg(1);
+    auto groupSizes = getArg(2);
+    auto lhsBatchingDimensions = getConstantIntTensor(getArg(3));
+    auto rhsBatchingDimensions = getConstantIntTensor(getArg(4));
+    auto lhsContractingDimensions = getConstantIntTensor(getArg(5));
+    auto rhsContractingDimensions = getConstantIntTensor(getArg(6));
+    auto lhsRaggedDim = getConstantInt(getArg(7));
+    auto rhsGroupDimensions = getConstantIntTensor(getArg(8));
+
+    auto lhsType = getRankedType(lhs.getType());
+    auto lhsShape = lhsType.getShape();
+    auto rhsShape = getRankedType(rhs.getType()).getShape();
+
+    auto g = getRankedType(groupSizes.getType()).getShape().back();
+
+    mlir::SmallVector<int64_t> resultShape;
+    if (llvm::is_contained(lhsContractingDimensions, lhsRaggedDim)) // Mode 2
+      resultShape.push_back(g);
+    for (auto i : lhsBatchingDimensions)
+      resultShape.push_back(lhsShape[i]);
+    for (auto d : llvm::enumerate(lhsShape))
+      if (!llvm::is_contained(lhsBatchingDimensions, d.index()) &&
+          !llvm::is_contained(lhsContractingDimensions, d.index()))
+        resultShape.push_back(lhsShape[d.index()]);
+    for (auto d : llvm::enumerate(rhsShape))
+      if (!llvm::is_contained(rhsBatchingDimensions, d.index()) &&
+          !llvm::is_contained(rhsContractingDimensions, d.index()) &&
+          !llvm::is_contained(rhsGroupDimensions, d.index()))
+        resultShape.push_back(rhsShape[d.index()]);
+
+    auto op = mlir::chlo::RaggedDotOp::create(
+        builder,
+        mlir::RankedTensorType::get(resultShape, lhsType.getElementType()),
+        lhs,
+        rhs,
+        groupSizes,
+        mlir::chlo::RaggedDotDimensionNumbersAttr::get(&context,
+                                                       lhsBatchingDimensions,
+                                                       rhsBatchingDimensions,
+                                                       lhsContractingDimensions,
+                                                       rhsContractingDimensions,
+                                                       {lhsRaggedDim},
+                                                       rhsGroupDimensions),
         {});
 
     return op->getResults();
@@ -424,6 +542,14 @@ struct FutharkCompiler {
       return {};
     if (mlir::matchPattern(x, mlir::m_Constant(&attr))) {
       return llvm::to_vector(attr.getValues<int64_t>());
+    }
+    Undefined();
+  }
+
+  int64_t getConstantInt(const mlir::Value &x) {
+    mlir::APInt v;
+    if (mlir::matchPattern(x, mlir::m_ConstantInt(&v))) {
+      return v.getSExtValue();
     }
     Undefined();
   }
