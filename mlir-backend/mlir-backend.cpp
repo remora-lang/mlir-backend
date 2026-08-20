@@ -1,19 +1,9 @@
-﻿#include "antlr4-runtime.h"
-#include "generated/FutharkLexer.h"
-#include "generated/FutharkParser.h"
-
-#include <variant>
-#include <string>
-#include <cstdint>
-#include <optional>
-#include <stdexcept>
-#include <filesystem>
-
-#include "ir/core.hpp"
-#include "ir/syntax.hpp"
+﻿#include "compiler.hpp"
 #include "ir/parser.hpp"
-#include "compiler.hpp"
+#include "ir/syntax.hpp"
 #include <config.h>
+#include <filesystem>
+#include <string>
 
 int main(int argc, char *argv[]) {
   std::filesystem::path base = PROJECT_ROOT_DIR;
