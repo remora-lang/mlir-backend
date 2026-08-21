@@ -7,13 +7,17 @@
 -- Here m = n = 2, k = 4, g = 2 with an even split [2, 2]. rhs is stacked
 -- identities, so each group just copies the matching 2 columns of lhs.
 
-#[noinline]
-#[blackbox(ragged_dot)]
+#[noinline] #[blackbox(ragged_dot)]
 def ragged_dot 'a 'b 'c [g] [n] [m] [s]
-                (x: a) (y: b) (group_sizes: [g]i64)
-                (lhs_batching_dims: [n]i64) (rhs_batching_dims: [n]i64)
-                (lhs_contracting_dims: [m]i64) (rhs_contracting_dims: [m]i64)
-                (lhs_ragged_dim: i64) (rhs_group_dims: [s]i64): c =
+               (lhs: a)
+               (rhs: b)
+               (group_sizes: [g]i64)
+               (lhs_batching_dims: [n]i64)
+               (rhs_batching_dims: [n]i64)
+               (lhs_contracting_dims: [m]i64)
+               (rhs_contracting_dims: [m]i64)
+               (lhs_ragged_dim: i64)
+               (rhs_group_dims: [s]i64) : c =
   #[unsafe] ???
 
 -- ==

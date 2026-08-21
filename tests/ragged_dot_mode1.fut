@@ -6,13 +6,17 @@
 -- Here k = n = 2 and g = 2. rhs[0] is the identity and rhs[1] is upper
 -- triangular, so a row's group selects which matrix transforms it.
 
-#[noinline]
-#[blackbox(ragged_dot)]
+#[noinline] #[blackbox(ragged_dot)]
 def ragged_dot 'a 'b 'c [g] [n] [m] [s]
-                (x: a) (y: b) (group_sizes: [g]i64)
-                (lhs_batching_dims: [n]i64) (rhs_batching_dims: [n]i64)
-                (lhs_contracting_dims: [m]i64) (rhs_contracting_dims: [m]i64)
-                (lhs_ragged_dim: i64) (rhs_group_dims: [s]i64): c =
+               (lhs: a)
+               (rhs: b)
+               (group_sizes: [g]i64)
+               (lhs_batching_dims: [n]i64)
+               (rhs_batching_dims: [n]i64)
+               (lhs_contracting_dims: [m]i64)
+               (rhs_contracting_dims: [m]i64)
+               (lhs_ragged_dim: i64)
+               (rhs_group_dims: [s]i64) : c =
   #[unsafe] ???
 
 -- ==

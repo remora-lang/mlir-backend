@@ -8,13 +8,17 @@
 -- The two test vectors use different group_sizes ([1,1] then [2,0], an empty
 -- second group) to show the output is identical either way.
 
-#[noinline]
-#[blackbox(ragged_dot)]
+#[noinline] #[blackbox(ragged_dot)]
 def ragged_dot 'a 'b 'c [g] [n] [m] [s]
-                (x: a) (y: b) (group_sizes: [g]i64)
-                (lhs_batching_dims: [n]i64) (rhs_batching_dims: [n]i64)
-                (lhs_contracting_dims: [m]i64) (rhs_contracting_dims: [m]i64)
-                (lhs_ragged_dim: i64) (rhs_group_dims: [s]i64): c =
+               (lhs: a)
+               (rhs: b)
+               (group_sizes: [g]i64)
+               (lhs_batching_dims: [n]i64)
+               (rhs_batching_dims: [n]i64)
+               (lhs_contracting_dims: [m]i64)
+               (rhs_contracting_dims: [m]i64)
+               (lhs_ragged_dim: i64)
+               (rhs_group_dims: [s]i64) : c =
   #[unsafe] ???
 
 -- ==

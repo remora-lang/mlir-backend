@@ -494,6 +494,14 @@ struct FutharkCompiler {
     auto lhsShape = lhsType.getShape();
     auto rhsShape = getRankedType(rhs.getType()).getShape();
 
+    // NOTE CHLO->StableHLO conversion does not handle rhs with dynamic
+    // dimensions, so we have to fail on that.
+    // (Probably because machine learning people always have a statically shaped
+    // weight matrix there.)
+    if (!mlir::ShapedType::isStaticShape(rhsShape))
+      throw std::runtime_error(
+          "ragged_dot: shape of rhs tensor must be static.");
+
     auto g = getRankedType(groupSizes.getType()).getShape().back();
 
     mlir::SmallVector<int64_t> resultShape;
