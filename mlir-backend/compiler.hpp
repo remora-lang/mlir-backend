@@ -563,212 +563,209 @@ struct FutharkCompiler {
   }
 
   mlir::Value LowerBasicOp(const BasicOp &basicOp, Ctx &ctx) {
-    if (auto *val = std::get_if<BasicOpSubExp>(&basicOp.v)) {
-      return LowerSubExp(val->subExp, ctx);
-    }
+    return match(
+        basicOp.v,
+        [&](const BasicOpSubExp &val) { return LowerSubExp(val.subExp, ctx); },
+        [&](const BasicOpArrayLit &val) { return LowerArrayLit(val, ctx); },
+        [&](const BasicOpBinOp &val) {
+          auto op0 = LowerSubExp(val.op0, ctx);
+          auto op1 = LowerSubExp(val.op1, ctx);
+          return LowerBinOp(val.op, op0, op1, ctx);
+        },
+        [&](const BasicOpIota &val) -> mlir::Value {
+          mlir::Value n = mlir::arith::IndexCastOp::create(
+              builder, builder.getIndexType(), LowerSubExp(val.n, ctx));
+          mlir::Value x = LowerSubExp(val.x, ctx);
+          mlir::Value s = LowerSubExp(val.s, ctx);
 
-    if (auto *val = std::get_if<BasicOpBinOp>(&basicOp.v)) {
-      auto op0 = LowerSubExp(val->op0, ctx);
-      auto op1 = LowerSubExp(val->op1, ctx);
-      return LowerBinOp(val->op, op0, op1, ctx);
-    }
+          auto elementTy = LowerTy(Type::CreatePrim(PrimType::Int(val.t)));
+          auto dimTy = toShapeType(val.n);
+          auto returnTy = mlir::RankedTensorType::get({dimTy}, elementTy);
 
-    if (auto *val = std::get_if<BasicOpArrayLit>(&basicOp.v)) {
-      return LowerArrayLit(*val, ctx);
-    }
+          auto output = mlir::tensor::EmptyOp::create(
+              builder,
+              returnTy,
+              mlir::ShapedType::isDynamic(dimTy) ? mlir::ValueRange{n}
+                                                 : mlir::ValueRange{});
+          auto op = mlir::linalg::GenericOp::create(
+              builder,
+              {returnTy},
+              {},
+              {output},
+              {mlir::AffineMap::getMultiDimIdentityMap(1, &context)},
+              {mlir::utils::IteratorType::parallel},
+              [&](mlir::OpBuilder &b,
+                  mlir::Location loc,
+                  mlir::ValueRange args) {
+                mlir::OpBuilder::InsertionGuard guard(builder);
+                builder.setInsertionPointToEnd(b.getInsertionBlock());
 
-    if (auto *val = std::get_if<BasicOpIota>(&basicOp.v)) {
-      mlir::Value n = mlir::arith::IndexCastOp::create(
-          builder, builder.getIndexType(), LowerSubExp(val->n, ctx));
-      mlir::Value x = LowerSubExp(val->x, ctx);
-      mlir::Value s = LowerSubExp(val->s, ctx);
+                auto i = mlir::arith::IndexCastOp::create(
+                    builder,
+                    loc,
+                    elementTy,
+                    mlir::linalg::IndexOp::create(builder, loc, 0));
 
-      auto elementTy = LowerTy(Type::CreatePrim(PrimType::Int(val->t)));
-      auto dimTy = toShapeType(val->n);
-      auto returnTy = mlir::RankedTensorType::get({dimTy}, elementTy);
+                auto offset = mlir::arith::MulIOp::create(builder, loc, i, s);
+                auto result =
+                    mlir::arith::AddIOp::create(builder, loc, x, offset);
 
-      auto output = mlir::tensor::EmptyOp::create(
-          builder,
-          returnTy,
-          mlir::ShapedType::isDynamic(dimTy) ? mlir::ValueRange{n}
-                                             : mlir::ValueRange{});
-      auto op = mlir::linalg::GenericOp::create(
-          builder,
-          {returnTy},
-          {},
-          {output},
-          {mlir::AffineMap::getMultiDimIdentityMap(1, &context)},
-          {mlir::utils::IteratorType::parallel},
-          [&](mlir::OpBuilder &b, mlir::Location loc, mlir::ValueRange args) {
-            mlir::OpBuilder::InsertionGuard guard(builder);
-            builder.setInsertionPointToEnd(b.getInsertionBlock());
+                mlir::linalg::YieldOp::create(builder, loc, {result});
+              });
 
-            auto i = mlir::arith::IndexCastOp::create(
-                builder,
-                loc,
-                elementTy,
-                mlir::linalg::IndexOp::create(builder, loc, 0));
+          return op.getResult(0);
+        },
+        [&](const BasicOpConcat &val) -> mlir::Value {
+          std::vector<mlir::Value> operands;
+          for (auto arr : val.arrs)
+            operands.push_back(LowerSubExp(arr.name, ctx));
 
-            auto offset = mlir::arith::MulIOp::create(builder, loc, i, s);
-            auto result = mlir::arith::AddIOp::create(builder, loc, x, offset);
+          auto op1 = LowerSubExp(val.total, ctx);
+          operands.push_back(op1);
 
-            mlir::linalg::YieldOp::create(builder, loc, {result});
-          });
+          auto concat = mlir::tensor::ConcatOp::create(builder, 0, operands);
+          return concat->getResult(0);
+        },
+        [&](const BasicOpFlatIndex &val) -> mlir::Value {
+          auto tensor = LowerSubExp(val.base, ctx);
+          std::vector<mlir::Value> indices;
+          for (auto idx : val.operands) {
+            auto i = LowerSubExp(idx, ctx);
+            auto casted = mlir::arith::IndexCastOp::create(
+                builder, builder.getIndexType(), i);
+            indices.push_back(casted);
+          }
 
-      return op.getResult(0);
-    }
+          auto result =
+              mlir::tensor::ExtractOp::create(builder, tensor, indices);
+          return result.getResult();
+        },
+        [&](const BasicOpConvOp &val) -> mlir::Value {
+          auto op0 = LowerSubExp(val.op0, ctx);
+          auto convOp = val.op;
+          return match(
+              convOp.v,
+              [&](const ConvOpZExt &zext) -> mlir::Value {
+                return mlir::arith::ExtUIOp::create(
+                    builder,
+                    LowerTy(Type::CreatePrim(PrimType::Int(zext.to))),
+                    op0);
+              },
 
-    if (auto *val = std::get_if<BasicOpConcat>(&basicOp.v)) {
-      std::vector<mlir::Value> operands;
-      for (auto arr : val->arrs)
-        operands.push_back(LowerSubExp(arr.name, ctx));
+              [&](const ConvOpSExt &sext) -> mlir::Value {
+                return mlir::arith::ExtSIOp::create(
+                    builder,
+                    LowerTy(Type::CreatePrim(PrimType::Int(sext.to))),
+                    op0);
+              },
+              [](const auto &) -> mlir::Value { Undefined(); });
+        },
+        [&](const BasicOpReshape &val) -> mlir::Value {
+          auto op0 = LowerSubExp(val.op0, ctx);
+          std::vector<mlir::ReassociationIndices> reassociations;
 
-      auto op1 = LowerSubExp(val->total, ctx);
-      operands.push_back(op1);
+          mlir::ReassociationIndices ranges;
+          for (auto i = 0; i < val.dimEnd; i++)
+            ranges.push_back(i);
+          reassociations.push_back(ranges);
 
-      auto concat = mlir::tensor::ConcatOp::create(builder, 0, operands);
-      return concat->getResult(0);
-    }
+          auto prevTy = llvm::dyn_cast<mlir::RankedTensorType>(op0.getType());
+          if (!prevTy)
+            Undefined();
+          for (int64_t i = val.dimEnd; i < std::ssize(prevTy.getShape()); i++) {
+            reassociations.push_back({i});
+          }
 
-    if (auto *val = std::get_if<BasicOpFlatIndex>(&basicOp.v)) {
-      auto tensor = LowerSubExp(val->base, ctx);
-      std::vector<mlir::Value> indices;
-      for (auto idx : val->operands) {
-        auto i = LowerSubExp(idx, ctx);
-        auto casted = mlir::arith::IndexCastOp::create(
-            builder, builder.getIndexType(), i);
-        indices.push_back(casted);
-      }
+          std::vector<int64_t> dims;
+          for (auto d : val.remainder.dims)
+            dims.push_back(d.GetIntValue());
 
-      auto result = mlir::tensor::ExtractOp::create(builder, tensor, indices);
-      return result.getResult();
-    }
+          auto resultTy =
+              mlir::RankedTensorType::get(dims, prevTy.getElementType());
+          auto reshape = mlir::tensor::CollapseShapeOp::create(
+              builder, resultTy, op0, reassociations);
+          return reshape->getResult(0);
+        },
+        [&](const BasicOpRearrange &val) -> mlir::Value {
+          auto op = LowerSubExp(val.arr.name, ctx);
+          auto tensorTy = llvm::dyn_cast<mlir::RankedTensorType>(op.getType());
+          if (!tensorTy)
+            Undefined();
 
-    if (auto *val = std::get_if<BasicOpConvOp>(&basicOp.v)) {
-      auto op0 = LowerSubExp(val->op0, ctx);
-      auto convOp = val->op;
-      return match(
-          convOp.v,
-          [&](const ConvOpZExt &zext) -> mlir::Value {
-            return mlir::arith::ExtUIOp::create(
-                builder,
-                LowerTy(Type::CreatePrim(PrimType::Int(zext.to))),
-                op0);
-          },
+          std::vector<int64_t> dims = tensorTy.getShape();
+          std::reverse(dims.begin(), dims.end());
 
-          [&](const ConvOpSExt &sext) -> mlir::Value {
-            return mlir::arith::ExtSIOp::create(
-                builder,
-                LowerTy(Type::CreatePrim(PrimType::Int(sext.to))),
-                op0);
-          },
-          [](const auto &) -> mlir::Value { Undefined(); });
-    }
+          auto transposedTy =
+              mlir::RankedTensorType::get(dims, tensorTy.getElementType());
+          auto destination =
+              mlir::tensor::EmptyOp::create(builder, transposedTy, {});
+          auto transpose = mlir::linalg::TransposeOp::create(
+              builder, op, destination, val.perm);
+          mlir::Value result = *transpose.result_begin();
+          return result;
+        },
+        [&](const BasicOpReplicate &val) -> mlir::Value {
+          auto op = LowerSubExp(val.val, ctx);
+          auto elementTy = op.getType();
 
-    if (auto *val = std::get_if<BasicOpReshape>(&basicOp.v)) {
-      auto op0 = LowerSubExp(val->op0, ctx);
-      std::vector<mlir::ReassociationIndices> reassociations;
+          std::vector<int64_t> before;
+          for (auto d : val.shape.dims)
+            before.push_back(d.GetIntValue());
 
-      mlir::ReassociationIndices ranges;
-      for (auto i = 0; i < val->dimEnd; i++)
-        ranges.push_back(i);
-      reassociations.push_back(ranges);
+          std::vector<int64_t> original;
+          auto t = op.getType();
+          if (auto tensorTy = llvm::dyn_cast<mlir::RankedTensorType>(t)) {
+            auto dims = tensorTy.getShape();
+            before.insert(before.end(), dims.begin(), dims.end());
+            original.insert(original.end(), dims.begin(), dims.end());
+            elementTy = tensorTy.getElementType();
+          }
 
-      auto prevTy = llvm::dyn_cast<mlir::RankedTensorType>(op0.getType());
-      if (!prevTy)
-        Undefined();
-      for (int64_t i = val->dimEnd; i < std::ssize(prevTy.getShape()); i++) {
-        reassociations.push_back({i});
-      }
+          else {
+            auto rankedType = mlir::RankedTensorType::get({}, elementTy);
+            op = mlir::tensor::FromElementsOp::create(builder, rankedType, op);
+          }
 
-      std::vector<int64_t> dims;
-      for (auto d : val->remainder.dims)
-        dims.push_back(d.GetIntValue());
+          auto transposedTy = mlir::RankedTensorType::get(before, elementTy);
+          auto destination =
+              mlir::tensor::EmptyOp::create(builder, transposedTy, {});
 
-      auto resultTy =
-          mlir::RankedTensorType::get(dims, prevTy.getElementType());
-      auto reshape = mlir::tensor::CollapseShapeOp::create(
-          builder, resultTy, op0, reassociations);
-      return reshape->getResult(0);
-    }
+          std::vector<int64_t> addedDims;
+          for (int64_t i = 0; i < std::ssize(before) - std::ssize(original);
+               i++) {
+            addedDims.push_back(i);
+          }
 
-    if (auto *val = std::get_if<BasicOpRearrange>(&basicOp.v)) {
-      auto op = LowerSubExp(val->arr.name, ctx);
-      auto tensorTy = llvm::dyn_cast<mlir::RankedTensorType>(op.getType());
-      if (!tensorTy)
-        Undefined();
-
-      std::vector<int64_t> dims = tensorTy.getShape();
-      std::reverse(dims.begin(), dims.end());
-
-      auto transposedTy =
-          mlir::RankedTensorType::get(dims, tensorTy.getElementType());
-      auto destination =
-          mlir::tensor::EmptyOp::create(builder, transposedTy, {});
-      auto transpose = mlir::linalg::TransposeOp::create(
-          builder, op, destination, val->perm);
-      mlir::Value result = *transpose.result_begin();
-      return result;
-    }
-
-    if (auto *val = std::get_if<BasicOpReplicate>(&basicOp.v)) {
-      auto op = LowerSubExp(val->val, ctx);
-      auto elementTy = op.getType();
-
-      std::vector<int64_t> before;
-      for (auto d : val->shape.dims)
-        before.push_back(d.GetIntValue());
-
-      std::vector<int64_t> original;
-      auto t = op.getType();
-      if (auto tensorTy = llvm::dyn_cast<mlir::RankedTensorType>(t)) {
-        auto dims = tensorTy.getShape();
-        before.insert(before.end(), dims.begin(), dims.end());
-        original.insert(original.end(), dims.begin(), dims.end());
-        elementTy = tensorTy.getElementType();
-      }
-
-      else {
-        auto rankedType = mlir::RankedTensorType::get({}, elementTy);
-        op = mlir::tensor::FromElementsOp::create(builder, rankedType, op);
-      }
-
-      auto transposedTy = mlir::RankedTensorType::get(before, elementTy);
-      auto destination =
-          mlir::tensor::EmptyOp::create(builder, transposedTy, {});
-
-      std::vector<int64_t> addedDims;
-      for (int64_t i = 0; i < std::ssize(before) - std::ssize(original); i++) {
-        addedDims.push_back(i);
-      }
-
-      auto broadcasted = mlir::linalg::BroadcastOp::create(
-          builder, op, destination, addedDims);
-      return *broadcasted.getResult().begin();
-    }
-
-    if (auto *val = std::get_if<BasicOpScratch>(&basicOp.v)) {
-      auto baseTy = LowerPrimType(val->type);
-      auto shapeTy = toShapeType(val->dims);
-      Values dynamicSizes;
-      for (auto [d, t] : llvm::zip_equal(val->dims, shapeTy)) {
-        if (mlir::ShapedType::isDynamic(t)) {
-          auto v = LowerSubExp(d, ctx);
-          dynamicSizes.push_back(mlir::arith::IndexCastOp::create(
-              builder, builder.getIndexType(), v));
-        }
-      }
-      return mlir::tensor::EmptyOp::create(
-          builder, mlir::RankedTensorType::get(shapeTy, baseTy), dynamicSizes);
-    }
-
-    if (std::get_if<BasicOpCmpOp>(&basicOp.v)) {
-      Undefined();
-    }
-
-    Undefined();
+          auto broadcasted = mlir::linalg::BroadcastOp::create(
+              builder, op, destination, addedDims);
+          return *broadcasted.getResult().begin();
+        },
+        [&](const BasicOpScratch &val) -> mlir::Value {
+          auto baseTy = LowerPrimType(val.type);
+          auto shapeTy = toShapeType(val.dims);
+          Values dynamicSizes;
+          for (auto [d, t] : llvm::zip_equal(val.dims, shapeTy)) {
+            if (mlir::ShapedType::isDynamic(t)) {
+              auto v = LowerSubExp(d, ctx);
+              dynamicSizes.push_back(mlir::arith::IndexCastOp::create(
+                  builder, builder.getIndexType(), v));
+            }
+          }
+          return mlir::tensor::EmptyOp::create(
+              builder,
+              mlir::RankedTensorType::get(shapeTy, baseTy),
+              dynamicSizes);
+        },
+        [](const BasicOpOpaque &) -> mlir::Value { Undefined(); },
+        [](const BasicOpArrayVal &) -> mlir::Value { Undefined(); },
+        [](const BasicOpUnOp &) -> mlir::Value { Undefined(); },
+        [](const BasicOpCmpOp &) -> mlir::Value { Undefined(); },
+        [](const BasicOpIndex &) -> mlir::Value { Undefined(); },
+        [](const BasicOpUpdate &) -> mlir::Value { Undefined(); },
+        [](const BasicOpAssert &) -> mlir::Value { Undefined(); },
+        [](const BasicOpFlatUpdate &) -> mlir::Value { Undefined(); },
+        [](const BasicOpManifest &) -> mlir::Value { Undefined(); });
   }
-
   mlir::Value LowerSubExp(SubExp subExp, Ctx &ctx) {
     if (auto *val = std::get_if<VarSubExp>(&subExp.v)) {
       return LowerSubExp(val->v.name, ctx);
