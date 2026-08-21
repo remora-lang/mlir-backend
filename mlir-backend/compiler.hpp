@@ -756,16 +756,48 @@ struct FutharkCompiler {
               mlir::RankedTensorType::get(shapeTy, baseTy),
               dynamicSizes);
         },
+        [&](const BasicOpCmpOp &val) -> mlir::Value {
+          auto lhs = LowerSubExp(val.op0, ctx);
+          auto rhs = LowerSubExp(val.op1, ctx);
+          auto cmpi = [&](mlir::arith::CmpIPredicate p) -> mlir::Value {
+            return mlir::arith::CmpIOp::create(builder, p, lhs, rhs);
+          };
+          auto cmpf = [&](mlir::arith::CmpFPredicate p) -> mlir::Value {
+            return mlir::arith::CmpFOp::create(builder, p, lhs, rhs);
+          };
+          using enum mlir::arith::CmpIPredicate;
+          using enum mlir::arith::CmpFPredicate;
+          return match(
+              val.op.v,
+              [&](const CmpOpEq &eqOp) -> mlir::Value {
+                return match(
+                    eqOp.t.v,
+                    [&](const PrimTypeInt &) { return cmpi(eq); },
+                    [&](const PrimTypeFloat &) -> mlir::Value {
+                      return cmpf(OEQ);
+                    },
+                    [&](const PrimTypeBool &) -> mlir::Value { Undefined(); },
+                    [&](const PrimTypeUnit &) -> mlir::Value { Undefined(); });
+              },
+              [&](const CmpOpUlt &) { return cmpi(ult); },
+              [&](const CmpOpUle &) { return cmpi(ule); },
+              [&](const CmpOpSlt &) { return cmpi(slt); },
+              [&](const CmpOpSle &) { return cmpi(sle); },
+              [&](const CmpOpFlt &) { return cmpf(OLT); },
+              [&](const CmpOpFle &) { return cmpf(OLE); },
+              [&](const CmpOpLLt &) -> mlir::Value { Undefined(); },
+              [&](const CmpOpLLe &) -> mlir::Value { Undefined(); });
+        },
         [](const BasicOpOpaque &) -> mlir::Value { Undefined(); },
         [](const BasicOpArrayVal &) -> mlir::Value { Undefined(); },
         [](const BasicOpUnOp &) -> mlir::Value { Undefined(); },
-        [](const BasicOpCmpOp &) -> mlir::Value { Undefined(); },
         [](const BasicOpIndex &) -> mlir::Value { Undefined(); },
         [](const BasicOpUpdate &) -> mlir::Value { Undefined(); },
         [](const BasicOpAssert &) -> mlir::Value { Undefined(); },
         [](const BasicOpFlatUpdate &) -> mlir::Value { Undefined(); },
         [](const BasicOpManifest &) -> mlir::Value { Undefined(); });
   }
+
   mlir::Value LowerSubExp(SubExp subExp, Ctx &ctx) {
     if (auto *val = std::get_if<VarSubExp>(&subExp.v)) {
       return LowerSubExp(val->v.name, ctx);
