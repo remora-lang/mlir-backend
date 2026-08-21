@@ -4,6 +4,7 @@
 #include "segop.hpp"
 #include "syntax.hpp"
 #include "utils.hpp"
+#include <limits>
 
 using namespace antlr4;
 
@@ -292,6 +293,9 @@ struct FutharkTranslationVisitor {
                     : width == 16 ? IntType::Int16
                     : width == 32 ? IntType::Int32
                                   : IntType::Int64;
+    FloatType floatTy = width == 16   ? FloatType::Float16
+                        : width == 32 ? FloatType::Float32
+                                      : FloatType::Float64;
 
     if (str.rfind("eq_", 0) == 0) {
       if (str.find("bool") != std::string::npos)
@@ -308,6 +312,11 @@ struct FutharkTranslationVisitor {
       return {CmpOpUlt{intTy}};
     if (str.rfind("ule", 0) == 0)
       return {CmpOpUle{intTy}};
+    // Ordered float comparisons: lt32, le64, ...
+    if (str.rfind("lt", 0) == 0)
+      return {CmpOpFlt{floatTy}};
+    if (str.rfind("le", 0) == 0)
+      return {CmpOpFle{floatTy}};
 
     Undefined();
   }
@@ -615,12 +624,17 @@ struct FutharkTranslationVisitor {
     if (auto *pFloat =
             dynamic_cast<FutharkParser::PrimValueFloatContext *>(ctx))
       return {VisitPrimValueFloat(pFloat)};
+    if (auto *pSpecial =
+            dynamic_cast<FutharkParser::PrimValueFloatSpecialContext *>(ctx))
+      return {VisitPrimValueFloatSpecial(pSpecial)};
 
     Undefined();
   }
 
   IntValue VisitPrimValueInteger(FutharkParser::PrimValueIntegerContext *ctx) {
-    auto v = std::stoull(ctx->NUMBER()->getText());
+    // NUMBER carries its own optional sign (e.g. "-1"), matching Futhark's
+    // `show`-based printing.
+    int64_t v = std::stoll(ctx->NUMBER()->getText());
     auto w = ctx->INTEGER_TYPE()->getText();
     if (w == "i8")
       return IntValue{Int8Value{(int8_t)v}};
@@ -635,13 +649,33 @@ struct FutharkTranslationVisitor {
   }
 
   FloatValue VisitPrimValueFloat(FutharkParser::PrimValueFloatContext *ctx) {
-    auto v = std::stoull(ctx->FLOAT()->getText());
+    // FLOAT carries its own optional sign (e.g. "-3.0").
+    double v = std::stod(ctx->FLOAT()->getText());
     auto w = ctx->FLOAT_TYPE()->getText();
     if (w == "f16")
       return FloatValue{Float16Value{(uint16_t)v}};
     if (w == "f32")
       return FloatValue{Float32Value{(float)v}};
     if (w == "f64")
+      return FloatValue{Float64Value{(double)v}};
+
+    Undefined();
+  }
+
+  // Special float literals printed type-first, e.g. `f32.inf`, `-f32.inf`,
+  // `f32.nan`. The optional sign is part of the token text.
+  FloatValue
+  VisitPrimValueFloatSpecial(FutharkParser::PrimValueFloatSpecialContext *ctx) {
+    auto text = ctx->SPECIAL_FLOAT()->getText(); // e.g. "-f32.inf"
+    double mag = text.find("nan") != std::string::npos
+                     ? std::numeric_limits<double>::quiet_NaN()
+                     : std::numeric_limits<double>::infinity();
+    double v = text.front() == '-' ? -mag : mag;
+    if (text.find("f16") != std::string::npos)
+      return FloatValue{Float16Value{(uint16_t)v}};
+    if (text.find("f32") != std::string::npos)
+      return FloatValue{Float32Value{(float)v}};
+    if (text.find("f64") != std::string::npos)
       return FloatValue{Float64Value{(double)v}};
 
     Undefined();

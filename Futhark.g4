@@ -115,7 +115,7 @@ pBinOp: binaryOpcode LPARAM pSubExp ',' pSubExp RPARAM;
 
 pCmpOp: cmpOpcode LPARAM pSubExp ',' pSubExp RPARAM;
 
-cmpOpcode: CMPEQ | CMPSLT | CMPSLE | CMPULT | CMPULE;
+cmpOpcode: CMPEQ | CMPSLT | CMPSLE | CMPULT | CMPULE | CMPFLT | CMPFLE;
 
 binaryOpcode: ADD | ADDNW | FADD | SUB | SUBNW | FSUB | MUL | MULNW | FMUL | UDIV | UDIVUP | SDIV | SDIVUP | FDIV | FMOD | UMOD | SMOD | SQUOT | SREM | SMIN | UMIN | FMIN | SMAX | UMAX | FMAX | SHL | LSHR | ASHR | AND | OR | XOR | POW | FPOW | LOGAND | LOGOR;
 
@@ -126,6 +126,7 @@ pSubExp: pPrimValue #ConstantSubExpression
 
 pPrimValue: NUMBER INTEGER_TYPE #PrimValueInteger
     | FLOAT FLOAT_TYPE #PrimValueFloat
+    | SPECIAL_FLOAT #PrimValueFloatSpecial
     | ('true' | 'false') #PrimValueBool;
 
 pPrimType: INTEGER_TYPE #PrimTypeInteger
@@ -135,7 +136,12 @@ pPrimType: INTEGER_TYPE #PrimTypeInteger
 INTEGER_TYPE: 'i8' | 'i16' | 'i32' | 'i64';
 FLOAT_TYPE: 'f16' | 'f32' | 'f64';
 
-NUMBER: ([0-9]+) | ('0x' ([a-fA-F0-9])+);
+// Special float literals, printed type-first with an optional sign, matching
+// Futhark's `Pretty FloatValue`: `f32.inf`, `-f32.inf`, `f32.nan`.
+// Declared before ID so it wins the maximal-munch tie against an identifier.
+SPECIAL_FLOAT: '-'? ('f16' | 'f32' | 'f64') '.' ('inf' | 'nan');
+
+NUMBER: '-'? (([0-9]+) | ('0x' ([a-fA-F0-9])+));
 
 // Binary operators
 IOTA: 'iota' NUMBER;
@@ -184,8 +190,11 @@ CMPSLT: 'slt' NUMBER;
 CMPSLE: 'sle' NUMBER;
 CMPULT: 'ult' NUMBER;
 CMPULE: 'ule' NUMBER;
+// Ordered float comparisons carry a bit width: lt32, le64, ...
+CMPFLT: 'lt' NUMBER;
+CMPFLE: 'le' NUMBER;
 
-FLOAT   : (DIGIT+ '.' DIGIT+) ;
+FLOAT   : '-'? (DIGIT+ '.' DIGIT+) ;
 fragment DIGIT  : [0-9];
 
 STRING_LITERAL: '"' ( '\\' . | ~["\\] )* '"';
