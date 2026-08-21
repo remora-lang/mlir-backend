@@ -271,6 +271,8 @@ struct FutharkCompiler {
                   return LowerDotGeneral(args, retTypes, ctx);
                 case BlackBox::RaggedDot:
                   return LowerRaggedDot(args, retTypes, ctx);
+                case BlackBox::ArgSort:
+                  return LowerArgSort(args, retTypes, ctx);
                 }
                 llvm_unreachable("LowerBlackBox");
               });
@@ -554,6 +556,66 @@ struct FutharkCompiler {
     return op->getResults();
   }
 
+  Values LowerArgSort(mlir::ValueRange args, mlir::TypeRange retTypes,
+                      Ctx &ctx) {
+    // A basic ascending sort.
+    // Doesn't implement StableHLO sort faithfully.
+    auto numNonSizeArgs = 2;
+    assert(args.size() >= numNonSizeArgs);
+    assert(retTypes.size() == 1);
+    auto getArg = [&](int i) {
+      // We don't know how many size parameters will be passed,
+      // but they are always preprended, so we index from the back.
+      return args[args.size() - numNonSizeArgs + i];
+    };
+    auto inputs = getArg(0);
+    bool isStable = getConstantInt(getArg(1)) != 0;
+
+    auto inputsTy = getRankedType(inputs.getType());
+    if (inputsTy.getRank() != 1)
+      Undefined();
+    if (!mlir::ShapedType::isStaticShape(inputsTy.getShape()))
+      throw std::runtime_error(
+          "argsort: shape of input tensor must be static.");
+
+    mlir::Value indices = createIota(
+        mlir::tensor::DimOp::create(builder, inputs, 0).getResult(),
+        mlir::arith::ConstantOp::create(builder, builder.getI64IntegerAttr(0)),
+        mlir::arith::ConstantOp::create(builder, builder.getI64IntegerAttr(1)),
+        builder.getI64Type(),
+        inputsTy.getShape()[0]);
+
+    // Sort the values and the indices together, keyed on the values; the
+    // permuted indices are the argsort result.
+    auto op = mlir::stablehlo::SortOp::create(
+        builder, mlir::ValueRange{inputs, indices}, (int64_t)0, isStable);
+
+    // The comparator has two arguments per sorted operand: the values first
+    // (compared here), then the indices (carried along).
+    auto valScalar = mlir::RankedTensorType::get({}, inputsTy.getElementType());
+    auto idxScalar = mlir::RankedTensorType::get({}, builder.getI64Type());
+    {
+      mlir::OpBuilder::InsertionGuard guard(builder);
+      auto *block =
+          builder.createBlock(&op.getComparator(),
+                              {},
+                              {valScalar, valScalar, idxScalar, idxScalar},
+                              {builder.getLoc(),
+                               builder.getLoc(),
+                               builder.getLoc(),
+                               builder.getLoc()});
+      auto lt = mlir::stablehlo::CompareOp::create(
+          builder,
+          block->getArgument(0),
+          block->getArgument(1),
+          mlir::stablehlo::ComparisonDirection::LT,
+          mlir::stablehlo::ComparisonType::SIGNED);
+      mlir::stablehlo::ReturnOp::create(builder, mlir::ValueRange{lt});
+    }
+
+    return {op.getResult(1)};
+  }
+
   mlir::RankedTensorType getRankedType(const mlir::Type &ty) {
     if (auto t = mlir::dyn_cast<mlir::RankedTensorType>(ty))
       return t;
@@ -579,6 +641,41 @@ struct FutharkCompiler {
     Undefined();
   }
 
+  // Builds a 1-D iota tensor where result[i] = x + i*s.
+  mlir::Value createIota(mlir::Value n, mlir::Value x, mlir::Value s,
+                         mlir::Type elementTy, int64_t dimTy) {
+    auto returnTy = mlir::RankedTensorType::get({dimTy}, elementTy);
+    auto output = mlir::tensor::EmptyOp::create(
+        builder,
+        returnTy,
+        mlir::ShapedType::isDynamic(dimTy) ? mlir::ValueRange{n}
+                                           : mlir::ValueRange{});
+    auto op = mlir::linalg::GenericOp::create(
+        builder,
+        {returnTy},
+        {},
+        {output},
+        {mlir::AffineMap::getMultiDimIdentityMap(1, &context)},
+        {mlir::utils::IteratorType::parallel},
+        [&](mlir::OpBuilder &b, mlir::Location loc, mlir::ValueRange args) {
+          mlir::OpBuilder::InsertionGuard guard(builder);
+          builder.setInsertionPointToEnd(b.getInsertionBlock());
+
+          auto i = mlir::arith::IndexCastOp::create(
+              builder,
+              loc,
+              elementTy,
+              mlir::linalg::IndexOp::create(builder, loc, 0));
+
+          auto offset = mlir::arith::MulIOp::create(builder, loc, i, s);
+          auto result = mlir::arith::AddIOp::create(builder, loc, x, offset);
+
+          mlir::linalg::YieldOp::create(builder, loc, {result});
+        });
+
+    return op.getResult(0);
+  }
+
   mlir::Value LowerBasicOp(const BasicOp &basicOp, Ctx &ctx) {
     return match(
         basicOp.v,
@@ -594,43 +691,8 @@ struct FutharkCompiler {
               builder, builder.getIndexType(), LowerSubExp(val.n, ctx));
           mlir::Value x = LowerSubExp(val.x, ctx);
           mlir::Value s = LowerSubExp(val.s, ctx);
-
           auto elementTy = LowerTy(Type::CreatePrim(PrimType::Int(val.t)));
-          auto dimTy = toShapeType(val.n);
-          auto returnTy = mlir::RankedTensorType::get({dimTy}, elementTy);
-
-          auto output = mlir::tensor::EmptyOp::create(
-              builder,
-              returnTy,
-              mlir::ShapedType::isDynamic(dimTy) ? mlir::ValueRange{n}
-                                                 : mlir::ValueRange{});
-          auto op = mlir::linalg::GenericOp::create(
-              builder,
-              {returnTy},
-              {},
-              {output},
-              {mlir::AffineMap::getMultiDimIdentityMap(1, &context)},
-              {mlir::utils::IteratorType::parallel},
-              [&](mlir::OpBuilder &b,
-                  mlir::Location loc,
-                  mlir::ValueRange args) {
-                mlir::OpBuilder::InsertionGuard guard(builder);
-                builder.setInsertionPointToEnd(b.getInsertionBlock());
-
-                auto i = mlir::arith::IndexCastOp::create(
-                    builder,
-                    loc,
-                    elementTy,
-                    mlir::linalg::IndexOp::create(builder, loc, 0));
-
-                auto offset = mlir::arith::MulIOp::create(builder, loc, i, s);
-                auto result =
-                    mlir::arith::AddIOp::create(builder, loc, x, offset);
-
-                mlir::linalg::YieldOp::create(builder, loc, {result});
-              });
-
-          return op.getResult(0);
+          return createIota(n, x, s, elementTy, toShapeType(val.n));
         },
         [&](const BasicOpConcat &val) -> mlir::Value {
           std::vector<mlir::Value> operands;
