@@ -281,7 +281,24 @@ struct FutharkCompiler {
           }
           return results;
         },
-        [&](const ExpIf &e) -> Values { Undefined(); });
+        [&](const ExpIf &e) -> Values {
+          return mlir::scf::IfOp::create(
+                     builder,
+                     LowerSubExp(e.cond, ctx),
+                     [&](mlir::OpBuilder &b, mlir::Location loc) {
+                       mlir::OpBuilder::InsertionGuard guard(builder);
+                       builder.setInsertionPointToEnd(b.getInsertionBlock());
+                       auto thenValue = LowerBody(*e.then_body, ctx);
+                       mlir::scf::YieldOp::create(builder, loc, thenValue);
+                     },
+                     [&](mlir::OpBuilder &b, mlir::Location loc) {
+                       mlir::OpBuilder::InsertionGuard guard(builder);
+                       builder.setInsertionPointToEnd(b.getInsertionBlock());
+                       auto elseValue = LowerBody(*e.else_body, ctx);
+                       mlir::scf::YieldOp::create(builder, loc, elseValue);
+                     })
+              .getResults();
+        });
   }
 
   // Casts the type of `value` to `type` if they are compatible
