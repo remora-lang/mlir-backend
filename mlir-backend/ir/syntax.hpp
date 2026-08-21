@@ -192,7 +192,7 @@ struct BasicOp {
                BasicOpAssert, BasicOpIndex, BasicOpUpdate, BasicOpFlatIndex,
                BasicOpFlatUpdate, BasicOpConcat, BasicOpManifest, BasicOpIota,
                BasicOpReplicate, BasicOpScratch, BasicOpReshape,
-               BasicOpRearrange, BasicOpUpdate>
+               BasicOpRearrange>
       v;
 };
 
