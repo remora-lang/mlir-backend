@@ -1415,7 +1415,9 @@ struct FutharkCompiler {
           return builder.getFloatAttr(GetFloatType(builder, GetWidth(val)),
                                       GetValue(val));
         },
-        [&](const BoolValue &) -> mlir::TypedAttr { Undefined(); },
+        [&](const BoolValue &val) -> mlir::TypedAttr {
+          return builder.getBoolAttr(val.v);
+        },
         [&](const UnitValue &) -> mlir::TypedAttr { Undefined(); });
   }
 

@@ -627,6 +627,9 @@ struct FutharkTranslationVisitor {
     if (auto *pSpecial =
             dynamic_cast<FutharkParser::PrimValueFloatSpecialContext *>(ctx))
       return {VisitPrimValueFloatSpecial(pSpecial)};
+    if (auto *pBool =
+            dynamic_cast<FutharkParser::PrimValueBoolContext *>(ctx))
+      return {BoolValue{pBool->getText() == "true"}};
 
     Undefined();
   }
