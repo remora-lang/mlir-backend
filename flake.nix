@@ -316,6 +316,18 @@
           clang
           vulkan-loader
         ];
+
+        # Expose IREE's StableHLO and MLIR sources (read-only nix store paths)
+        # for reference during development.
+        shellHook = ''
+          ln -sfn ${iree}/third_party/stablehlo/stablehlo third-party/stablehlo-src
+          ln -sfn ${iree}/third_party/llvm-project/mlir third-party/mlir-src
+          for l in third-party/stablehlo-src third-party/mlir-src; do
+            grep -qxF "!$l" .ignore 2>/dev/null || echo "!$l" >> .ignore
+          done
+          [ -f .ripgreprc ] || printf -- '--follow\n' > .ripgreprc
+          export RIPGREP_CONFIG_PATH="$PWD/.ripgreprc"
+        '';
       } // pkgs.lib.optionalAttrs (!pkgs.stdenv.isDarwin) {
         IREE_HAL_VULKAN_LIBVULKAN_PATH = "${pkgs.vulkan-loader}/lib";
         VK_ICD_FILENAMES = "/run/opengl-driver/share/vulkan/icd.d/nvidia_icd.json";

@@ -1,0 +1,4 @@
+# Re-include the pinned StableHLO/MLIR source symlinks (gitignored) so the
+# sources are greppable. Links are created by the nix flake.
+!third-party/stablehlo-src
+!third-party/mlir-src
