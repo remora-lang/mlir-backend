@@ -12,6 +12,8 @@ struct SegSpace {
   std::vector<std::tuple<std::string, SubExp>> dims;
 };
 
+using SegLevel = std::variant<SegThread, SegBlock, SegThreadInBlock>;
+
 struct KernelResult {
   SubExp result;
 };
@@ -33,14 +35,14 @@ struct SegPostOp {
 };
 
 struct SegMap {
-  std::variant<SegThread, SegBlock, SegThreadInBlock> lvl;
+  SegLevel lvl;
   SegSpace space;
   std::vector<Type> ret;
   KernelBody body;
 };
 
 struct SegRed {
-  std::variant<SegThread, SegBlock, SegThreadInBlock> lvl;
+  SegLevel lvl;
   SegSpace space;
   std::vector<Type> ret;
   KernelBody body;
@@ -48,7 +50,7 @@ struct SegRed {
 };
 
 struct SegScan {
-  std::variant<SegThread, SegBlock, SegThreadInBlock> lvl;
+  SegLevel lvl;
   SegSpace space;
   std::vector<Type> ret;
   KernelBody body;
