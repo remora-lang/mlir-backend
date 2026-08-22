@@ -994,18 +994,6 @@ struct FutharkCompiler {
 
   // TODO Same limitations as SegMap, probably.
   Values LowerSegRed(const SegRed &pSegRed, Ctx &ctx) {
-    IterationSpace iterSpace = LowerSegSpace(pSegRed.space, ctx);
-    int64_t rank = std::ssize(iterSpace);
-    if (rank == 0)
-      Undefined();
-
-    std::vector<AffineRead> affine_reads =
-        FindSegOpAffineReads(iterSpace, pSegRed.body);
-
-    Values inputs;
-    for (auto &read : affine_reads)
-      inputs.push_back(ctx.subexps.lookup(read.array.name));
-
     if (pSegRed.ops.size() != 1) {
       Undefined();
     }
@@ -1018,6 +1006,17 @@ struct FutharkCompiler {
       neutral.push_back(LowerSubExp(e, ctx));
     }
 
+    IterationSpace iterSpace = LowerSegSpace(pSegRed.space, ctx);
+    int64_t rank = std::ssize(iterSpace);
+    if (rank == 0)
+      Undefined();
+
+    std::vector<AffineRead> affine_reads =
+        FindSegOpAffineReads(iterSpace, pSegRed.body);
+
+    Values inputs;
+    for (auto &read : affine_reads)
+      inputs.push_back(ctx.subexps.lookup(read.array.name));
 
     mlir::SmallVector<mlir::Type> returnTypes;
     for (auto ret : pSegBinOp.lambda.ret) {
@@ -1026,7 +1025,6 @@ struct FutharkCompiler {
                                  std::views::take(rank - 1));
       returnTypes.push_back(mlir::RankedTensorType::get(shapeTy, baseTy));
     }
-
     Values dynamicSizes;
     int64_t reductionIndex = rank - 1;
     for (const auto &d : iterSpace) {
