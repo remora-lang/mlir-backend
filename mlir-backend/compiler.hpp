@@ -1018,7 +1018,6 @@ struct FutharkCompiler {
       neutral.push_back(LowerSubExp(e, ctx));
     }
 
-    // TODO reorder statements to match segmap
 
     mlir::SmallVector<mlir::Type> returnTypes;
     for (auto ret : pSegBinOp.lambda.ret) {
