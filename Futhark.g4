@@ -194,7 +194,7 @@ CMPULE: 'ule' NUMBER;
 CMPFLT: 'lt' NUMBER;
 CMPFLE: 'le' NUMBER;
 
-FLOAT   : '-'? (DIGIT+ '.' DIGIT+) ;
+FLOAT   : '-'? (DIGIT+ '.' DIGIT+) ([eE][+-]?DIGIT+)? ;
 fragment DIGIT  : [0-9];
 
 STRING_LITERAL: '"' ( '\\' . | ~["\\] )* '"';
