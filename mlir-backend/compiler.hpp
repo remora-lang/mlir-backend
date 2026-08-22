@@ -6,6 +6,7 @@
 #include "ir/segop.hpp"
 #include "ir/syntax.hpp"
 #include "iree/compiler/Dialect/Flow/IR/FlowOps.h"
+#include "mlir/Dialect/Arith/Utils/Utils.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/Matchers.h"
 #include "stablehlo/dialect/ChloOps.h"
@@ -912,7 +913,8 @@ struct FutharkCompiler {
         pSegOp->v,
         [&](const SegMap &v) { return LowerSegMap(v, ctx); },
         [&](const SegRed &v) { return LowerSegRed(v, ctx); },
-        [&](const SegScan &v) { return LowerSegScan(v, ctx); });
+        [&](const SegScan &v) { return LowerSegScan(v, ctx); },
+        [&](const SegHist &v) -> Values { return LowerSegHist(v, ctx); });
   }
 
   // TODO Limitations
@@ -1097,6 +1099,115 @@ struct FutharkCompiler {
 
           mlir::linalg::YieldOp::create(builder, loc, results);
         });
+
+    return op.getResults();
+  }
+
+  Values LowerSegHist(const SegHist &pSegHist, Ctx &ctx) {
+    // This lowers a SegMap to a linalg.generic op, whose
+    //   * iteration space corresponds to the SegMap's SegSpace;
+    //   * inputs correspond to "affine reads" in the SegMap body.
+    // An affine read is an array load whose index expression is an affine
+    // function of the iteration space.
+
+    IterationSpace iterSpace = LowerSegSpace(pSegHist.space, ctx);
+
+    std::vector<AffineRead> affine_reads =
+        FindSegOpAffineReads(iterSpace, pSegHist.body);
+
+    if (pSegHist.ops.size() != 1) {
+      Undefined();
+    }
+    auto pHistOp = pSegHist.ops[0];
+    Values neutral;
+    for (auto &e : pHistOp.neutral) {
+      neutral.push_back(LowerSubExp(e, ctx));
+    }
+    auto returnShape = toShapeType(pHistOp.shape.dims);
+    Values returnDims;
+    for (auto const &d : pHistOp.shape.dims)
+      returnDims.push_back(LowerSubExp(d, ctx));
+
+    // Hopefully this is invariant.
+    if (affine_reads.size() != 2)
+      Undefined();
+    mlir::Value indices = ctx.subexps.lookup(affine_reads[0].array.name);
+    mlir::Value values = ctx.subexps.lookup(affine_reads[1].array.name);
+
+    Values bins;
+    mlir::SmallVector<mlir::Type> binsTy;
+    for (auto const &vn : pHistOp.dest) {
+      auto v = ctx.subexps.lookup(vn.name);
+      bins.push_back(v);
+      binsTy.push_back(v.getType());
+    }
+
+    auto indicesTy = getRankedType(indices.getType());
+    if (indicesTy.getRank() != 1)
+      Undefined();
+    // Expand indices' shape <?xi64> -> <?x1xi64> because update slice has 1 el.
+    std::vector<int64_t> newShapeTy = indicesTy.getShape();
+    newShapeTy.push_back(builder.getIndexAttr(1).getSInt());
+    auto scatterIndices = mlir::tensor::ExpandShapeOp::create(
+        builder,
+        mlir::RankedTensorType::get(newShapeTy, indicesTy.getElementType()),
+        indices,
+        {{0, 1}},
+        {mlir::tensor::DimOp::create(builder, indices, 0).getResult(),
+         builder.getIndexAttr(1)});
+    PrintValue(scatterIndices);
+
+    // TODO support 2D and 3D histograms
+    // Axis of scatterIndices holding the update slice.
+    // Updates are scalar here, so window is empty.
+    mlir::SmallVector<int64_t> updateWindowDims = {};
+    // Result axes not given by update slices (here, axis 0 of bins).
+    mlir::SmallVector<int64_t> insertedWindowDims = {0};
+    mlir::SmallVector<int64_t> scatterDimsToOperandDims = {0};
+    // The scatterIndices axis containing the indices.
+    int64_t indexVectorDim = 1;
+    // TODO Flattening: this lets us create batched histograms.
+    mlir::SmallVector<int64_t> batchingDims = {};
+    mlir::SmallVector<int64_t> inputBatchingDims = {};
+    mlir::SmallVector<int64_t> scatterIndicesBatchingDims = {};
+
+    auto op = mlir::stablehlo::ScatterOp::create(
+        builder,
+        binsTy,
+        bins,
+        scatterIndices,
+        values,
+        mlir::stablehlo::ScatterDimensionNumbersAttr::get(
+            &context,
+            updateWindowDims,
+            insertedWindowDims,
+            inputBatchingDims,
+            scatterIndicesBatchingDims,
+            scatterDimsToOperandDims,
+            indexVectorDim));
+
+    // TODO build update op region
+    mlir::SmallVector<mlir::Type> opInputTypes;
+    for (const auto &param : pHistOp.lambda.params)
+      opInputTypes.push_back(
+          mlir::RankedTensorType::get({}, LowerTy(param.dec.v)));
+    mlir::SmallVector<mlir::Location> locs;
+    for (const auto &_ : opInputTypes)
+      locs.push_back(builder.getLoc());
+    {
+      mlir::OpBuilder::InsertionGuard guard(builder);
+      auto *blk = builder.createBlock(
+          &op.getUpdateComputation(), {}, opInputTypes, locs);
+      Ctx local = ctx;
+      for (auto [param, arg] :
+           llvm::zip_equal(pHistOp.lambda.params, blk->getArguments()))
+        local.subexps.insert(param.name, arg);
+      auto results = LowerBody(pHistOp.lambda.body, ctx);
+      Values returns;
+      for (const auto& r : results)
+        returns.push_back(mlir::tensor::FromElementsOp
+      mlir::stablehlo::ReturnOp::create(builder, returns);
+    }
 
     return op.getResults();
   }

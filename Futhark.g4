@@ -67,10 +67,16 @@ pSizeOp: 'get_size' '(' ID ',' ID ')';
 pSegOp : 'segmap' '(' 'thread' ';' 'virtualise'? ';' ')' pSegSpace ':' pTypes '{' pKernelBody '}' #SegMap
        | 'segred' '(' 'thread' ';' 'virtualise'? ';' ')' pSegSpace ':' pTypes '{' pKernelBody '}' '(' pSegBinOp (',' pSegBinOp)* ')' #SegRed
        | 'segscan' '(' 'thread' ';' 'virtualise'? ';' ')' pSegSpace ':' pTypes '{' pKernelBody '}' '(' pSegBinOp (',' pSegBinOp)* ')' pSegPostOp #SegScan
+       | 'seghist' '(' 'thread' ';' 'virtualise'? ';' ')' pSegSpace ':' pTypes '{' pKernelBody '}' '(' pHistOp (',' pHistOp)* ')' #SegHist
        ;
 
 // Futhark's SegBinOp: {neutrals}, shape, [commutative] lambda.
 pSegBinOp: '{' (pSubExp (',' pSubExp)*)? '}' ',' pExtShape? ',' pComm pLambda;
+
+// Futhark's HistOp: histShape, raceFactor, {dests}, {neutrals}, opShape, lambda.
+pHistOp: pExtShape ',' pSubExp ',' pHistDest ',' pHistNeutral ',' pExtShape? ',' pLambda;
+pHistDest: '{' (pSubExp (',' pSubExp)*)? '}';
+pHistNeutral: '{' (pSubExp (',' pSubExp)*)? '}';
 
 pSegPostOp: pLambda;
 

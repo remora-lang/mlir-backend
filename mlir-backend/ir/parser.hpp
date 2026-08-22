@@ -510,6 +510,9 @@ struct FutharkTranslationVisitor {
     if (auto *pSegScan = dynamic_cast<FutharkParser::SegScanContext *>(segop))
       return {
           ExpHostOp{HostOp{std::make_shared<SegOp>(VisitSegScan(pSegScan))}}};
+    if (auto *pSegHist = dynamic_cast<FutharkParser::SegHistContext *>(segop))
+      return {
+          ExpHostOp{HostOp{std::make_shared<SegOp>(VisitSegHist(pSegHist))}}};
     Undefined();
   }
 
@@ -549,6 +552,34 @@ struct FutharkTranslationVisitor {
       segscan.ops.push_back(VisitSegBinOp(op));
     segscan.post_op = VisitSegPostOp(ctx->pSegPostOp());
     return {segscan};
+  }
+
+  SegOp VisitSegHist(FutharkParser::SegHistContext *ctx) {
+    SegHist seghist;
+    seghist.lvl = SegThread{};
+    seghist.space = VisitSegSpace(ctx->pSegSpace());
+    for (auto t : ctx->pTypes()->pType())
+      seghist.ret.push_back(VisitType(t));
+    seghist.body = VisitKernelBody(ctx->pKernelBody());
+    for (auto op : ctx->pHistOp())
+      seghist.ops.push_back(VisitHistOp(op));
+    return {seghist};
+  }
+
+  HistOp VisitHistOp(FutharkParser::PHistOpContext *ctx) {
+    HistOp op;
+    // pExtShape[0] is the histogram shape; the optional pExtShape[1] is the
+    // operator shape (empty for a scalar operator).
+    op.shape = VisitExtShape(ctx->pExtShape(0));
+    op.raceFactor = VisitSubExp(ctx->pSubExp());
+    for (auto d : ctx->pHistDest()->pSubExp())
+      op.dest.push_back(std::get<VarSubExp>(VisitSubExp(d).v).v);
+    for (auto ne : ctx->pHistNeutral()->pSubExp())
+      op.neutral.push_back(VisitSubExp(ne));
+    if (ctx->pExtShape().size() > 1)
+      op.opShape = VisitExtShape(ctx->pExtShape(1)).dims;
+    op.lambda = VisitLambda(ctx->pLambda());
+    return op;
   }
 
   SegPostOp VisitSegPostOp(FutharkParser::PSegPostOpContext *ctx) {

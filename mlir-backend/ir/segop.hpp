@@ -34,6 +34,16 @@ struct SegPostOp {
   Lambda lambda;
 };
 
+struct HistOp {
+  Shape shape;
+  SubExp raceFactor;
+  std::vector<VName> dest;
+  std::vector<SubExp> neutral;
+  // See the Futhark source comment about opShape.
+  std::vector<SubExp> opShape;
+  Lambda lambda;
+};
+
 struct SegMap {
   SegLevel lvl;
   SegSpace space;
@@ -58,6 +68,14 @@ struct SegScan {
   SegPostOp post_op;
 };
 
+struct SegHist {
+  SegLevel lvl;
+  SegSpace space;
+  std::vector<Type> ret;
+  KernelBody body;
+  std::vector<HistOp> ops;
+};
+
 struct SegOp {
-  std::variant<SegMap, SegRed,SegScan> v;
+  std::variant<SegMap, SegRed,SegScan, SegHist> v;
 };
