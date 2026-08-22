@@ -2,18 +2,54 @@
 // src/Futhark/IR/GPU/Op.hs with rep SOAC
 #include "core.hpp"
 #include <memory>
+#include <optional>
 
 struct SegOp;
 struct Body;
 
 using Name = std::string;
 
-// Mirrors Futhark.IR.GPU.Sizes.SizeClass. Held as the raw printed name for now
-// (e.g. "thread_block_size"). TODO: model faithfully as a variant, if needed
-// (SizeThreshold/SizeGrid/SizeRegisters/...).
-struct SizeClass {
-  std::string name;
+// Mirrors Futhark.IR.GPU.Sizes.SizeClass.
+
+// Printed as `threshold(<def>, <path>)`, e.g. `threshold(32, )`. The path is
+// the sequence of threshold comparisons that led here; it is empty in all IR
+// we have seen, so we keep it as the raw printed text.
+struct SizeThreshold {
+  std::optional<int64_t> def;
+  std::string path;
 };
+
+struct SizeGrid {};
+struct SizeBlockSize {};
+struct SizeTile {};
+struct SizeRegTile {};
+struct SizeLocalMemory {};
+
+// A size that is not one of the above; we keep whatever name was printed.
+struct SizeBespoke {
+  Name name;
+};
+
+struct SizeClass {
+  std::variant<SizeThreshold, SizeGrid, SizeBlockSize, SizeTile, SizeRegTile,
+               SizeLocalMemory, SizeBespoke>
+      v;
+};
+
+// The names Futhark prints for the classes that carry no payload.
+inline SizeClass SizeClassFromName(const Name &name) {
+  if (name == "grid_size")
+    return {SizeGrid{}};
+  if (name == "thread_block_size")
+    return {SizeBlockSize{}};
+  if (name == "tile_size")
+    return {SizeTile{}};
+  if (name == "reg_tile_size")
+    return {SizeRegTile{}};
+  if (name == "shared_memory" || name == "local_memory")
+    return {SizeLocalMemory{}};
+  return {SizeBespoke{name}};
+}
 
 struct GetSize {
   Name name;

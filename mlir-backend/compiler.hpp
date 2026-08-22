@@ -289,6 +289,7 @@ struct FutharkCompiler {
           }
           return results;
         },
+        [&](const ExpLoop &) -> Values { Undefined(); },
         [&](const ExpIf &e) -> Values {
           return mlir::scf::IfOp::create(
                      builder,
@@ -705,20 +706,23 @@ struct FutharkCompiler {
           for (auto arr : val.arrs)
             operands.push_back(LowerSubExp(arr.name, ctx));
 
-          auto op1 = LowerSubExp(val.total, ctx);
-          operands.push_back(op1);
-
-          auto concat = mlir::tensor::ConcatOp::create(builder, 0, operands);
+          // `val.total` is the size of the concatenated dimension, which the
+          // result type already carries.
+          auto concat =
+              mlir::tensor::ConcatOp::create(builder, val.dim, operands);
           return concat->getResult(0);
         },
-        [&](const BasicOpFlatIndex &val) -> mlir::Value {
-          auto tensor = LowerSubExp(val.base, ctx);
+        [&](const BasicOpIndex &val) -> mlir::Value {
+          auto tensor = LowerSubExp(val.vName.name, ctx);
           std::vector<mlir::Value> indices;
-          for (auto idx : val.operands) {
-            auto i = LowerSubExp(idx, ctx);
-            auto casted = mlir::arith::IndexCastOp::create(
-                builder, builder.getIndexType(), i);
-            indices.push_back(casted);
+          for (const auto &dim : val.slice.dims) {
+            // TODO: lower slices, presumably to tensor.extract_slice.
+            auto *fix = std::get_if<DimFix<SubExp>>(&dim.v);
+            if (!fix)
+              Undefined();
+            auto i = LowerSubExp(fix->i, ctx);
+            indices.push_back(mlir::arith::IndexCastOp::create(
+                builder, builder.getIndexType(), i));
           }
 
           auto result =
@@ -880,7 +884,7 @@ struct FutharkCompiler {
         [](const BasicOpOpaque &) -> mlir::Value { Undefined(); },
         [](const BasicOpArrayVal &) -> mlir::Value { Undefined(); },
         [](const BasicOpUnOp &) -> mlir::Value { Undefined(); },
-        [](const BasicOpIndex &) -> mlir::Value { Undefined(); },
+        [](const BasicOpFlatIndex &) -> mlir::Value { Undefined(); },
         [](const BasicOpUpdate &) -> mlir::Value { Undefined(); },
         [](const BasicOpAssert &) -> mlir::Value { Undefined(); },
         [](const BasicOpFlatUpdate &) -> mlir::Value { Undefined(); },
@@ -933,6 +937,10 @@ struct FutharkCompiler {
   //    xs[gtid - c],
   // where c is a variable defined outside the kernel body.
   Values LowerSegMap(const SegMap &pSegMap, Ctx &ctx) {
+    // Block-level and in-block kernels describe a nested iteration space that
+    // a flat linalg.generic cannot express.
+    RequireThreadLevel(pSegMap.lvl);
+
     // This lowers a SegMap to a linalg.generic op, whose
     //   * iteration space corresponds to the SegMap's SegSpace;
     //   * inputs correspond to "affine reads" in the SegMap body.
@@ -1005,6 +1013,8 @@ struct FutharkCompiler {
 
   // TODO Same limitations as SegMap, probably.
   Values LowerSegRed(const SegRed &pSegRed, Ctx &ctx) {
+    RequireThreadLevel(pSegRed.lvl);
+
     if (pSegRed.ops.size() != 1) {
       Undefined();
     }
@@ -1109,6 +1119,8 @@ struct FutharkCompiler {
   }
 
   Values LowerSegHist(const SegHist &pSegHist, Ctx &ctx) {
+    RequireThreadLevel(pSegHist.lvl);
+
     IterationSpace iterSpace = LowerSegSpace(pSegHist.space, ctx);
 
     std::vector<AffineRead> affine_reads =
@@ -1167,6 +1179,7 @@ struct FutharkCompiler {
   // XXX: There seems to be bug in IREE forall and IREE code result in segfault.
   // (#24775)
   Values LowerSegScan(const SegScan &pSegScan, Ctx &ctx) {
+    RequireThreadLevel(pSegScan.lvl);
 
     if (pSegScan.ops.size() != 1)
       Undefined();
@@ -1413,6 +1426,12 @@ struct FutharkCompiler {
 
     return results;
   }
+
+  void RequireThreadLevel(const SegLevel &lvl) {
+    if (!std::holds_alternative<SegThread>(lvl))
+      Undefined();
+  }
+
   // Find SegOp iteration space.
   IterationSpace LowerSegSpace(const SegSpace &space, Ctx &ctx) {
     IterationSpace iterSpace;
@@ -1450,16 +1469,19 @@ struct FutharkCompiler {
                                          const IterationSpace &iterSpace) {
     auto rank = iterSpace.size();
     if (auto e = std::get_if<ExpBasicOp>(&exp.v)) {
-      if (auto idx = std::get_if<BasicOpFlatIndex>(&e->op.v)) {
-        auto vnArray = idx->base.GetVName();
+      if (auto idx = std::get_if<BasicOpIndex>(&e->op.v)) {
+        auto vnArray = idx->vName;
 
         std::vector<mlir::AffineExpr> usedDims;
-        for (auto operand : idx->operands) {
+        for (const auto &dim : idx->slice.dims) {
+          // TODO suport affine indexing beyond seg space ids
+          auto *fix = std::get_if<DimFix<SubExp>>(&dim.v);
+          if (!fix)
+            Undefined();
 
-          auto vnDim = operand.GetVName();
+          auto vnDim = fix->i.GetVName();
           auto d = std::ranges::find(iterSpace, vnDim.name, &Dim::id);
           if (d == iterSpace.end())
-            // TODO suport affine indexing beyond seg space ids
             Undefined();
           auto i = d->index;
 
@@ -1705,6 +1727,10 @@ struct FutharkCompiler {
         return f;
     }
 
-    Undefined();
+    // Futhark's intrinsics (sqrt32, exp32, log32, tanh32, ...) are applied
+    // without ever being defined in the IR; they need lowering to the math
+    // dialect.
+    throw std::runtime_error(
+        std::format("no definition of function '{}'", fname));
   }
 };

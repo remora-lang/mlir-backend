@@ -1,9 +1,19 @@
 #pragma once
 #include "syntax.hpp"
 
-struct SegThread {};
+// Futhark.IR.SegOp.SegVirt. `SegNoVirtFull` also names the sequentialised
+// dimensions; we do not model those.
+enum class SegVirt { NoVirt, Virt, NoVirtFull };
 
-struct SegBlock {};
+// The levels also carry a KernelGrid (block count and block size) in Futhark.
+// We never see one, because the IR is printed with --no-grid.
+struct SegThread {
+  SegVirt virt = SegVirt::NoVirt;
+};
+
+struct SegBlock {
+  SegVirt virt = SegVirt::NoVirt;
+};
 
 struct SegThreadInBlock {};
 

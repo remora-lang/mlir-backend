@@ -174,6 +174,8 @@ struct FutharkTranslationVisitor {
       return {VisitSizeOp(pSizeOp->pSizeOp())};
     if (auto *pIf = dynamic_cast<FutharkParser::ExpIfContext *>(ctx))
       return VisitExpIf(pIf);
+    if (auto *pLoop = dynamic_cast<FutharkParser::ExpLoopContext *>(ctx))
+      return VisitExpLoop(pLoop->pLoop());
     if (auto *pGpu = dynamic_cast<FutharkParser::ExpGpuBodyContext *>(ctx))
       return VisitExpGpuBody(pGpu);
     if (auto *pSubExp = dynamic_cast<FutharkParser::ExpSubExpContext *>(ctx))
@@ -183,12 +185,49 @@ struct FutharkTranslationVisitor {
 
   Exp VisitExpIf(FutharkParser::ExpIfContext *ctx) {
     ExpIf e;
+    if (auto *sort = ctx->MATCH_SORT())
+      e.sort =
+          sort->getText() == "<equiv>" ? MatchSort::Equiv : MatchSort::Fallback;
     e.cond = VisitSubExp(ctx->pSubExp());
     e.then_body = std::make_shared<Body>(VisitCaseBody(ctx->pCaseBody(0)));
     e.else_body = std::make_shared<Body>(VisitCaseBody(ctx->pCaseBody(1)));
     for (auto t : ctx->pTypes()->pType())
       e.retType.push_back(VisitType(t));
     return {e};
+  }
+
+  Exp VisitExpLoop(FutharkParser::PLoopContext *ctx) {
+    ExpLoop loop;
+    // The loop form has its own rule, so the bound of a `for` is not among
+    // these subexpressions: they are exactly the initial values.
+    auto params = ctx->pLoopParam();
+    auto inits = ctx->pSubExp();
+    if (params.size() != inits.size())
+      throw std::runtime_error("loop has a different number of parameters "
+                               "than initial values");
+    for (size_t i = 0; i < params.size(); i++) {
+      FParam param;
+      param.name = VisitId(params[i]->ID());
+      param.dec.v = VisitType(params[i]->pType());
+      loop.merge.push_back({param, VisitSubExp(inits[i])});
+    }
+    loop.form = VisitLoopForm(ctx->pLoopForm());
+    loop.body = std::make_shared<Body>(VisitCaseBody(ctx->pCaseBody()));
+    return {loop};
+  }
+
+  LoopForm VisitLoopForm(FutharkParser::PLoopFormContext *ctx) {
+    if (auto *pFor = dynamic_cast<FutharkParser::LoopForContext *>(ctx)) {
+      ForLoop forLoop;
+      forLoop.i = VName{VisitId(pFor->ID())};
+      forLoop.t = std::get<PrimTypeInt>(VisitPrimType(pFor->pPrimType()).v).t;
+      forLoop.bound = VisitSubExp(pFor->pSubExp());
+      return {forLoop};
+    }
+    if (auto *pWhile = dynamic_cast<FutharkParser::LoopWhileContext *>(ctx))
+      return {WhileLoop{VName{VisitId(pWhile->ID())}}};
+
+    Undefined();
   }
 
   Exp VisitExpGpuBody(FutharkParser::ExpGpuBodyContext *ctx) {
@@ -217,10 +256,36 @@ struct FutharkTranslationVisitor {
   }
 
   Exp VisitSizeOp(FutharkParser::PSizeOpContext *ctx) {
-    GetSize g;
-    g.name = VisitId(ctx->ID(0));
-    g.cls = SizeClass{VisitId(ctx->ID(1))};
-    return {ExpHostOp{HostOp{SizeOp{g}}}};
+    return {ExpHostOp{HostOp{VisitSizeOpInner(ctx)}}};
+  }
+
+  SizeOp VisitSizeOpInner(FutharkParser::PSizeOpContext *ctx) {
+    if (auto *pGet = dynamic_cast<FutharkParser::SizeOpGetSizeContext *>(ctx))
+      return {GetSize{VisitId(pGet->ID()), VisitSizeClass(pGet->pSizeClass())}};
+    if (auto *pMax =
+            dynamic_cast<FutharkParser::SizeOpGetSizeMaxContext *>(ctx))
+      return {GetSizeMax{VisitSizeClass(pMax->pSizeClass())}};
+    if (auto *pCmp = dynamic_cast<FutharkParser::SizeOpCmpSizeLeContext *>(ctx))
+      return {CmpSizeLe{VisitId(pCmp->ID()),
+                        VisitSizeClass(pCmp->pSizeClass()),
+                        VisitSubExp(pCmp->pSubExp())}};
+
+    Undefined();
+  }
+
+  SizeClass VisitSizeClass(FutharkParser::PSizeClassContext *ctx) {
+    if (auto *pThreshold =
+            dynamic_cast<FutharkParser::SizeClassThresholdContext *>(ctx)) {
+      SizeThreshold threshold;
+      if (auto *number = pThreshold->NUMBER())
+        threshold.def = std::stoll(number->getText());
+      return {threshold};
+    }
+    if (auto *pNamed =
+            dynamic_cast<FutharkParser::SizeClassNamedContext *>(ctx))
+      return SizeClassFromName(VisitId(pNamed->ID()));
+
+    Undefined();
   }
 
   // TODO: Parse diet and RetAls
@@ -256,9 +321,11 @@ struct FutharkTranslationVisitor {
     if (auto *pConcat =
             dynamic_cast<FutharkParser::BasicOpConcatContext *>(ctx))
       return {VisitBasicOpConcat(pConcat)};
-    if (auto *pFlatIndex =
-            dynamic_cast<FutharkParser::BasicOpFlatIndexContext *>(ctx))
-      return {VisitBasicOpFlatIndex(pFlatIndex)};
+    if (auto *pIndex = dynamic_cast<FutharkParser::BasicOpIndexContext *>(ctx))
+      return {VisitBasicOpIndex(pIndex)};
+    if (auto *pManifest =
+            dynamic_cast<FutharkParser::BasicOpManifestContext *>(ctx))
+      return {VisitBasicOpManifest(pManifest)};
     if (auto *pFlatIndex =
             dynamic_cast<FutharkParser::BasicOpReshapeContext *>(ctx))
       return {VisitBasicOpReshape(pFlatIndex)};
@@ -343,6 +410,13 @@ struct FutharkTranslationVisitor {
     auto it = std::find_if(str.begin(), str.end(), ::isdigit);
     size_t l = std::distance(str.begin(), it);
     std::string name = str.substr(0, l);
+
+    // The logical operators are the only ones without a width suffix.
+    if (name == "logand")
+      return {BinOpLogAnd{}};
+    if (name == "logor")
+      return {BinOpLogOr{}};
+
     int width = std::stoi(str.substr(l));
 
     IntType intTy = IntType::Int8;
@@ -359,60 +433,123 @@ struct FutharkTranslationVisitor {
       floatTy = FloatType::Float64;
     }
 
-    // TODO: Set width field
+    // `_nw` is Futhark's undefined-on-overflow arithmetic; it lowers the same
+    // way as the wrapping kind.
     if (name == "add")
-      return {BinOpAdd{intTy}};
-    if (name == "fadd")
-      return {BinOpFAdd{floatTy}};
+      return {BinOpAdd{intTy, OverflowWrap}};
+    if (name == "add_nw")
+      return {BinOpAdd{intTy, OverflowUndef}};
     if (name == "sub")
-      return {BinOpSub{intTy}};
-    if (name == "sdiv_up")
-      return {BinOpSDivUp{intTy}};
+      return {BinOpSub{intTy, OverflowWrap}};
+    if (name == "sub_nw")
+      return {BinOpSub{intTy, OverflowUndef}};
+    if (name == "mul")
+      return {BinOpMul{intTy, OverflowWrap}};
+    if (name == "mul_nw")
+      return {BinOpMul{intTy, OverflowUndef}};
+    if (name == "udiv")
+      return {BinOpUDiv{intTy}};
+    if (name == "udiv_up")
+      return {BinOpUDivUp{intTy}};
     if (name == "sdiv")
       return {BinOpSDiv{intTy}};
+    if (name == "sdiv_up")
+      return {BinOpSDivUp{intTy}};
+    if (name == "umod")
+      return {BinOpUMod{intTy}};
+    if (name == "smod")
+      return {BinOpSMod{intTy}};
+    if (name == "squot")
+      return {BinOpSQuot{intTy}};
+    if (name == "srem")
+      return {BinOpSRem{intTy}};
+    if (name == "smin")
+      return {BinOpSMin{intTy}};
+    if (name == "umin")
+      return {BinOpUMin{intTy}};
+    if (name == "smax")
+      return {BinOpSMax{intTy}};
+    if (name == "umax")
+      return {BinOpUMax{intTy}};
+    if (name == "shl")
+      return {BinOpShl{intTy}};
+    if (name == "lshr")
+      return {BinOpLShr{intTy}};
+    if (name == "ashr")
+      return {BinOpAShr{intTy}};
+    if (name == "and")
+      return {BinOpAnd{intTy}};
+    if (name == "or")
+      return {BinOpOr{intTy}};
+    if (name == "xor")
+      return {BinOpXor{intTy}};
+    if (name == "pow")
+      return {BinOpPow{intTy}};
+
+    if (name == "fadd")
+      return {BinOpFAdd{floatTy}};
     if (name == "fsub")
       return {BinOpFSub{floatTy}};
-    if (name == "mul")
-      return {BinOpMul{intTy}};
     if (name == "fmul")
       return {BinOpFMul{floatTy}};
-    // No-wrap integer arithmetic behaves like plain arithmetic here.
-    if (name == "add_nw")
-      return {BinOpAdd{intTy}};
-    if (name == "sub_nw")
-      return {BinOpSub{intTy}};
-    if (name == "mul_nw")
-      return {BinOpMul{intTy}};
+    if (name == "fdiv")
+      return {BinOpFDiv{floatTy}};
+    if (name == "fmod")
+      return {BinOpFMod{floatTy}};
+    if (name == "fmin")
+      return {BinOpFMin{floatTy}};
+    if (name == "fmax")
+      return {BinOpFMax{floatTy}};
+    if (name == "fpow")
+      return {BinOpFPow{floatTy}};
 
     Undefined();
   }
 
   BasicOpConcat VisitBasicOpConcat(FutharkParser::BasicOpConcatContext *ctx) {
-    if (ctx->pSubExp().size() != 3)
+    // `concat@d(w, x, y, ...)`: the dimension is part of the opcode, the first
+    // operand is that dimension's size in the result, and the rest are the
+    // arrays being concatenated.
+    auto subExps = ctx->pSubExp();
+    if (subExps.size() < 2)
       throw std::runtime_error("unrecognized concat format");
 
     BasicOpConcat concat;
-    auto constExp = std::get<ConstantSubExp>(VisitSubExp(ctx->pSubExp(0)).v).v;
-    concat.dim = std::get<Int64Value>(std::get<IntValue>(constExp.v).v).v;
-
-    auto vname = std::get<VarSubExp>(VisitSubExp(ctx->pSubExp(1)).v).v;
-    concat.arrs.push_back(vname);
-
-    concat.total = VisitSubExp(ctx->pSubExp(2));
+    auto opcode = ctx->CONCAT()->getText();
+    concat.dim = std::stoi(opcode.substr(opcode.find('@') + 1));
+    concat.total = VisitSubExp(subExps[0]);
+    for (size_t i = 1; i < subExps.size(); i++)
+      concat.arrs.push_back(VisitSubExp(subExps[i]).GetVName());
 
     return concat;
   }
 
-  BasicOpFlatIndex
-  VisitBasicOpFlatIndex(FutharkParser::BasicOpFlatIndexContext *ctx) {
-    BasicOpFlatIndex flatIndex{};
-    for (auto subexp : ctx->pSubExp()) {
-      flatIndex.operands.push_back(VisitSubExp(subexp));
-    }
+  BasicOpIndex VisitBasicOpIndex(FutharkParser::BasicOpIndexContext *ctx) {
+    BasicOpIndex index;
+    index.vName = VisitSubExp(ctx->pSubExp()).GetVName();
+    for (auto dim : ctx->pDimIndex())
+      index.slice.dims.push_back(VisitDimIndex(dim));
+    return index;
+  }
 
-    flatIndex.base = flatIndex.operands[0];
-    flatIndex.operands.erase(flatIndex.operands.begin());
-    return flatIndex;
+  DimIndex<SubExp> VisitDimIndex(FutharkParser::PDimIndexContext *ctx) {
+    if (auto *pSlice = dynamic_cast<FutharkParser::DimSliceContext *>(ctx))
+      return {DimSlice<SubExp>{VisitSubExp(pSlice->pSubExp(0)),
+                               VisitSubExp(pSlice->pSubExp(1)),
+                               VisitSubExp(pSlice->pSubExp(2))}};
+    if (auto *pFix = dynamic_cast<FutharkParser::DimFixContext *>(ctx))
+      return {DimFix<SubExp>{VisitSubExp(pFix->pSubExp())}};
+
+    Undefined();
+  }
+
+  BasicOpManifest
+  VisitBasicOpManifest(FutharkParser::BasicOpManifestContext *ctx) {
+    BasicOpManifest manifest;
+    manifest.arr = VisitSubExp(ctx->pSubExp()).GetVName();
+    for (auto number : ctx->NUMBER())
+      manifest.perm.push_back(std::stoi(number->getText()));
+    return manifest;
   }
 
   BasicOpReshape
@@ -472,14 +609,44 @@ struct FutharkTranslationVisitor {
   }
 
   BasicOpConvOp VisitBasicOpConvOp(FutharkParser::BasicOpConvContext *ctx) {
-    ConvOp op;
-    op.v = ConvOpSExt{
-        std::get<PrimTypeInt>(VisitPrimType(ctx->pConvOp()->pPrimType(0)).v).t,
-        std::get<PrimTypeInt>(VisitPrimType(ctx->pConvOp()->pPrimType(1)).v).t,
+    // All conversions print as `<opcode> <from> <x> to <to>`.
+    auto *conv = ctx->pConvOp();
+    auto opcode = conv->convOpcode()->getText();
+    auto from = VisitPrimType(conv->pPrimType(0));
+    auto to = VisitPrimType(conv->pPrimType(1));
+
+    auto asInt = [](const PrimType &t) { return std::get<PrimTypeInt>(t.v).t; };
+    auto asFloat = [](const PrimType &t) {
+      return std::get<PrimTypeFloat>(t.v).t;
     };
 
-    auto subExp = VisitSubExp(ctx->pConvOp()->pSubExp());
-    return {op, subExp};
+    ConvOp op;
+    if (opcode == "zext")
+      op.v = ConvOpZExt{asInt(from), asInt(to)};
+    else if (opcode == "sext")
+      op.v = ConvOpSExt{asInt(from), asInt(to)};
+    else if (opcode == "fpconv")
+      op.v = ConvOpFPConv{asFloat(from), asFloat(to)};
+    else if (opcode == "fptoui")
+      op.v = ConvOpFPToUI{asFloat(from), asInt(to)};
+    else if (opcode == "fptosi")
+      op.v = ConvOpFPToSI{asFloat(from), asInt(to)};
+    else if (opcode == "uitofp")
+      op.v = ConvOpUIToFP{asInt(from), asFloat(to)};
+    else if (opcode == "sitofp")
+      op.v = ConvOpSIToFP{asInt(from), asFloat(to)};
+    else if (opcode == "itob")
+      op.v = ConvOpIToB{asInt(from)};
+    else if (opcode == "btoi")
+      op.v = ConvOpBToI{asInt(to)};
+    else if (opcode == "ftob")
+      op.v = ConvOpFToB{asFloat(from)};
+    else if (opcode == "btof")
+      op.v = ConvOpBToF{asFloat(to)};
+    else
+      Undefined();
+
+    return {op, VisitSubExp(conv->pSubExp())};
   }
 
   Exp VisitExpSubExp(FutharkParser::ExpSubExpContext *ctx) {
@@ -516,10 +683,26 @@ struct FutharkTranslationVisitor {
     Undefined();
   }
 
+  SegLevel VisitSegLevel(FutharkParser::PSegLevelContext *ctx) {
+    if (auto *pThread =
+            dynamic_cast<FutharkParser::SegLevelThreadContext *>(ctx))
+      return {SegThread{VisitSegVirt(pThread->pSegVirt())}};
+    if (auto *pBlock = dynamic_cast<FutharkParser::SegLevelBlockContext *>(ctx))
+      return {SegBlock{VisitSegVirt(pBlock->pSegVirt())}};
+    if (dynamic_cast<FutharkParser::SegLevelThreadInBlockContext *>(ctx))
+      return {SegThreadInBlock{}};
+
+    Undefined();
+  }
+
+  SegVirt VisitSegVirt(FutharkParser::PSegVirtContext *ctx) {
+    return ctx->getText() == "virtualise" ? SegVirt::Virt : SegVirt::NoVirt;
+  }
+
   SegOp VisitSegMap(FutharkParser::SegMapContext *ctx) {
     SegMap segmap;
 
-    segmap.lvl = SegThread{};
+    segmap.lvl = VisitSegLevel(ctx->pSegLevel());
     segmap.space = VisitSegSpace(ctx->pSegSpace());
     for (auto t : ctx->pTypes()->pType()) {
       segmap.ret.push_back(VisitType(t));
@@ -531,7 +714,7 @@ struct FutharkTranslationVisitor {
 
   SegOp VisitSegRed(FutharkParser::SegRedContext *ctx) {
     SegRed segred;
-    segred.lvl = SegThread{};
+    segred.lvl = VisitSegLevel(ctx->pSegLevel());
     segred.space = VisitSegSpace(ctx->pSegSpace());
     for (auto t : ctx->pTypes()->pType())
       segred.ret.push_back(VisitType(t));
@@ -543,7 +726,7 @@ struct FutharkTranslationVisitor {
 
   SegOp VisitSegScan(FutharkParser::SegScanContext *ctx) {
     SegScan segscan;
-    segscan.lvl = SegThread{};
+    segscan.lvl = VisitSegLevel(ctx->pSegLevel());
     segscan.space = VisitSegSpace(ctx->pSegSpace());
     for (auto t : ctx->pTypes()->pType())
       segscan.ret.push_back(VisitType(t));
@@ -556,7 +739,7 @@ struct FutharkTranslationVisitor {
 
   SegOp VisitSegHist(FutharkParser::SegHistContext *ctx) {
     SegHist seghist;
-    seghist.lvl = SegThread{};
+    seghist.lvl = VisitSegLevel(ctx->pSegLevel());
     seghist.space = VisitSegSpace(ctx->pSegSpace());
     for (auto t : ctx->pTypes()->pType())
       seghist.ret.push_back(VisitType(t));

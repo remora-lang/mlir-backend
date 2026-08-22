@@ -106,15 +106,11 @@ struct BasicOpUpdate {
   SubExp val;
 };
 
+// `arr[offset; n1:s1, n2:s2]`. Distinct from BasicOpIndex, which is the
+// ordinary `arr[i, j]` and `arr[i :+ n * s]`.
 struct BasicOpFlatIndex {
-  /*
-VName vName;
-FlatSlice<SubExp> slice;
-*/
-
-  SubExp base;
-  // TODO: Use vName/slice instead
-  std::vector<SubExp> operands;
+  VName vName;
+  FlatSlice<SubExp> slice;
 };
 
 struct BasicOpFlatUpdate {
@@ -216,16 +212,43 @@ struct ExpHostOp {
   HostOp op;
 };
 
+// Futhark.IR.Syntax.MatchSort, printed between `if` and the condition:
+// nothing, `<fallback>` or `<equiv>`.
+enum class MatchSort { Normal, Fallback, Equiv };
+
 // NOTE: Futhark has a more general "Match".
 struct ExpIf {
   SubExp cond;
   std::shared_ptr<Body> then_body;
   std::shared_ptr<Body> else_body;
   std::vector<Type> retType;
+  MatchSort sort = MatchSort::Normal;
+};
+
+// Futhark.IR.Syntax.LoopForm.
+struct ForLoop {
+  VName i;
+  IntType t;
+  SubExp bound;
+};
+
+struct WhileLoop {
+  VName cond;
+};
+
+struct LoopForm {
+  std::variant<ForLoop, WhileLoop> v;
+};
+
+struct ExpLoop {
+  // Each merge parameter paired with its initial value.
+  std::vector<std::pair<FParam, SubExp>> merge;
+  LoopForm form;
+  std::shared_ptr<Body> body;
 };
 
 struct Exp {
-  std::variant<ExpBasicOp, ExpApply, ExpHostOp, ExpSubExp, ExpIf> v;
+  std::variant<ExpBasicOp, ExpApply, ExpHostOp, ExpSubExp, ExpIf, ExpLoop> v;
 };
 
 struct Stm {
