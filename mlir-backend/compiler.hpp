@@ -82,7 +82,7 @@ struct AffineRead {
 
 inline int64_t toShapeType(SubExp dim) {
   return match(
-      dim.v,
+      dim,
       [&](const ConstantSubExp &c) { return c.GetIntValue(); },
       [&](const VarSubExp &) { return mlir::ShapedType::kDynamic; });
 }
@@ -180,7 +180,7 @@ struct FutharkCompiler {
           mlir::SmallVector<int64_t> pos;
           for (const auto &d : arr->shape.dims)
             pos.push_back(match(
-                d.v,
+                d,
                 [&](const VarSubExp &) {
                   return argPosition.at(d.GetVName().name);
                 },
@@ -232,7 +232,7 @@ struct FutharkCompiler {
 
   Values LowerExp(const Exp &exp, Ctx &ctx) {
     return match(
-        exp.v,
+        exp,
         [&](const ExpBasicOp &e) { return Values{LowerBasicOp(e.op, ctx)}; },
         [&](const ExpSubExp &e) { return Values{LowerSubExp(e.subExp, ctx)}; },
         [&](const ExpHostOp &e) { return LowerHostOp(e.op, ctx); },
@@ -678,7 +678,7 @@ struct FutharkCompiler {
 
   mlir::Value LowerBasicOp(const BasicOp &basicOp, Ctx &ctx) {
     return match(
-        basicOp.v,
+        basicOp,
         [&](const BasicOpSubExp &val) { return LowerSubExp(val.subExp, ctx); },
         [&](const BasicOpArrayLit &val) { return LowerArrayLit(val, ctx); },
         [&](const BasicOpBinOp &val) {
@@ -723,7 +723,7 @@ struct FutharkCompiler {
           auto op0 = LowerSubExp(val.op0, ctx);
           auto convOp = val.op;
           return match(
-              convOp.v,
+              convOp,
               [&](const ConvOpZExt &zext) -> mlir::Value {
                 return mlir::arith::ExtUIOp::create(
                     builder,
@@ -847,10 +847,10 @@ struct FutharkCompiler {
           using enum mlir::arith::CmpIPredicate;
           using enum mlir::arith::CmpFPredicate;
           return match(
-              val.op.v,
+              val.op,
               [&](const CmpOpEq &eqOp) -> mlir::Value {
                 return match(
-                    eqOp.t.v,
+                    eqOp.t,
                     [&](const PrimTypeInt &) { return cmpi(eq); },
                     [&](const PrimTypeFloat &) -> mlir::Value {
                       return cmpf(OEQ);
@@ -895,7 +895,7 @@ struct FutharkCompiler {
 
   Values LowerHostOp(const HostOp &op, Ctx &ctx) {
     return match(
-        op.v,
+        op,
         [&](const SizeOp &v) { return Values{LowerSizeOp(v, ctx)}; },
         [&](const std::shared_ptr<SegOp> &v) { return LowerSegOp(v, ctx); },
         [&](const GPUBody &) -> Values { Undefined(); });
@@ -1416,7 +1416,7 @@ struct FutharkCompiler {
 
   mlir::Type LowerSegOpBaseType(const Type &pReturnType, Ctx &ctx) {
     return match(
-        pReturnType.t.v,
+        pReturnType.t,
         [&](const TypePrim<Shape, NoUniqueness> &val) {
           return LowerPrimType(val.t);
         },
@@ -1468,7 +1468,7 @@ struct FutharkCompiler {
 
   mlir::TypedAttr getPrimValueAttr(PrimValue value) {
     return match(
-        value.v,
+        value,
         [&](const IntValue &val) -> mlir::TypedAttr {
           return builder.getIntegerAttr(builder.getIntegerType(GetWidth(val)),
                                         GetValue(val));
