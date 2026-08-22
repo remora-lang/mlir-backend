@@ -64,9 +64,9 @@ pCaseBody: OPEN_BRACKET pStm* 'in' OPEN_BRACKET pSubExp (',' pSubExp)* CLOSE_BRA
 pSizeOp: 'get_size' '(' ID ',' ID ')';
 
 // This is specialised to a certain form of seg ops.
-pSegOp : 'segmap' '(' 'thread' ';' ';' ')' pSegSpace ':' pTypes '{' pKernelBody '}' #SegMap
-       | 'segred' '(' 'thread' ';' ';' ')' pSegSpace ':' pTypes '{' pKernelBody '}' '(' pSegBinOp (',' pSegBinOp)* ')' #SegRed
-       | 'segscan' '(' 'thread' ';' ';' ')' pSegSpace ':' pTypes '{' pKernelBody '}' '(' pSegBinOp (',' pSegBinOp)* ')' pSegPostOp #SegScan
+pSegOp : 'segmap' '(' 'thread' ';' 'virtualise'? ';' ')' pSegSpace ':' pTypes '{' pKernelBody '}' #SegMap
+       | 'segred' '(' 'thread' ';' 'virtualise'? ';' ')' pSegSpace ':' pTypes '{' pKernelBody '}' '(' pSegBinOp (',' pSegBinOp)* ')' #SegRed
+       | 'segscan' '(' 'thread' ';' 'virtualise'? ';' ')' pSegSpace ':' pTypes '{' pKernelBody '}' '(' pSegBinOp (',' pSegBinOp)* ')' pSegPostOp #SegScan
        ;
 
 // Futhark's SegBinOp: {neutrals}, shape, [commutative] lambda.
