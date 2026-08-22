@@ -787,9 +787,13 @@ struct FutharkCompiler {
           auto op = LowerSubExp(val.val, ctx);
           auto elementTy = op.getType();
 
+          // TODO dynamic replicate
           std::vector<int64_t> before;
           for (auto d : val.shape.dims)
-            before.push_back(d.GetIntValue());
+            before.push_back(match(
+                d,
+                [&](const ConstantSubExp &) { return d.GetIntValue(); },
+                [&](const VarSubExp &) -> int64_t { Undefined(); }));
 
           std::vector<int64_t> original;
           auto t = op.getType();
