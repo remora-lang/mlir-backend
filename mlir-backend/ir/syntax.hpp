@@ -13,19 +13,7 @@ enum class Rep {
   MCMem,
 };
 
-struct Exp;
-struct Stm;
 struct Body;
-struct Lambda;
-struct FunDef;
-struct Prog;
-struct SegOp;
-struct MCOp;
-struct MemInfoLet;
-struct MemInfoFParam;
-struct MemInfoLParam;
-struct FunReturnsMem;
-struct BodyReturnsMem;
 
 struct LetDec {
   Type v;
