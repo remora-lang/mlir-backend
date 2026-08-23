@@ -55,8 +55,14 @@ inline void PrintValue(const Env<std::string, mlir::Value> &env) {
   llvm::errs() << "}\n";
 }
 
+struct AccValue {
+  mlir::Value update;
+  mlir::Value index;
+};
+
 struct Ctx {
   Env<std::string, mlir::Value> subexps;
+  Env<std::string, AccValue> accs;
 };
 
 struct Dim {
@@ -88,6 +94,14 @@ inline int64_t toShapeType(SubExp dim) {
 inline bool IsUnitType(const Type &type) {
   auto *prim = std::get_if<TypePrim<Shape, NoUniqueness>>(&type.t.v);
   return prim && std::holds_alternative<PrimTypeUnit>(prim->t.v);
+}
+
+inline const TypeAcc<Shape, NoUniqueness> *GetAccType(const Type &type) {
+  return std::get_if<TypeAcc<Shape, NoUniqueness>>(&type.t.v);
+}
+
+inline bool IsAccType(const Type &type) {
+  return GetAccType(type) != nullptr;
 }
 
 template <typename R, typename V>
@@ -231,9 +245,28 @@ struct FutharkCompiler {
 
   void LowerStm(const Stm &stm, Ctx &ctx) {
     auto vs = LowerExp(stm.exp, ctx);
-    for (auto [elem, value] : llvm::zip_equal(stm.pat.elems, vs)) {
-      ctx.subexps.insert(elem.name.name, value);
+    size_t valueIndex = 0;
+    for (const auto &elem : stm.pat.elems) {
+      if (IsAccType(elem.dec.v)) {
+        assert(valueIndex + 2 <= vs.size());
+
+        ctx.accs.insert(elem.name.name,
+                        AccValue{
+                            vs[valueIndex],
+                            vs[valueIndex + 1],
+                        });
+
+        valueIndex += 2;
+      } else {
+        assert(valueIndex < vs.size());
+
+        ctx.subexps.insert(elem.name.name, vs[valueIndex]);
+
+        ++valueIndex;
+      }
     }
+
+    assert(valueIndex == vs.size());
   }
 
   Values LowerExp(const Exp &exp, Ctx &ctx) {
@@ -286,7 +319,9 @@ struct FutharkCompiler {
           return results;
         },
         [&](const ExpIf &e) -> Values { Undefined(); },
-        [&](const ExpWithAcc &e) -> Values { Undefined(); });
+        [&](const ExpWithAcc &e) {
+          return LowerWithAcc(e, ctx);
+      });
   }
 
   // Casts the type of `value` to `type` if they are compatible
@@ -343,6 +378,16 @@ struct FutharkCompiler {
         .getResults();
   }
 
+  Values LowerUpdateAcc(const BasicOpUpdateAcc &update, Ctx &ctx) {
+  assert(update.indices.size() == 1);
+  assert(update.values.size() == 1);
+
+  mlir::Value index = LowerSubExp(update.indices[0], ctx);
+  mlir::Value value = LowerSubExp(update.values[0], ctx);
+
+  return {value, index};
+}
+  
   Values LowerDotGeneral(mlir::ValueRange args, mlir::TypeRange retTypes,
                          Ctx &ctx) {
     // StableHLO dot_general
@@ -490,9 +535,6 @@ struct FutharkCompiler {
       return LowerSubExp(val->subExp, ctx);
     }
     
-    if (auto *val = std::get_if<BasicOpUpdateAcc>(&basicOp.v)) {
-      Undefined();
-     }
 
     if (auto *val = std::get_if<BasicOpBinOp>(&basicOp.v)) {
       auto op0 = LowerSubExp(val->op0, ctx);
