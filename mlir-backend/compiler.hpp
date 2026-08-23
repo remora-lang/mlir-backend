@@ -4,6 +4,7 @@
 #include "ir/segop.hpp"
 #include "ir/syntax.hpp"
 #include "iree/compiler/Dialect/Flow/IR/FlowOps.h"
+#include "iree/compiler/Dialect/LinalgExt/IR/LinalgExtOps.h"
 #include "blackbox.hpp"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/Matchers.h"
@@ -134,6 +135,7 @@ struct FutharkCompiler {
       : prog(prog), context(context), builder(builder) {
     context.getOrLoadDialect<mlir::linalg::LinalgDialect>();
     context.getOrLoadDialect<mlir::iree_compiler::IREE::Flow::FlowDialect>();
+    context.getOrLoadDialect<mlir::iree_compiler::IREE::LinalgExt::IREELinalgExtDialect>();
     context.getOrLoadDialect<mlir::tensor::TensorDialect>();
     context.getOrLoadDialect<mlir::scf::SCFDialect>();
     context.getOrLoadDialect<mlir::index::IndexDialect>();
@@ -272,7 +274,11 @@ struct FutharkCompiler {
   Values LowerExp(const Exp &exp, Ctx &ctx) {
     return match(
         exp.v,
-        [&](const ExpBasicOp &e) { return Values{LowerBasicOp(e.op, ctx)}; },
+        [&](const ExpBasicOp &e) -> Values {
+          if (auto *update = std::get_if<BasicOpUpdateAcc>(&e.op.v))
+            return LowerUpdateAcc(*update, ctx);
+          return {LowerBasicOp(e.op, ctx)};
+        },
         [&](const ExpSubExp &e) { return Values{LowerSubExp(e.subExp, ctx)}; },
         [&](const ExpHostOp &e) { return LowerHostOp(e.op, ctx); },
         [&](const ExpApply &e) -> Values {
@@ -319,9 +325,7 @@ struct FutharkCompiler {
           return results;
         },
         [&](const ExpIf &e) -> Values { Undefined(); },
-        [&](const ExpWithAcc &e) {
-          return LowerWithAcc(e, ctx);
-      });
+        [&](const ExpWithAcc &e) { return LowerWithAcc(e, ctx); });
   }
 
   // Casts the type of `value` to `type` if they are compatible
@@ -379,15 +383,68 @@ struct FutharkCompiler {
   }
 
   Values LowerUpdateAcc(const BasicOpUpdateAcc &update, Ctx &ctx) {
-  assert(update.indices.size() == 1);
-  assert(update.values.size() == 1);
+    assert(update.indices.size() == 1);
+    assert(update.values.size() == 1);
+    
+    mlir::Value index = LowerSubExp(update.indices[0], ctx);
+    mlir::Value value = LowerSubExp(update.values[0], ctx);
+    return {value, index};
+  }
 
-  mlir::Value index = LowerSubExp(update.indices[0], ctx);
-  mlir::Value value = LowerSubExp(update.values[0], ctx);
+  mlir::Value EmitScatter(mlir::Value update, mlir::Value index,
+                          mlir::Value original) {
+    namespace LinalgExt = mlir::iree_compiler::IREE::LinalgExt;
 
-  return {value, index};
-}
-  
+    auto originalType = mlir::dyn_cast<mlir::RankedTensorType>(original.getType());
+    if (!originalType)
+      Undefined();
+
+    llvm::SmallVector<int64_t> dimensionMap{0};
+    auto scatter = LinalgExt::ScatterOp::create(
+        builder,
+        mlir::TypeRange{originalType},
+        update,
+        index,
+        /*mask=*/mlir::Value(),
+        original,
+        dimensionMap,
+        /*unique_indices=*/false);
+
+    {
+      mlir::OpBuilder::InsertionGuard guard(builder);
+      mlir::Type elementType = originalType.getElementType();
+      mlir::SmallVector<mlir::Type> argumentTypes{elementType, elementType};
+      mlir::SmallVector<mlir::Location> argumentLocations(2, builder.getLoc());
+      mlir::Block *body = builder.createBlock(&scatter.getRegion(), {}, argumentTypes, argumentLocations);
+      builder.setInsertionPointToStart(body);
+      LinalgExt::YieldOp::create(builder, body->getArgument(0));
+    }
+
+    return scatter.getResult(0);
+  }
+
+  Values LowerWithAcc(const ExpWithAcc &withAcc, Ctx &ctx) {
+    assert(withAcc.inputs.size() == 1);
+    const WithAccInput &input = withAcc.inputs[0];
+    assert(input.arrays.size() == 1);
+    assert(!input.op.has_value());
+
+    const Lambda &lambda = *withAcc.lambda;
+    Ctx local = ctx;
+    for (const Stm &stm : lambda.body.stms)
+      LowerStm(stm, local);
+
+    assert(lambda.body.result.size() >= withAcc.inputs.size());
+    VName returnedAcc = lambda.body.result[0].GetVName();
+    AccValue acc = local.accs.lookup(returnedAcc.name);
+    mlir::Value original = ctx.subexps.lookup(input.arrays[0].name);
+
+    Values results{EmitScatter(acc.update, acc.index, original)};
+    for (size_t i = withAcc.inputs.size(); i < lambda.body.result.size(); ++i)
+      results.push_back(LowerSubExp(lambda.body.result[i], local));
+    return results;
+  }
+
   Values LowerDotGeneral(mlir::ValueRange args, mlir::TypeRange retTypes,
                          Ctx &ctx) {
     // StableHLO dot_general
@@ -798,11 +855,18 @@ struct FutharkCompiler {
     for (auto &read : affine_reads)
       inputs.push_back(ctx.subexps.lookup(read.array.name));
 
+    auto shapeTy = toShapeType(std::views::values(pSegMap.space.dims));
     mlir::SmallVector<mlir::Type> returnTypes;
-    for (auto ret : pSegMap.ret) {
-      auto baseTy = LowerSegOpBaseType(ret, ctx);
-      auto shapeTy = toShapeType(std::views::values(pSegMap.space.dims));
-      returnTypes.push_back(mlir::RankedTensorType::get(shapeTy, baseTy));
+    for (const Type &ret : pSegMap.ret) {
+      if (auto *acc = GetAccType(ret)) {
+        assert(acc->ispace.dims.size() == 1);
+        assert(acc->ts.size() == 1);
+        auto updateType = LowerSegOpBaseType(acc->ts[0], ctx);
+        returnTypes.push_back(mlir::RankedTensorType::get(shapeTy, updateType));
+        returnTypes.push_back(mlir::RankedTensorType::get(shapeTy, builder.getI64Type()));
+      } else {
+        returnTypes.push_back(mlir::RankedTensorType::get(shapeTy, LowerSegOpBaseType(ret, ctx)));
+      }
     }
     Values dynamicSizes;
     for (const auto &d : iterSpace) {
@@ -844,7 +908,7 @@ struct FutharkCompiler {
 
           Ctx local = ctx;
           Values results = LowerSegOpKernelBody(
-              loc, args, affine_reads, iterSpace, pSegMap.body, local);
+              loc, args, affine_reads, iterSpace, pSegMap.body, pSegMap.ret, local);
 
           assert(results.size() == outputs.size());
           mlir::linalg::YieldOp::create(builder, loc, results);
@@ -939,7 +1003,7 @@ struct FutharkCompiler {
 
           Ctx local = ctx;
           Values returns = LowerSegOpKernelBody(
-              loc, args, affine_reads, iterSpace, pSegRed.body, local);
+              loc, args, affine_reads, iterSpace, pSegRed.body, pSegRed.ret, local);
 
           // Bind accumulators and inputs to reduce op.
           auto accs = args.drop_front(inputs.size());
@@ -1291,7 +1355,9 @@ struct FutharkCompiler {
                               const mlir::ValueRange blockArgs,
                               const std::vector<AffineRead> &affine_reads,
                               const IterationSpace &iterSpace,
-                              const KernelBody &body, Ctx &ctx) {
+                              const KernelBody &body,
+                              const std::vector<Type> &resultTypes,
+                              Ctx &ctx) {
     std::unordered_set<std::string> skipLowering;
     for (auto &read : affine_reads)
       skipLowering.insert(read.result.name);
@@ -1317,8 +1383,15 @@ struct FutharkCompiler {
       LowerStm(stm, ctx);
     }
     Values returns;
-    for (auto &r : body.result)
-      returns.push_back(LowerSubExp(r.result, ctx));
+    for (auto [result, type] : llvm::zip_equal(body.result, resultTypes)) {
+      if (IsAccType(type)) {
+        AccValue acc = ctx.accs.lookup(result.result.GetVName().name);
+        returns.push_back(acc.update);
+        returns.push_back(acc.index);
+      } else {
+        returns.push_back(LowerSubExp(result.result, ctx));
+      }
+    }
 
     return returns;
   }
