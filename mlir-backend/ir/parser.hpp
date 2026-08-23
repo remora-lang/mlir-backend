@@ -65,7 +65,20 @@ struct FutharkTranslationVisitor {
                              VisitExtShape(pUnitArr->pExtShape()));
     if (dynamic_cast<FutharkParser::TypeUnitContext *>(ctx))
       return Type::CreatePrim(PrimType{PrimTypeUnit{}});
+    if (auto *pAcc = dynamic_cast<FutharkParser::TypeAccContext *>(ctx))
+      return VisitTypeAcc(pAcc);
     Undefined();
+  }
+
+  Type VisitTypeAcc(FutharkParser::TypeAccContext *ctx) {
+    // acc(cert, ispace, {ts}): the certificate name is not modelled; we keep
+    // the index-space shape and the element types the accumulator writes.
+    TypeAcc<Shape, NoUniqueness> acc;
+    acc.ispace = VisitExtShape(ctx->pExtShape());
+    for (auto t : ctx->pTypes()->pType())
+      acc.ts.push_back(VisitType(t));
+    acc.u = NoUniqueness{};
+    return Type{TypeBase<Shape, NoUniqueness>{acc}};
   }
 
   Type VisitTypePrim(FutharkParser::TypePrimContext *ctx) {
@@ -178,9 +191,34 @@ struct FutharkTranslationVisitor {
       return VisitExpLoop(pLoop->pLoop());
     if (auto *pGpu = dynamic_cast<FutharkParser::ExpGpuBodyContext *>(ctx))
       return VisitExpGpuBody(pGpu);
+    if (auto *pWithAcc = dynamic_cast<FutharkParser::ExpWithAccContext *>(ctx))
+      return VisitWithAcc(pWithAcc->pWithAcc());
     if (auto *pSubExp = dynamic_cast<FutharkParser::ExpSubExpContext *>(ctx))
       return {VisitExpSubExp(pSubExp)};
     Undefined();
+  }
+
+  Exp VisitWithAcc(FutharkParser::PWithAccContext *ctx) {
+    ExpWithAcc e;
+    for (auto in : ctx->pWithAccInput())
+      e.inputs.push_back(VisitWithAccInput(in));
+    e.lambda = std::make_shared<Lambda>(VisitLambda(ctx->pLambda()));
+    return {e};
+  }
+
+  WithAccInput VisitWithAccInput(FutharkParser::PWithAccInputContext *ctx) {
+    WithAccInput in;
+    in.shape = VisitExtShape(ctx->pExtShape());
+    for (auto se : ctx->pSubExpList()->pSubExp())
+      in.arrays.push_back(VisitSubExp(se).GetVName());
+    if (auto *op = ctx->pWithAccOp()) {
+      std::vector<SubExp> nes;
+      for (auto se : op->pSubExpList()->pSubExp())
+        nes.push_back(VisitSubExp(se));
+      in.combiningFunction = std::make_pair(
+          std::make_shared<Lambda>(VisitLambda(op->pLambda())), nes);
+    }
+    return in;
   }
 
   Exp VisitExpIf(FutharkParser::ExpIfContext *ctx) {
@@ -346,8 +384,27 @@ struct FutharkTranslationVisitor {
     }
     if (dynamic_cast<FutharkParser::BasicOpAssertContext *>(ctx))
       return {BasicOpAssert{}};
+    if (auto *pUpdateAcc =
+            dynamic_cast<FutharkParser::BasicOpUpdateAccContext *>(ctx))
+      return {VisitBasicOpUpdateAcc(pUpdateAcc)};
 
     Undefined();
+  }
+
+  BasicOpUpdateAcc
+  VisitBasicOpUpdateAcc(FutharkParser::BasicOpUpdateAccContext *ctx) {
+    // update_acc(acc, {indices}, {values}); the `_unsafe` spelling skips the
+    // out-of-bounds check.
+    BasicOpUpdateAcc op;
+    op.safety =
+        ctx->getStart()->getText() == "update_acc_unsafe" ? Unsafe : Safe;
+    op.acc = VisitSubExp(ctx->pSubExp()).GetVName();
+    auto lists = ctx->pSubExpList();
+    for (auto se : lists[0]->pSubExp())
+      op.indices.push_back(VisitSubExp(se));
+    for (auto se : lists[1]->pSubExp())
+      op.values.push_back(VisitSubExp(se));
+    return op;
   }
 
   CmpOp VisitCmpOp(FutharkParser::PCmpOpContext *ctx) {
@@ -841,8 +898,7 @@ struct FutharkTranslationVisitor {
     if (auto *pSpecial =
             dynamic_cast<FutharkParser::PrimValueFloatSpecialContext *>(ctx))
       return {VisitPrimValueFloatSpecial(pSpecial)};
-    if (auto *pBool =
-            dynamic_cast<FutharkParser::PrimValueBoolContext *>(ctx))
+    if (auto *pBool = dynamic_cast<FutharkParser::PrimValueBoolContext *>(ctx))
       return {BoolValue{pBool->getText() == "true"}};
 
     Undefined();

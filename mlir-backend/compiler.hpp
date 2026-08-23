@@ -290,6 +290,20 @@ struct FutharkCompiler {
           return results;
         },
         [&](const ExpLoop &) -> Values { Undefined(); },
+        [&](const ExpWithAcc &e) -> Values {
+          if (e.inputs.size() != 1)
+            Undefined();
+          auto withAccInput = e.inputs[0];
+          if (withAccInput.combiningFunction)
+            Undefined();
+
+          auto shape = LowerShape(withAccInput.shape); // FIX used for what?
+          Values arrays;
+          for (const auto &a : withAccInput.arrays)
+            arrays.push_back(LowerSubExp(a.name, ctx));
+
+          Undefined();
+        },
         [&](const ExpIf &e) -> Values {
           return mlir::scf::IfOp::create(
                      builder,
@@ -888,7 +902,8 @@ struct FutharkCompiler {
         [](const BasicOpUpdate &) -> mlir::Value { Undefined(); },
         [](const BasicOpAssert &) -> mlir::Value { Undefined(); },
         [](const BasicOpFlatUpdate &) -> mlir::Value { Undefined(); },
-        [](const BasicOpManifest &) -> mlir::Value { Undefined(); });
+        [](const BasicOpManifest &) -> mlir::Value { Undefined(); },
+        [](const BasicOpUpdateAcc &) -> mlir::Value { Undefined(); });
   }
 
   mlir::Value LowerSubExp(SubExp subExp, Ctx &ctx) {

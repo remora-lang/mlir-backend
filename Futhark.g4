@@ -27,7 +27,8 @@ pRetTypes: '{' pType* (',' pType)* '}';
 pType: pExtShape pPrimType pAlias? #TypeShape
     | pPrimType pAlias? #TypePrim
     | pExtShape 'unit' pAlias? #TypeUnitArray
-    | 'unit' #TypeUnit;
+    | 'unit' #TypeUnit
+    | '*'? 'acc' '(' ID ',' pExtShape ',' pTypes ')' pAlias? #TypeAcc;
 
 pAlias: '#' '(' pAliasSet (',' pAliasSet)* ')';
 pAliasSet: '[' (NUMBER (',' NUMBER)*)? ']';
@@ -55,7 +56,14 @@ pExp: pApply #ExpApply
     | pLoop #ExpLoop
     | 'if' MATCH_SORT? pSubExp 'then' pCaseBody 'else' pCaseBody ':' pTypes #ExpIf
     | 'gpu' ':' pTypes pCaseBody #ExpGpuBody
+    | pWithAcc #ExpWithAcc
     | pSubExp #ExpSubExp;
+
+pWithAcc: 'with_acc' '(' '{' pWithAccInput (',' pWithAccInput)* '}' ',' pLambda ')';
+pWithAccInput: '(' pExtShape ',' pSubExpList pWithAccOp? ')';
+pWithAccOp: ',' '(' pLambda ',' pSubExpList ')';
+
+pSubExpList: '{' (pSubExp (',' pSubExp)*)? '}';
 
 // The loop parameters, their initial values, the loop form and the body:
 //   loop {acc : f32} = {x} for i:i64 < n do { stms in {res} }
@@ -140,6 +148,7 @@ pBasicOp: 'replicate' '(' pExtShape ',' pSubExp ')' #BasicOpReplicate
     | 'assert' '(' pSubExp ',' '{' pErrPart (',' pErrPart)* '}' ')' #BasicOpAssert
     | 'scratch' '(' pPrimType (',' pSubExp)* ')' #BasicOpScratch
     | 'manifest' '(' pSubExp ',' '(' NUMBER (',' NUMBER)* ')' ')' #BasicOpManifest
+    | ('update_acc' | 'update_acc_unsafe') '(' pSubExp ',' pSubExpList ',' pSubExpList ')' #BasicOpUpdateAcc
     ;
 
 pDimIndex: pSubExp COLON_PLUS pSubExp '*' pSubExp #DimSlice

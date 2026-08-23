@@ -14,6 +14,7 @@ enum class Rep {
 };
 
 struct Body;
+struct Lambda;
 
 struct LetDec {
   Type v;
@@ -176,7 +177,7 @@ struct BasicOp {
                BasicOpAssert, BasicOpIndex, BasicOpUpdate, BasicOpFlatIndex,
                BasicOpFlatUpdate, BasicOpConcat, BasicOpManifest, BasicOpIota,
                BasicOpReplicate, BasicOpScratch, BasicOpReshape,
-               BasicOpRearrange>
+               BasicOpRearrange, BasicOpUpdateAcc>
       v;
 };
 
@@ -247,8 +248,22 @@ struct ExpLoop {
   std::shared_ptr<Body> body;
 };
 
+struct WithAccInput {
+  Shape shape;
+  std::vector<VName> arrays;
+  std::optional<std::pair<std::shared_ptr<Lambda>, std::vector<SubExp>>>
+      combiningFunction;
+};
+
+struct ExpWithAcc {
+  std::vector<WithAccInput> inputs;
+  std::shared_ptr<Lambda> lambda;
+};
+
 struct Exp {
-  std::variant<ExpBasicOp, ExpApply, ExpHostOp, ExpSubExp, ExpIf, ExpLoop> v;
+  std::variant<ExpBasicOp, ExpApply, ExpHostOp, ExpSubExp, ExpIf, ExpLoop,
+               ExpWithAcc>
+      v;
 };
 
 struct Stm {
