@@ -39,7 +39,7 @@ pExtShape: ('[' pSubExp* ']')+;
 pBody: pStm* 'in' OPEN_BRACKET pSubExp (',' pSubExp)* CLOSE_BRACKET #Body
     | OPEN_BRACKET pSubExp (',' pSubExp)* CLOSE_BRACKET #EmptyBody;
 
-pStm: 'let' pPat '=' pCerts? pExp;
+pStm: 'let' pPat '=' pAttr* pCerts? pExp;
 
 pCerts: '#' '{' (ID (',' ID)*)? '}';
 
