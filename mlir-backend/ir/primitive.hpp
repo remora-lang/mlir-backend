@@ -97,7 +97,7 @@ struct PrimType {
       t = FloatType::Float32;
       break;
     case 64:
-      t = FloatType::Float16;
+      t = FloatType::Float64;
       break;
     }
 
@@ -324,6 +324,11 @@ struct BinOpUDiv {
   Safety s;
 };
 
+struct BinOpUDivUp {
+  IntType t;
+  Safety s;
+};
+
 struct BinOpSDiv {
   IntType t;
   Safety s;
@@ -415,17 +420,16 @@ struct BinOpPow {
 };
 
 struct BinOpFPow {
-  IntType t;
+  FloatType t;
 };
 
 struct BinOpLogAnd {};
 
 struct BinOpLogOr {};
 
-// TODO: Implement rest of operators
 struct BinOp {
   std::variant<BinOpAdd, BinOpFAdd, BinOpSub, BinOpFSub, BinOpMul, BinOpFMul,
-               BinOpUDiv, BinOpUDiv, BinOpSDiv, BinOpSDivUp, BinOpFDiv,
+               BinOpUDiv, BinOpUDivUp, BinOpSDiv, BinOpSDivUp, BinOpFDiv,
                BinOpFMod, BinOpUMod, BinOpSMod, BinOpSQuot, BinOpSRem,
                BinOpSMin, BinOpUMin, BinOpFMin, BinOpSMax, BinOpUMax, BinOpFMax,
                BinOpShl, BinOpLShr, BinOpAShr, BinOpAnd, BinOpOr, BinOpXor,
@@ -480,7 +484,52 @@ struct ConvOpSExt {
   IntType to;
 };
 
-// TODO: Rest of ConvOp operators
+struct ConvOpFPConv {
+  FloatType from;
+  FloatType to;
+};
+
+struct ConvOpFPToUI {
+  FloatType from;
+  IntType to;
+};
+
+struct ConvOpFPToSI {
+  FloatType from;
+  IntType to;
+};
+
+struct ConvOpUIToFP {
+  IntType from;
+  FloatType to;
+};
+
+struct ConvOpSIToFP {
+  IntType from;
+  FloatType to;
+};
+
+// The remaining conversions always have `bool` on one side, so only the
+// other side is recorded.
+struct ConvOpIToB {
+  IntType from;
+};
+
+struct ConvOpBToI {
+  IntType to;
+};
+
+struct ConvOpFToB {
+  FloatType from;
+};
+
+struct ConvOpBToF {
+  FloatType to;
+};
+
 struct ConvOp {
-  std::variant<ConvOpZExt, ConvOpSExt> v;
+  std::variant<ConvOpZExt, ConvOpSExt, ConvOpFPConv, ConvOpFPToUI, ConvOpFPToSI,
+               ConvOpUIToFP, ConvOpSIToFP, ConvOpIToB, ConvOpBToI, ConvOpFToB,
+               ConvOpBToF>
+      v;
 };

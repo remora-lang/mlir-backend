@@ -40,7 +40,7 @@ pExtShape: ('[' pSubExp* ']')+;
 pBody: pStm* 'in' OPEN_BRACKET pSubExp (',' pSubExp)* CLOSE_BRACKET #Body
     | OPEN_BRACKET pSubExp (',' pSubExp)* CLOSE_BRACKET #EmptyBody;
 
-pStm: 'let' pPat '=' pCerts? pExp;
+pStm: 'let' pPat '=' pAttr* pCerts? pExp;
 
 pCerts: '#' '{' (ID (',' ID)*)? '}';
 
@@ -53,17 +53,37 @@ pExp: pApply #ExpApply
     | pBasicOp #ExpBasicOp
     | pSegOp #ExpSegOp
     | pSizeOp #ExpSizeOp
-    | 'if' pSubExp 'then' pCaseBody 'else' pCaseBody ':' pTypes #ExpIf
+    | pLoop #ExpLoop
+    | 'if' MATCH_SORT? pSubExp 'then' pCaseBody 'else' pCaseBody ':' pTypes #ExpIf
     | 'gpu' ':' pTypes pCaseBody #ExpGpuBody
     | pWithAcc #ExpWithAcc
     | pSubExp #ExpSubExp;
+
+// The loop parameters, their initial values, the loop form and the body:
+//   loop {acc : f32} = {x} for i:i64 < n do { stms in {res} }
+//   loop {c : bool, y : i32} = {c0, y0} while c do { stms in {res} }
+pLoop: 'loop' OPEN_BRACKET pLoopParam? (',' pLoopParam)* CLOSE_BRACKET
+       '=' OPEN_BRACKET pSubExp? (',' pSubExp)* CLOSE_BRACKET
+       pLoopForm 'do' pCaseBody;
+
+pLoopParam: ID ':' pType;
+
+pLoopForm: 'for' ID ':' pPrimType '<' pSubExp #LoopFor
+         | 'while' ID #LoopWhile;
 
 // A branch/kernel body delimited by braces, as printed for `if` arms and
 // `gpu` bodies: either `{ stms in {results} }` or just `{ results }`.
 pCaseBody: OPEN_BRACKET pStm* 'in' OPEN_BRACKET pSubExp (',' pSubExp)* CLOSE_BRACKET CLOSE_BRACKET #CaseBodyFull
          | OPEN_BRACKET pSubExp (',' pSubExp)* CLOSE_BRACKET #CaseBodyResult;
 
-pSizeOp: 'get_size' '(' ID ',' ID ')';
+pSizeOp: 'get_size' '(' ID ',' pSizeClass ')' #SizeOpGetSize
+       | 'get_size_max' '(' pSizeClass ')' #SizeOpGetSizeMax
+       | 'cmp_size' '(' ID ',' pSizeClass ')' '<' '=' pSubExp #SizeOpCmpSizeLe;
+
+// Either `threshold(<default>, <path>)` or the bare name of a class that
+// carries no payload, e.g. `thread_block_size`. TODO: support path.
+pSizeClass: 'threshold' '(' NUMBER? ',' ')' #SizeClassThreshold
+          | ID #SizeClassNamed;
 
 pWithAcc: 'with_acc' '(' '{' pWithAccInput (',' pWithAccInput)* '}' ',' pLambda ')';
 
@@ -72,13 +92,27 @@ pWithAccInput: '(' pExtShape ',' '{' ID (',' ID)* '}' (',' pWithAccOp)? ')';
 pWithAccOp: '(' pLambda ',' '{' (pSubExp (',' pSubExp)*)? '}' ')';
 
 // This is specialised to a certain form of seg ops.
-pSegOp : 'segmap' '(' 'thread' ';' ';' ')' pSegSpace ':' pTypes '{' pKernelBody '}' #SegMap
-       | 'segred' '(' 'thread' ';' ';' ')' pSegSpace ':' pTypes '{' pKernelBody '}' '(' pSegBinOp (',' pSegBinOp)* ')' #SegRed
-       | 'segscan' '(' 'thread' ';' ';' ')' pSegSpace ':' pTypes '{' pKernelBody '}' '(' pSegBinOp (',' pSegBinOp)* ')' pSegPostOp #SegScan
+pSegOp : 'segmap' '(' pSegLevel ')' pSegSpace ':' pTypes '{' pKernelBody '}' #SegMap
+       | 'segred' '(' pSegLevel ')' pSegSpace ':' pTypes '{' pKernelBody '}' '(' pSegBinOp (',' pSegBinOp)* ')' #SegRed
+       | 'segscan' '(' pSegLevel ')' pSegSpace ':' pTypes '{' pKernelBody '}' '(' pSegBinOp (',' pSegBinOp)* ')' pSegPostOp #SegScan
+       | 'seghist' '(' pSegLevel ')' pSegSpace ':' pTypes '{' pKernelBody '}' '(' pHistOp (',' pHistOp)* ')' #SegHist
        ;
+
+// `thread; <virt>; `, `block; <virt>; ` or `inblock; `. We assume no grid
+// information (via --no-grid passed to the Futhark compiler).
+pSegLevel: 'thread' ';' pSegVirt ';' #SegLevelThread
+         | 'block' ';' pSegVirt ';' #SegLevelBlock
+         | 'inblock' ';' #SegLevelThreadInBlock;
+
+pSegVirt: 'virtualise'?;
 
 // Futhark's SegBinOp: {neutrals}, shape, [commutative] lambda.
 pSegBinOp: '{' (pSubExp (',' pSubExp)*)? '}' ',' pExtShape? ',' pComm pLambda;
+
+// Futhark's HistOp: histShape, raceFactor, {dests}, {neutrals}, opShape, lambda.
+pHistOp: pExtShape ',' pSubExp ',' pHistDest ',' pHistNeutral ',' pExtShape? ',' pLambda;
+pHistDest: '{' (pSubExp (',' pSubExp)*)? '}';
+pHistNeutral: '{' (pSubExp (',' pSubExp)*)? '}';
 
 pSegPostOp: pLambda;
 
@@ -103,8 +137,8 @@ pArrayLit: '[' pSubExp (',' pSubExp)* ']';
 // https://hackage-content.haskell.org/package/futhark-0.25.34/docs/Futhark-IR-Syntax.html#t:BasicOp
 pBasicOp: 'replicate' '(' pExtShape ',' pSubExp ')' #BasicOpReplicate
     | pArrayLit ':' pType #BasicOpArrayLit
-    | pSubExp '[' pSubExp (',' pSubExp)* ']' #BasicOpFlatIndex
-    | CONCAT '(' pSubExp ',' pSubExp ',' pSubExp ')' #BasicOpConcat
+    | pSubExp '[' pDimIndex (',' pDimIndex)* ']' #BasicOpIndex
+    | CONCAT '(' pSubExp (',' pSubExp)* ')' #BasicOpConcat
     | IOTA '(' pSubExp ',' pSubExp ',' pSubExp ')' #BasicOpIota
     | pBinOp #BasicOpBinary
     | pCmpOp #BasicOpCmp
@@ -114,7 +148,11 @@ pBasicOp: 'replicate' '(' pExtShape ',' pSubExp ')' #BasicOpReplicate
     | 'assert' '(' pSubExp ',' '{' pErrPart (',' pErrPart)* '}' ')' #BasicOpAssert
     | 'scratch' '(' pPrimType (',' pSubExp)* ')' #BasicOpScratch
     | 'update_acc' '(' ID ',' '{' pSubExp '}' ',' '{' pSubExp '}' ')' #BasicOpUpdateAcc
+    | 'manifest' '(' pSubExp ',' '(' NUMBER (',' NUMBER)* ')' ')' #BasicOpManifest
     ;
+
+pDimIndex: pSubExp COLON_PLUS pSubExp '*' pSubExp #DimSlice
+         | pSubExp #DimFix;
 
 // An interpolated assertion error message: literal chunks interleaved with
 // typed subexpressions, e.g. {"a[", i : i64, "]"}.
@@ -124,17 +162,21 @@ pBinOp: binaryOpcode LPARAM pSubExp ',' pSubExp RPARAM;
 
 pCmpOp: cmpOpcode LPARAM pSubExp ',' pSubExp RPARAM;
 
-cmpOpcode: CMPEQ | CMPSLT | CMPSLE | CMPULT | CMPULE;
+cmpOpcode: CMPEQ | CMPSLT | CMPSLE | CMPULT | CMPULE | CMPFLT | CMPFLE;
 
 binaryOpcode: ADD | ADDNW | FADD | SUB | SUBNW | FSUB | MUL | MULNW | FMUL | UDIV | UDIVUP | SDIV | SDIVUP | FDIV | FMOD | UMOD | SMOD | SQUOT | SREM | SMIN | UMIN | FMIN | SMAX | UMAX | FMAX | SHL | LSHR | ASHR | AND | OR | XOR | POW | FPOW | LOGAND | LOGOR;
 
-pConvOp: 'sext' pPrimType pSubExp 'to' pPrimType;
+pConvOp: convOpcode pPrimType pSubExp 'to' pPrimType;
+
+convOpcode: 'zext' | 'sext' | 'fpconv' | 'fptoui' | 'fptosi' | 'uitofp'
+          | 'sitofp' | 'itob' | 'btoi' | 'ftob' | 'btof';
 
 pSubExp: pPrimValue #ConstantSubExpression
     | ID #VarSubExp;
 
 pPrimValue: NUMBER INTEGER_TYPE #PrimValueInteger
     | FLOAT FLOAT_TYPE #PrimValueFloat
+    | SPECIAL_FLOAT #PrimValueFloatSpecial
     | ('true' | 'false') #PrimValueBool;
 
 pPrimType: INTEGER_TYPE #PrimTypeInteger
@@ -144,7 +186,12 @@ pPrimType: INTEGER_TYPE #PrimTypeInteger
 INTEGER_TYPE: 'i8' | 'i16' | 'i32' | 'i64';
 FLOAT_TYPE: 'f16' | 'f32' | 'f64';
 
-NUMBER: ([0-9]+) | ('0x' ([a-fA-F0-9])+);
+// Special float literals, printed type-first with an optional sign, matching
+// Futhark's `Pretty FloatValue`: `f32.inf`, `-f32.inf`, `f32.nan`.
+// Declared before ID so it wins the maximal-munch tie against an identifier.
+SPECIAL_FLOAT: '-'? ('f16' | 'f32' | 'f64') '.' ('inf' | 'nan');
+
+NUMBER: '-'? (([0-9]+) | ('0x' ([a-fA-F0-9])+));
 
 // Binary operators
 IOTA: 'iota' NUMBER;
@@ -183,8 +230,8 @@ OR: 'or' NUMBER;
 XOR: 'xor' NUMBER;
 POW: 'pow' NUMBER;
 FPOW: 'fpow' NUMBER;
-LOGAND: 'logand' NUMBER;
-LOGOR: 'logor' NUMBER;
+LOGAND: 'logand';
+LOGOR: 'logor';
 
 // Comparison operators. eq_ carries a type name (eq_i64, eq_f32, eq_bool);
 // the ordered comparisons carry a bit width.
@@ -193,13 +240,21 @@ CMPSLT: 'slt' NUMBER;
 CMPSLE: 'sle' NUMBER;
 CMPULT: 'ult' NUMBER;
 CMPULE: 'ule' NUMBER;
+// Ordered float comparisons carry a bit width: lt32, le64, ...
+CMPFLT: 'lt' NUMBER;
+CMPFLE: 'le' NUMBER;
 
-FLOAT   : (DIGIT+ '.' DIGIT+) ;
+FLOAT   : '-'? (DIGIT+ '.' DIGIT+) ([eE][+-]?DIGIT+)? ;
 fragment DIGIT  : [0-9];
 
 STRING_LITERAL: '"' ( '\\' . | ~["\\] )* '"';
 
 OPAQUE: '*'? 'opaque';
+
+MATCH_SORT: '<' ('equiv' | 'fallback') '>';
+
+// The separator in a slice: `start :+ n * stride`.
+COLON_PLUS: ':+';
 
 ID : ( [a-zA-Z_+'-'*/%!<>|&^.] ) ([a-zA-Z0-9_+\-*/%!<>|&^.₀-₉])*;
 

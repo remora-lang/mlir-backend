@@ -1,19 +1,11 @@
-﻿#include "antlr4-runtime.h"
-#include "generated/FutharkLexer.h"
-#include "generated/FutharkParser.h"
-
-#include <variant>
-#include <string>
-#include <cstdint>
-#include <optional>
-#include <stdexcept>
-#include <filesystem>
-
-#include "ir/core.hpp"
-#include "ir/syntax.hpp"
+﻿#include "compiler.hpp"
 #include "ir/parser.hpp"
-#include "compiler.hpp"
+#include "ir/syntax.hpp"
+#include "mlir/IR/Verifier.h"
+#include "llvm/Support/SourceMgr.h"
 #include <config.h>
+#include <filesystem>
+#include <string>
 
 int main(int argc, char *argv[]) {
   std::filesystem::path base = PROJECT_ROOT_DIR;
@@ -32,6 +24,8 @@ int main(int argc, char *argv[]) {
 
   auto prog = ParseFuthark(file);
   mlir::MLIRContext ctx;
+  llvm::SourceMgr sourceMgr;
+  mlir::SourceMgrDiagnosticHandler diagHandler(sourceMgr, &ctx);
   mlir::ImplicitLocOpBuilder builder(mlir::UnknownLoc::get(&ctx), &ctx);
   FutharkCompiler compiler(prog, ctx, builder);
   for (auto fun : prog.funs) {
@@ -39,5 +33,6 @@ int main(int argc, char *argv[]) {
   }
 
   compiler.module.print(llvm::outs());
-  return 0;
+
+  return mlir::failed(mlir::verify(compiler.module));
 }
