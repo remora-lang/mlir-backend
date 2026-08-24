@@ -241,3 +241,5 @@ tests/*
 # Links to source code set up by nix flake.
 third-party/stablehlo-src
 third-party/mlir-src
+
+result
