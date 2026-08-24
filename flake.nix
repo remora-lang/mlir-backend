@@ -25,8 +25,13 @@
       inherit pkgs iree;
       src = ./.;
     };
+
+    ireeToolsFor = pkgs: import ./nix/iree-tools.nix { inherit pkgs iree; };
   in {
-    packages = forAllSystems (pkgs: { default = packageFor pkgs; });
+    packages = forAllSystems (pkgs: {
+      default = packageFor pkgs;
+      iree-tools = ireeToolsFor pkgs;
+    });
 
     devShells = forAllSystems (pkgs: {
       default = import ./nix/devshell.nix {
