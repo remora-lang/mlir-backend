@@ -1057,9 +1057,16 @@ struct FutharkCompiler {
   //    xs[gtid - c],
   // where c is a variable defined outside the kernel body.
   Values LowerSegMap(const SegMap &pSegMap, Ctx &ctx) {
+    return LowerSegMap(
+        pSegMap.lvl, pSegMap.space, pSegMap.body, pSegMap.ret, ctx);
+  }
+
+  Values LowerSegMap(const SegLevel &lvl, const SegSpace &space,
+                     const KernelBody &body, const std::vector<Type> &ret,
+                     Ctx &ctx) {
     // Block-level and in-block kernels describe a nested iteration space that
     // a flat linalg.generic cannot express.
-    RequireThreadLevel(pSegMap.lvl);
+    RequireThreadLevel(lvl);
 
     // This lowers a SegMap to a linalg.generic op, whose
     //   * iteration space corresponds to the SegMap's SegSpace;
@@ -1067,19 +1074,19 @@ struct FutharkCompiler {
     // An affine read is an array load whose index expression is an affine
     // function of the iteration space.
 
-    IterationSpace iterSpace = LowerSegSpace(pSegMap.space, ctx);
+    IterationSpace iterSpace = LowerSegSpace(space, ctx);
 
     std::vector<AffineRead> affine_reads =
-        FindSegOpAffineReads(iterSpace, pSegMap.body);
+        FindSegOpAffineReads(iterSpace, body);
 
     Values inputs;
     for (auto &read : affine_reads)
       inputs.push_back(ctx.subexps.lookup(read.array.name));
 
     mlir::SmallVector<mlir::Type> returnTypes;
-    for (auto ret : pSegMap.ret) {
+    for (auto ret : ret) {
       auto baseTy = LowerSegOpBaseType(ret, ctx);
-      auto shapeTy = toShapeType(std::views::values(pSegMap.space.dims));
+      auto shapeTy = toShapeType(std::views::values(space.dims));
       returnTypes.push_back(mlir::RankedTensorType::get(shapeTy, baseTy));
     }
     Values dynamicSizes;
@@ -1122,7 +1129,7 @@ struct FutharkCompiler {
 
           Ctx local = ctx;
           Values results = LowerSegOpKernelBody(
-              loc, args, affine_reads, iterSpace, pSegMap.body, local);
+              loc, args, affine_reads, iterSpace, body, local);
 
           assert(results.size() == outputs.size());
           mlir::linalg::YieldOp::create(builder, loc, results);
@@ -1241,21 +1248,19 @@ struct FutharkCompiler {
   Values LowerSegHist(const SegHist &pSegHist, Ctx &ctx) {
     RequireThreadLevel(pSegHist.lvl);
 
-    IterationSpace iterSpace = LowerSegSpace(pSegHist.space, ctx);
+    // If this map is the identity function, IREE will kill it.
+    Values inputs = LowerSegMap(
+        pSegHist.lvl, pSegHist.space, pSegHist.body, pSegHist.ret, ctx);
+    if (inputs.size() != 2)
+      Undefined();
+    mlir::Value indices = inputs[0];
+    mlir::Value values = inputs[1];
 
-    std::vector<AffineRead> affine_reads =
-        FindSegOpAffineReads(iterSpace, pSegHist.body);
-
+    // Histogram
     if (pSegHist.ops.size() != 1) {
       Undefined();
     }
     auto pHistOp = pSegHist.ops[0];
-
-    // Hopefully this is invariant.
-    if (affine_reads.size() != 2)
-      Undefined();
-    mlir::Value indices = ctx.subexps.lookup(affine_reads[0].array.name);
-    mlir::Value values = ctx.subexps.lookup(affine_reads[1].array.name);
 
     Values dests;
     for (auto const &vn : pHistOp.dest) {
@@ -1271,6 +1276,7 @@ struct FutharkCompiler {
     auto op = mlir::iree_compiler::IREE::LinalgExt::ScatterOp::create(
         builder, dest.getType(), values, indices, {}, dest, {0}, false);
 
+    // Lower the histogram's combining op.
     mlir::SmallVector<mlir::Type> opInputTypes;
     for (const auto &param : pHistOp.lambda.params)
       opInputTypes.push_back(LowerTy(param.dec.v));
