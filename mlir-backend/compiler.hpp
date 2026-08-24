@@ -1839,6 +1839,15 @@ struct FutharkCompiler {
   }
 
   Values LowerIntrinsic(const std::string &fname, mlir::ValueRange args) {
+    // `cond_t` is Futhark's branchless select; its suffix is a full type name
+    // ("cond_i64", "cond_bool"), not the width suffix IntrinsicBaseName knows.
+    if (fname.starts_with("cond_")) {
+      if (args.size() != 3)
+        Undefined();
+      return {mlir::arith::SelectOp::create(builder, args[0], args[1], args[2])
+                  .getResult()};
+    }
+
     auto base = IntrinsicBaseName(fname);
     if (!base)
       throw std::runtime_error(
