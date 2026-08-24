@@ -81,30 +81,30 @@ def dmoe_top1 [T] [E] [d1] [d2]
   let y = scatter (unflatten (#[scratch] replicate (T * d1) 0f32)) perm h2
   in map2 (\g -> map (* g)) gate y
 
-entry main (tokens: [1024][512]f32)
-           (W_router: [512][64]f32)
-           (W_expert_in: [64][512][2048]f32)
-           (W_expert_out: [64][2048][512]f32) : [1024][512]f32 =
-  #[flattening(only_inner)]
-  dmoe_top1 tokens W_router W_expert_in W_expert_out (\(x: f32) -> x)
-
--- -- Testing.
--- --
--- -- ==
--- -- input {
--- --   [[1.0f32, 0.0f32], [0.0f32, 2.0f32]]
--- --   [[1.0f32, 0.0f32], [0.0f32, 1.0f32]]
--- --   [[[1.0f32, 1.0f32], [1.0f32, 1.0f32]],
--- --    [[1.0f32, 1.0f32], [1.0f32, 1.0f32]]]
--- --   [[[1.0f32, 1.0f32], [1.0f32, 1.0f32]],
--- --    [[1.0f32, 1.0f32], [1.0f32, 1.0f32]]]
--- -- }
--- -- output {
--- --   [[2.0f32, 2.0f32], [8.0f32, 8.0f32]]
--- -- }
--- entry main (tokens: [2][2]f32)
---            (W_router: [2][2]f32)
---            (W_expert_in: [2][2][2]f32)
---            (W_expert_out: [2][2][2]f32) : [2][2]f32 =
+-- entry main (tokens: [1024][512]f32)
+--            (W_router: [512][64]f32)
+--            (W_expert_in: [64][512][2048]f32)
+--            (W_expert_out: [64][2048][512]f32) : [1024][512]f32 =
 --   #[flattening(only_inner)]
 --   dmoe_top1 tokens W_router W_expert_in W_expert_out (\(x: f32) -> x)
+
+-- Testing.
+--
+-- ==
+-- input {
+--   [[1.0f32, 0.0f32], [0.0f32, 2.0f32]]
+--   [[1.0f32, 0.0f32], [0.0f32, 1.0f32]]
+--   [[[1.0f32, 1.0f32], [1.0f32, 1.0f32]],
+--    [[1.0f32, 1.0f32], [1.0f32, 1.0f32]]]
+--   [[[1.0f32, 1.0f32], [1.0f32, 1.0f32]],
+--    [[1.0f32, 1.0f32], [1.0f32, 1.0f32]]]
+-- }
+-- output {
+--   [[2.0f32, 2.0f32], [8.0f32, 8.0f32]]
+-- }
+entry main (tokens: [2][2]f32)
+           (W_router: [2][2]f32)
+           (W_expert_in: [2][2][2]f32)
+           (W_expert_out: [2][2][2]f32) : [2][2]f32 =
+  #[flattening(only_inner)]
+  dmoe_top1 tokens W_router W_expert_in W_expert_out (\(x: f32) -> x)

@@ -14,13 +14,15 @@ by symbol from the array shapes), then runs the built module (`run-iree
 --run-only`) and checks the printed result matches `output`. Comparison is on
 the flat sequence of numeric values, ignoring type suffixes and formatting.
 
-Supported literals: signed-int scalars and rectangular int arrays (1D/2D) with
-explicit type suffixes (`i32`/`i64`/...). Anything we can't handle (floats,
-booleans, `empty(...)`) is reported as a failure -- it means the program isn't
-handled -- not silently skipped.
+Supported literals: signed-int and float scalars and rectangular arrays (1D/2D)
+with explicit type suffixes (`i32`/`i64`/`f32`/...); floats are compared with a
+tolerance since backends format them differently (`2.0` vs `2`). Anything we
+can't handle (booleans, `empty(...)`) is reported as a failure -- it means the
+program isn't handled -- not silently skipped.
 """
 
 import glob
+import math
 import re
 import subprocess
 import sys
@@ -223,6 +225,27 @@ def _expected_values(block):
     return [_strip_suffix(t) for t in cleaned.split()]
 
 
+def _values_match(actual, expected, rel_tol=1e-5, abs_tol=1e-6):
+    """Compare flat value lists element-wise.
+
+    Numeric tokens are compared with a tolerance (floats print differently
+    across backends, e.g. `2.0` vs `2`); anything non-numeric falls back to an
+    exact string match.
+    """
+    if len(actual) != len(expected):
+        return False
+    for a, e in zip(actual, expected):
+        try:
+            fa, fe = float(a), float(e)
+        except ValueError:
+            if a != e:
+                return False
+            continue
+        if not math.isclose(fa, fe, rel_tol=rel_tol, abs_tol=abs_tol):
+            return False
+    return True
+
+
 # --- test-block extraction ---------------------------------------------------
 
 def _read_cases(path):
@@ -305,7 +328,7 @@ def _run_case(path, input_str, output_str):
         return _fail(proc, "run-iree")
     actual = _iree_output_values(proc.stdout)
     expected = _expected_values(output_str)
-    if actual != expected:
+    if not _values_match(actual, expected):
         return False, f"expected {expected}, got {actual}"
     return True, None
 
