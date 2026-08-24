@@ -320,11 +320,11 @@ struct FutharkCompiler {
         });
   }
 
-  // A Futhark loop carries a set of "merge" parameters from one iteration to
+  // A Futhark loop carries a set of parameters from one iteration to
   // the next, which become the iteration arguments of the scf.for.
   Values LowerLoop(const ExpLoop &loop, Ctx &ctx) {
     // TODO while loops, which need an scf.while with the continuation
-    // condition -- itself a merge parameter -- read in the "before" region.
+    // condition -- itself a loop parameter -- read in the "before" region.
     auto *forLoop = std::get_if<ForLoop>(&loop.form.v);
     if (!forLoop)
       Undefined();
@@ -364,8 +364,8 @@ struct FutharkCompiler {
           local.subexps.insert(forLoop->i.name,
                                mlir::arith::IndexCastOp::create(
                                    builder, bodyLoc, counterTy, iv));
-          for (auto [merge, arg] : llvm::zip_equal(loop.merge, iterArgs))
-            local.subexps.insert(merge.first.name, arg);
+          for (auto [param, arg] : llvm::zip_equal(loop.merge, iterArgs))
+            local.subexps.insert(param.first.name, arg);
 
           // The body's results feed back into the merge parameters, so they
           // must have exactly the parameters' types.
