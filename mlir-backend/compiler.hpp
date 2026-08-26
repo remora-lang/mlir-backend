@@ -1026,18 +1026,21 @@ struct FutharkCompiler {
           auto op = LowerSubExp(val.val, ctx);
           auto elementTy = op.getType();
 
-          // TODO dynamic replicate
-          std::vector<int64_t> before;
-          for (auto d : val.shape.dims)
-            before.push_back(match(
-                d,
-                [&](const ConstantSubExp &) { return d.GetIntValue(); },
-                [&](const VarSubExp &) -> int64_t { Undefined(); }));
+          std::vector<int64_t> before = toShapeType(val.shape.dims);
+          Values dynamicSizes;
+          for (auto [d, dimTy] : llvm::zip_equal(val.shape.dims, before))
+            if (mlir::ShapedType::isDynamic(dimTy))
+              dynamicSizes.push_back(mlir::arith::IndexCastOp::create(
+                  builder, builder.getIndexType(), LowerSubExp(d, ctx)));
 
           std::vector<int64_t> original;
           auto t = op.getType();
           if (auto tensorTy = llvm::dyn_cast<mlir::RankedTensorType>(t)) {
             auto dims = tensorTy.getShape();
+            for (auto [i, d] : llvm::enumerate(dims))
+              if (mlir::ShapedType::isDynamic(d))
+                dynamicSizes.push_back(
+                    mlir::tensor::DimOp::create(builder, op, i).getResult());
             before.insert(before.end(), dims.begin(), dims.end());
             original.insert(original.end(), dims.begin(), dims.end());
             elementTy = tensorTy.getElementType();
@@ -1049,8 +1052,8 @@ struct FutharkCompiler {
           }
 
           auto transposedTy = mlir::RankedTensorType::get(before, elementTy);
-          auto destination =
-              mlir::tensor::EmptyOp::create(builder, transposedTy, {});
+          auto destination = mlir::tensor::EmptyOp::create(
+              builder, transposedTy, dynamicSizes);
 
           std::vector<int64_t> addedDims;
           for (int64_t i = 0; i < std::ssize(before) - std::ssize(original);
