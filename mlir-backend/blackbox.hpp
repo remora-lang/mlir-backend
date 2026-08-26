@@ -29,6 +29,8 @@ inline std::optional<BlackBox> MaybeBlackBox(const Attrs &attrs) {
     if (auto *a = std::get_if<CompAttr>(&attr.v)) {
       if (a->name == "blackbox" && a->args.size() == 1) {
         if (auto *v = std::get_if<AtomAttr>(&a->args[0].v)) {
+          if (v->name == "dummy")
+            continue;
           return ToBlackBox(v->name);
         }
       }
@@ -38,9 +40,5 @@ inline std::optional<BlackBox> MaybeBlackBox(const Attrs &attrs) {
 }
 
 inline bool IsBlackBox(const Attrs &attrs) {
-  for (const auto &attr : attrs.attrs)
-    if (auto *a = std::get_if<CompAttr>(&attr.v))
-      if (a->name == "blackbox" && a->args.size() == 1)
-        return true;
-  return false;
+  return MaybeBlackBox(attrs).has_value();
 }
