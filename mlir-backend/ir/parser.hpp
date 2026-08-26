@@ -1,6 +1,7 @@
 #pragma once
 #include "FutharkLexer.h"
 #include "FutharkParser.h"
+#include "blackbox.hpp"
 #include "segop.hpp"
 #include "syntax.hpp"
 #include "utils.hpp"
@@ -34,7 +35,8 @@ struct FutharkTranslationVisitor {
     for (auto *attr : ctx->pAttr())
       fun.attrs.attrs.push_back(VisitAttr(attr));
 
-    fun.body = VisitBody(ctx->pBody());
+    if (!IsBlackBox(fun.attrs))
+      fun.body = VisitBody(ctx->pBody());
     return fun;
   }
 
