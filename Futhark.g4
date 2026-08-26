@@ -23,7 +23,7 @@ pEntryPointInput: ID ':' pType;
 
 fParam: ID ':' pType;
 
-pRetTypes: '{' pType* (',' pType)* '}';
+pRetTypes: '{' ('*'? pType)* (',' '*'? pType)* '}';
 pType: pExtShape pPrimType pAlias? #TypeShape
     | pPrimType pAlias? #TypePrim
     | pExtShape 'unit' pAlias? #TypeUnitArray
