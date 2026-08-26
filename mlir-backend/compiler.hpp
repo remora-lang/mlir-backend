@@ -335,8 +335,6 @@ struct FutharkCompiler {
                   return LowerRaggedDot(args, retTypes, ctx);
                 case BlackBox::ArgSort:
                   return LowerArgSort(args, retTypes, ctx);
-                case BlackBox::Scatter:
-                  return LowerScatter(args, retTypes, ctx);
                 }
                 llvm_unreachable("LowerBlackBox");
               });
@@ -801,39 +799,6 @@ struct FutharkCompiler {
     }
 
     return {op.getResult(1)};
-  }
-
-  Values LowerScatter(mlir::ValueRange args, mlir::TypeRange retTypes,
-                      Ctx &ctx) {
-    // TODO Remove black box scatter once we handle WithAcc.
-    auto numNonSizeArgs = 3;
-    assert(args.size() >= numNonSizeArgs);
-    assert(retTypes.size() == 1);
-    auto getArg = [&](int i) {
-      // We don't know how many size parameters will be passed,
-      // but they are always preprended, so we index from the back.
-      return args[args.size() - numNonSizeArgs + i];
-    };
-    auto dest = getArg(0);
-    auto indices = getArg(1);
-    auto values = getArg(2);
-
-    auto elementTy = getRankedType(values.getType()).getElementType();
-
-    auto op = mlir::iree_compiler::IREE::LinalgExt::ScatterOp::create(
-        builder, dest.getType(), values, indices, {}, dest, {0}, false);
-
-    {
-      mlir::OpBuilder::InsertionGuard guard(builder);
-      auto *blk = builder.createBlock(&op.getRegion(),
-                                      {},
-                                      {elementTy, elementTy},
-                                      {builder.getLoc(), builder.getLoc()});
-      mlir::iree_compiler::IREE::LinalgExt::YieldOp::create(
-          builder, blk->getArgument(0));
-    }
-
-    return {op.getResult(0)};
   }
 
   mlir::RankedTensorType getRankedType(const mlir::Type &ty) {

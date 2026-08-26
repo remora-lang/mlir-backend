@@ -5,7 +5,7 @@
 #include <optional>
 #include <string>
 
-enum class BlackBox { MatMul, DotGeneral, RaggedDot, ArgSort, Scatter };
+enum class BlackBox { MatMul, DotGeneral, RaggedDot, ArgSort };
 
 inline BlackBox ToBlackBox(const std::string &name) {
   if (name == "matmul") {
@@ -19,10 +19,6 @@ inline BlackBox ToBlackBox(const std::string &name) {
   }
   if (name == "argsort") {
     return BlackBox::ArgSort;
-  }
-  // TODO Remove black box scatter once we handle WithAcc.
-  if (name == "scatter") {
-    return BlackBox::Scatter;
   }
   Undefined();
 }
