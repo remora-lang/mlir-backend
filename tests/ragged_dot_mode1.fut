@@ -7,16 +7,16 @@
 -- triangular, so a row's group selects which matrix transforms it.
 
 #[noinline] #[blackbox(ragged_dot)]
-def ragged_dot 'a 'b 'c [g] [n] [m] [s]
-               (lhs: a)
-               (rhs: b)
+def ragged_dot [m] [k] [g] [n] [nb] [nc] [ng]
+               (lhs: [m][k]i64)
+               (rhs: [g][k][n]i64)
                (group_sizes: [g]i64)
-               (lhs_batching_dims: [n]i64)
-               (rhs_batching_dims: [n]i64)
-               (lhs_contracting_dims: [m]i64)
-               (rhs_contracting_dims: [m]i64)
+               (lhs_batching_dims: [nb]i64)
+               (rhs_batching_dims: [nb]i64)
+               (lhs_contracting_dims: [nc]i64)
+               (rhs_contracting_dims: [nc]i64)
                (lhs_ragged_dim: i64)
-               (rhs_group_dims: [s]i64) : c =
+               (rhs_group_dims: [ng]i64) : [m][n]i64 =
   #[unsafe] ???
 
 -- ==

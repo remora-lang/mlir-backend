@@ -6,28 +6,28 @@
 --
 
 #[noinline] #[blackbox(scatter)]
-def scatter 't [k] [n] (dest: [k]t) (is: [n]i64) (vs: [n]t) : [k]t =
+def scatter [k] [n] [d] (dest: [k][d]f32) (is: [n]i64) (vs: [n][d]f32) : [k][d]f32 =
   #[unsafe] ???
 
 #[noinline] #[blackbox(matmul)]
-def matmul 't [n] [k] [m] (x: [n][k]t) (y: [k][m]t) : [n][m]t =
+def matmul [n] [k] [m] (x: [n][k]f32) (y: [k][m]f32) : [n][m]f32 =
   #[unsafe] ???
 
 #[noinline] #[blackbox(ragged_dot)]
-def ragged_dot 'a 'b 'c [g] [n] [m] [s]
-               (lhs: a)
-               (rhs: b)
+def ragged_dot [m] [k] [g] [n] [nb] [nc] [ng]
+               (lhs: [m][k]f32)
+               (rhs: [g][k][n]f32)
                (group_sizes: [g]i64)
-               (lhs_batching_dims: [n]i64)
-               (rhs_batching_dims: [n]i64)
-               (lhs_contracting_dims: [m]i64)
-               (rhs_contracting_dims: [m]i64)
+               (lhs_batching_dims: [nb]i64)
+               (rhs_batching_dims: [nb]i64)
+               (lhs_contracting_dims: [nc]i64)
+               (rhs_contracting_dims: [nc]i64)
                (lhs_ragged_dim: i64)
-               (rhs_group_dims: [s]i64) : c =
+               (rhs_group_dims: [ng]i64) : [m][n]f32 =
   #[unsafe] ???
 
 #[noinline] #[blackbox(argsort)]
-def argsort 'a [n] (x: [n]a) (is_stable: bool) : [n]i64 =
+def argsort [n] (x: [n]i64) (is_stable: bool) : [n]i64 =
   ???
 
 def ragged_matmul [m] [E] [d1] [d2]

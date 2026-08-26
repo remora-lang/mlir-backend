@@ -1,7 +1,7 @@
 -- argsort: the permutation of indices that sorts x ascending.
 
 #[noinline] #[blackbox(argsort)]
-def argsort 'a [n] (x: [n]a) (is_stable: bool) : [n]i64 =
+def argsort [n] (x: [n]i32) (is_stable: bool) : [n]i64 =
   ???
 
 -- ==

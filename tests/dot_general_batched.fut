@@ -4,9 +4,9 @@
 
 #[noinline]
 #[blackbox(dot_general)]
-def dot_general 'a 'b 'c [n] [m] (x: a) (y: b)
-                (lhs_batching_dims: [n]i64) (rhs_batching_dims: [n]i64)
-                (lhs_contracting_dims: [m]i64) (rhs_contracting_dims: [m]i64): c =
+def dot_general [b] [n] [k] [m] [nb] [nc] (x: [b][n][k]i64) (y: [b][k][m]i64)
+                (lhs_batching_dims: [nb]i64) (rhs_batching_dims: [nb]i64)
+                (lhs_contracting_dims: [nc]i64) (rhs_contracting_dims: [nc]i64): [b][n][m]i64 =
   #[unsafe] ???
 
 -- ==
