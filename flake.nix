@@ -26,6 +26,15 @@
       cudatoolkit = pkgs.cudaPackages_12.cudatoolkit;
       cudaDepsDir = if pkgs.stdenv.isDarwin then "" else "${cudatoolkit}";
 
+      # IREE source with the cuda sort fix: route iree_linalg_ext.sort to the
+      # Distribute pipeline (TileAndFuse fails to bufferize it). See
+      # patches/sort-distribute.patch.
+      ireeSrc = pkgs.applyPatches {
+        name = "iree-sort-distribute";
+        src = iree;
+        patches = [ ./patches/sort-distribute.patch ];
+      };
+
       mlir-backend = pkgs.stdenv.mkDerivation {
       pname = "futhark-mlir-backend";
       version = "dev";
@@ -52,7 +61,7 @@
 
       cmakeFlags = [
         "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON"
-        "-DMOCHA_IREE_SOURCE_DIR=${iree}"
+        "-DMOCHA_IREE_SOURCE_DIR=${ireeSrc}"
         "-DIREE_ENABLE_LIBBACKTRACE=OFF"
       ] ++ pkgs.lib.optionals pkgs.stdenv.isLinux [
         "-DMOCHA_ENABLE_CUDA=ON"
@@ -85,7 +94,7 @@
           -DCMAKE_C_COMPILER_LAUNCHER=ccache \
           -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
           $cuda_flag \
-          -DMOCHA_IREE_SOURCE_DIR=${iree}
+          -DMOCHA_IREE_SOURCE_DIR=${ireeSrc}
       fi
       cmake --build build ''${jobs:+-j "$jobs"} \
         --target mlir-backend iree-compile iree-run-module iree-benchmark-module
