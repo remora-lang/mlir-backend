@@ -16,10 +16,12 @@
 #include "stablehlo/dialect/StablehloOps.h"
 #include "utils.hpp"
 #include "llvm/Support/ErrorHandling.h"
+#include <cctype>
 #include <format>
 #include <iterator>
 #include <mlir/Dialect/Arith/IR/Arith.h>
 #include <mlir/Dialect/Linalg/IR/Linalg.h>
+#include <mlir/Dialect/Math/IR/Math.h>
 #include <mlir/Dialect/Tensor/IR/Tensor.h>
 #include <mlir/IR/AffineMap.h>
 #include <mlir/IR/BuiltinTypeInterfaces.h>
@@ -139,6 +141,7 @@ struct FutharkCompiler {
                   mlir::ImplicitLocOpBuilder &builder)
       : prog(prog), context(context), builder(builder) {
     context.getOrLoadDialect<mlir::linalg::LinalgDialect>();
+    context.getOrLoadDialect<mlir::math::MathDialect>();
     context.getOrLoadDialect<mlir::iree_compiler::IREE::Flow::FlowDialect>();
     context.getOrLoadDialect<
         mlir::iree_compiler::IREE::LinalgExt::IREELinalgExtDialect>();
@@ -289,7 +292,14 @@ struct FutharkCompiler {
         [&](const ExpSubExp &e) { return Values{LowerSubExp(e.subExp, ctx)}; },
         [&](const ExpHostOp &e) { return LowerHostOp(e.op, ctx); },
         [&](const ExpApply &e) -> Values {
-          auto fun = GetFunction(prog, e.fname);
+          const FunDef *pFun = FindFunction(prog, e.fname);
+          if (!pFun) {
+            Values args;
+            for (auto arg : std::views::elements<0>(e.args))
+              args.push_back(LowerSubExp(arg, ctx));
+            return LowerIntrinsic(e.fname, args);
+          }
+          const FunDef &fun = *pFun;
           mlir::SmallVector<mlir::Type> retTypes;
           for (auto ty : std::views::elements<0>(e.retTypes)) {
             retTypes.push_back(LowerTy(ty.v));
@@ -325,6 +335,8 @@ struct FutharkCompiler {
                   return LowerRaggedDot(args, retTypes, ctx);
                 case BlackBox::ArgSort:
                   return LowerArgSort(args, retTypes, ctx);
+                case BlackBox::Scatter:
+                  return LowerScatter(args, retTypes, ctx);
                 }
                 llvm_unreachable("LowerBlackBox");
               });
@@ -335,7 +347,7 @@ struct FutharkCompiler {
           }
           return results;
         },
-        [&](const ExpLoop &) -> Values { Undefined(); },
+        [&](const ExpLoop &e) -> Values { return LowerLoop(e, ctx); },
         [&](const ExpIf &e) -> Values {
           return mlir::scf::IfOp::create(
                      builder,
@@ -355,6 +367,65 @@ struct FutharkCompiler {
               .getResults();
         },
         [&](const ExpWithAcc &e) { return LowerWithAcc(e, ctx); });
+  }
+
+  // A Futhark loop carries a set of parameters from one iteration to
+  // the next, which become the iteration arguments of the scf.for.
+  Values LowerLoop(const ExpLoop &loop, Ctx &ctx) {
+    // TODO while loops, which need an scf.while with the continuation
+    // condition -- itself a loop parameter -- read in the "before" region.
+    auto *forLoop = std::get_if<ForLoop>(&loop.form.v);
+    if (!forLoop)
+      Undefined();
+
+    mlir::SmallVector<mlir::Type> mergeTypes;
+    Values inits;
+    for (const auto &[param, init] : loop.merge) {
+      auto ty = LowerTy(param.dec.v);
+      mergeTypes.push_back(ty);
+      inits.push_back(castToType(LowerSubExp(init, ctx), ty));
+    }
+
+    auto lb = mlir::arith::ConstantIndexOp::create(builder, 0);
+    auto ub = mlir::arith::IndexCastOp::create(
+        builder, builder.getIndexType(), LowerSubExp(forLoop->bound, ctx));
+    auto step = mlir::arith::ConstantIndexOp::create(builder, 1);
+    auto counterTy = builder.getIntegerType(GetWidth(forLoop->t));
+
+    auto forOp = mlir::scf::ForOp::create(
+        builder,
+        builder.getLoc(),
+        lb,
+        ub,
+        step,
+        inits,
+        [&](mlir::OpBuilder &b,
+            mlir::Location bodyLoc,
+            mlir::Value iv,
+            mlir::ValueRange iterArgs) {
+          mlir::OpBuilder::InsertionGuard guard(builder);
+          builder.setInsertionPoint(b.getInsertionBlock(),
+                                    b.getInsertionPoint());
+
+          Ctx local = ctx;
+          // scf.for counts in `index`, but the body sees the Futhark loop
+          // counter at its own integer type.
+          local.subexps.insert(forLoop->i.name,
+                               mlir::arith::IndexCastOp::create(
+                                   builder, bodyLoc, counterTy, iv));
+          for (auto [param, arg] : llvm::zip_equal(loop.merge, iterArgs))
+            local.subexps.insert(param.first.name, arg);
+
+          // The body's results feed back into the merge parameters, so they
+          // must have exactly the parameters' types.
+          Values results;
+          for (auto [v, ty] :
+               llvm::zip_equal(LowerBody(*loop.body, local), mergeTypes))
+            results.push_back(castToType(v, ty));
+          mlir::scf::YieldOp::create(builder, bodyLoc, results);
+        });
+
+    return forOp.getResults();
   }
 
   // Casts the type of `value` to `type` if they are compatible
@@ -732,6 +803,39 @@ struct FutharkCompiler {
     return {op.getResult(1)};
   }
 
+  Values LowerScatter(mlir::ValueRange args, mlir::TypeRange retTypes,
+                      Ctx &ctx) {
+    // TODO Remove black box scatter once we handle WithAcc.
+    auto numNonSizeArgs = 3;
+    assert(args.size() >= numNonSizeArgs);
+    assert(retTypes.size() == 1);
+    auto getArg = [&](int i) {
+      // We don't know how many size parameters will be passed,
+      // but they are always preprended, so we index from the back.
+      return args[args.size() - numNonSizeArgs + i];
+    };
+    auto dest = getArg(0);
+    auto indices = getArg(1);
+    auto values = getArg(2);
+
+    auto elementTy = getRankedType(values.getType()).getElementType();
+
+    auto op = mlir::iree_compiler::IREE::LinalgExt::ScatterOp::create(
+        builder, dest.getType(), values, indices, {}, dest, {0}, false);
+
+    {
+      mlir::OpBuilder::InsertionGuard guard(builder);
+      auto *blk = builder.createBlock(&op.getRegion(),
+                                      {},
+                                      {elementTy, elementTy},
+                                      {builder.getLoc(), builder.getLoc()});
+      mlir::iree_compiler::IREE::LinalgExt::YieldOp::create(
+          builder, blk->getArgument(0));
+    }
+
+    return {op.getResult(0)};
+  }
+
   mlir::RankedTensorType getRankedType(const mlir::Type &ty) {
     if (auto t = mlir::dyn_cast<mlir::RankedTensorType>(ty))
       return t;
@@ -792,6 +896,64 @@ struct FutharkCompiler {
     return op.getResult(0);
   }
 
+  // `arr[i, j]` reads a single element, but a slice among the indices makes the
+  // result an array: `arr[i, a :+ n * s]` becomes a tensor.extract_slice whose
+  // fixed dimensions are rank-reduced away.
+  mlir::Value LowerIndex(const BasicOpIndex &index, Ctx &ctx) {
+    auto tensor = LowerSubExp(index.vName.name, ctx);
+
+    auto isSlice = [](const DimIndex<SubExp> &d) {
+      return std::holds_alternative<DimSlice<SubExp>>(d.v);
+    };
+    if (!llvm::any_of(index.slice.dims, isSlice)) {
+      std::vector<mlir::Value> indices;
+      for (const auto &dim : index.slice.dims) {
+        auto i = LowerSubExp(std::get<DimFix<SubExp>>(dim.v).i, ctx);
+        indices.push_back(mlir::arith::IndexCastOp::create(
+            builder, builder.getIndexType(), i));
+      }
+      return mlir::tensor::ExtractOp::create(builder, tensor, indices)
+          .getResult();
+    }
+
+    // Constants stay attributes so that they remain visible in the shape of
+    // the extracted slice.
+    auto toIndex = [&](const SubExp &e) -> mlir::OpFoldResult {
+      if (auto *c = std::get_if<ConstantSubExp>(&e.v))
+        return builder.getIndexAttr(c->GetIntValue());
+      return mlir::OpFoldResult(mlir::arith::IndexCastOp::create(
+          builder, builder.getIndexType(), LowerSubExp(e, ctx)));
+    };
+
+    mlir::SmallVector<mlir::OpFoldResult> offsets, sizes, strides;
+    std::vector<int64_t> resultShape;
+    for (const auto &dim : index.slice.dims) {
+      match(
+          dim,
+          [&](const DimFix<SubExp> &fix) {
+            offsets.push_back(toIndex(fix.i));
+            sizes.push_back(builder.getIndexAttr(1));
+            strides.push_back(builder.getIndexAttr(1));
+          },
+          [&](const DimSlice<SubExp> &s) {
+            offsets.push_back(toIndex(s.start));
+            sizes.push_back(toIndex(s.length));
+            // tensor.extract_slice cannot step backwards, so a stride we
+            // cannot see to be positive -- a reversal, say -- is out of reach.
+            auto *stride = std::get_if<ConstantSubExp>(&s.stride.v);
+            if (!stride || stride->GetIntValue() < 1)
+              Undefined();
+            strides.push_back(builder.getIndexAttr(stride->GetIntValue()));
+            resultShape.push_back(toShapeType(s.length));
+          });
+    }
+
+    auto resultTy = mlir::RankedTensorType::get(
+        resultShape, getRankedType(tensor.getType()).getElementType());
+    return mlir::tensor::ExtractSliceOp::create(
+        builder, resultTy, tensor, offsets, sizes, strides);
+  }
+
   mlir::Value LowerBasicOp(const BasicOp &basicOp, Ctx &ctx) {
     return match(
         basicOp,
@@ -822,21 +984,7 @@ struct FutharkCompiler {
           return concat->getResult(0);
         },
         [&](const BasicOpIndex &val) -> mlir::Value {
-          auto tensor = LowerSubExp(val.vName.name, ctx);
-          std::vector<mlir::Value> indices;
-          for (const auto &dim : val.slice.dims) {
-            // TODO: lower slices, presumably to tensor.extract_slice.
-            auto *fix = std::get_if<DimFix<SubExp>>(&dim.v);
-            if (!fix)
-              Undefined();
-            auto i = LowerSubExp(fix->i, ctx);
-            indices.push_back(mlir::arith::IndexCastOp::create(
-                builder, builder.getIndexType(), i));
-          }
-
-          auto result =
-              mlir::tensor::ExtractOp::create(builder, tensor, indices);
-          return result.getResult();
+          return LowerIndex(val, ctx);
         },
         [&](const BasicOpConvOp &val) -> mlir::Value {
           auto op0 = LowerSubExp(val.op0, ctx);
@@ -856,42 +1004,49 @@ struct FutharkCompiler {
                     LowerTy(Type::CreatePrim(PrimType::Int(sext.to))),
                     op0);
               },
+              [&](const ConvOpSIToFP &sitofp) -> mlir::Value {
+                return mlir::arith::SIToFPOp::create(
+                    builder, GetFloatType(builder, GetWidth(sitofp.to)), op0);
+              },
               [](const auto &) -> mlir::Value { Undefined(); });
         },
         [&](const BasicOpReshape &val) -> mlir::Value {
           auto op0 = LowerSubExp(val.op0, ctx);
-          std::vector<mlir::ReassociationIndices> reassociations;
+          auto sourceTy = getRankedType(op0.getType());
 
-          mlir::ReassociationIndices ranges;
-          for (auto i = 0; i < val.dimEnd; i++)
-            ranges.push_back(i);
-          reassociations.push_back(ranges);
+          // `remainder` is the whole shape the reshape produces; the splice
+          // fields only say which dimensions were rewritten to get there. A
+          // splice may either merge dimensions or split them, so the direction
+          // comes from comparing the two ranks.
+          auto resultTy = mlir::RankedTensorType::get(
+              toShapeType(val.remainder.dims), sourceTy.getElementType());
+          if (sourceTy == resultTy)
+            return op0;
 
-          auto prevTy = llvm::dyn_cast<mlir::RankedTensorType>(op0.getType());
-          if (!prevTy)
+          auto reassociation =
+              mlir::getReassociationIndicesForReshape(sourceTy, resultTy);
+          if (!reassociation)
             Undefined();
-          for (int64_t i = val.dimEnd; i < std::ssize(prevTy.getShape()); i++) {
-            reassociations.push_back({i});
-          }
 
-          std::vector<int64_t> dims;
-          for (auto d : val.remainder.dims)
-            dims.push_back(d.GetIntValue());
-
-          auto resultTy =
-              mlir::RankedTensorType::get(dims, prevTy.getElementType());
-          auto reshape = mlir::tensor::CollapseShapeOp::create(
-              builder, resultTy, op0, reassociations);
-          return reshape->getResult(0);
+          if (resultTy.getRank() < sourceTy.getRank())
+            return mlir::tensor::CollapseShapeOp::create(
+                builder, resultTy, op0, *reassociation);
+          return mlir::tensor::ExpandShapeOp::create(
+              builder, resultTy, op0, *reassociation);
         },
         [&](const BasicOpRearrange &val) -> mlir::Value {
           auto op = LowerSubExp(val.arr.name, ctx);
           auto tensorTy = llvm::dyn_cast<mlir::RankedTensorType>(op.getType());
           if (!tensorTy)
             Undefined();
+          if (val.perm.size() != tensorTy.getShape().size())
+            Undefined();
 
-          std::vector<int64_t> dims = tensorTy.getShape();
-          std::reverse(dims.begin(), dims.end());
+          // linalg.transpose puts input dimension perm[i] in result
+          // dimension i, which is a reversal only when perm is one.
+          std::vector<int64_t> dims;
+          for (int64_t p : val.perm)
+            dims.push_back(tensorTy.getShape()[p]);
 
           auto transposedTy =
               mlir::RankedTensorType::get(dims, tensorTy.getElementType());
@@ -1047,9 +1202,16 @@ struct FutharkCompiler {
   //    xs[gtid - c],
   // where c is a variable defined outside the kernel body.
   Values LowerSegMap(const SegMap &pSegMap, Ctx &ctx) {
+    return LowerSegMap(
+        pSegMap.lvl, pSegMap.space, pSegMap.body, pSegMap.ret, ctx);
+  }
+
+  Values LowerSegMap(const SegLevel &lvl, const SegSpace &space,
+                     const KernelBody &body, const std::vector<Type> &ret,
+                     Ctx &ctx) {
     // Block-level and in-block kernels describe a nested iteration space that
     // a flat linalg.generic cannot express.
-    RequireThreadLevel(pSegMap.lvl);
+    RequireThreadLevel(lvl);
 
     // This lowers a SegMap to a linalg.generic op, whose
     //   * iteration space corresponds to the SegMap's SegSpace;
@@ -1057,26 +1219,28 @@ struct FutharkCompiler {
     // An affine read is an array load whose index expression is an affine
     // function of the iteration space.
 
-    IterationSpace iterSpace = LowerSegSpace(pSegMap.space, ctx);
+    IterationSpace iterSpace = LowerSegSpace(space, ctx);
 
     std::vector<AffineRead> affine_reads =
-        FindSegOpAffineReads(iterSpace, pSegMap.body);
+        FindSegOpAffineReads(iterSpace, body);
 
     Values inputs;
     for (auto &read : affine_reads)
       inputs.push_back(ctx.subexps.lookup(read.array.name));
 
-    auto shapeTy = toShapeType(std::views::values(pSegMap.space.dims));
+    auto shapeTy = toShapeType(std::views::values(space.dims));
     mlir::SmallVector<mlir::Type> returnTypes;
-    for (const Type &ret : pSegMap.ret) {
-      if (auto *acc = GetAccType(ret)) {
+    for (const Type &resultType : ret) {
+      if (auto *acc = GetAccType(resultType)) {
         assert(acc->ispace.dims.size() == 1);
         assert(acc->ts.size() == 1);
         auto updateType = LowerSegOpBaseType(acc->ts[0], ctx);
         returnTypes.push_back(mlir::RankedTensorType::get(shapeTy, updateType));
-        returnTypes.push_back(mlir::RankedTensorType::get(shapeTy, builder.getI64Type()));
+        returnTypes.push_back(mlir::RankedTensorType::get(
+            shapeTy, builder.getI64Type()));
       } else {
-        returnTypes.push_back(mlir::RankedTensorType::get(shapeTy, LowerSegOpBaseType(ret, ctx)));
+        returnTypes.push_back(mlir::RankedTensorType::get(
+            shapeTy, LowerSegOpBaseType(resultType, ctx)));
       }
     }
     Values dynamicSizes;
@@ -1119,7 +1283,7 @@ struct FutharkCompiler {
 
           Ctx local = ctx;
           Values results = LowerSegOpKernelBody(
-              loc, args, affine_reads, iterSpace, pSegMap.body, pSegMap.ret, local);
+              loc, args, affine_reads, iterSpace, body, ret, local);
 
           assert(results.size() == outputs.size());
           mlir::linalg::YieldOp::create(builder, loc, results);
@@ -1238,21 +1402,19 @@ struct FutharkCompiler {
   Values LowerSegHist(const SegHist &pSegHist, Ctx &ctx) {
     RequireThreadLevel(pSegHist.lvl);
 
-    IterationSpace iterSpace = LowerSegSpace(pSegHist.space, ctx);
+    // If this map is the identity function, IREE will kill it.
+    Values inputs = LowerSegMap(
+        pSegHist.lvl, pSegHist.space, pSegHist.body, pSegHist.ret, ctx);
+    if (inputs.size() != 2)
+      Undefined();
+    mlir::Value indices = inputs[0];
+    mlir::Value values = inputs[1];
 
-    std::vector<AffineRead> affine_reads =
-        FindSegOpAffineReads(iterSpace, pSegHist.body);
-
+    // Histogram
     if (pSegHist.ops.size() != 1) {
       Undefined();
     }
     auto pHistOp = pSegHist.ops[0];
-
-    // Hopefully this is invariant.
-    if (affine_reads.size() != 2)
-      Undefined();
-    mlir::Value indices = ctx.subexps.lookup(affine_reads[0].array.name);
-    mlir::Value values = ctx.subexps.lookup(affine_reads[1].array.name);
 
     Values dests;
     for (auto const &vn : pHistOp.dest) {
@@ -1268,6 +1430,7 @@ struct FutharkCompiler {
     auto op = mlir::iree_compiler::IREE::LinalgExt::ScatterOp::create(
         builder, dest.getType(), values, indices, {}, dest, {0}, false);
 
+    // Lower the histogram's combining op.
     mlir::SmallVector<mlir::Type> opInputTypes;
     for (const auto &param : pHistOp.lambda.params)
       opInputTypes.push_back(LowerTy(param.dec.v));
@@ -1592,14 +1755,19 @@ struct FutharkCompiler {
         std::vector<mlir::AffineExpr> usedDims;
         for (const auto &dim : idx->slice.dims) {
           // TODO suport affine indexing beyond seg space ids
+          // Anything else -- a slice, a constant index, a variable from
+          // outside the iteration space -- is not an affine read, and is left
+          // to the ordinary lowering of the statement.
           auto *fix = std::get_if<DimFix<SubExp>>(&dim.v);
           if (!fix)
-            Undefined();
+            return std::nullopt;
+          auto *var = std::get_if<VarSubExp>(&fix->i.v);
+          if (!var)
+            return std::nullopt;
 
-          auto vnDim = fix->i.GetVName();
-          auto d = std::ranges::find(iterSpace, vnDim.name, &Dim::id);
+          auto d = std::ranges::find(iterSpace, var->v.name, &Dim::id);
           if (d == iterSpace.end())
-            Undefined();
+            return std::nullopt;
           auto i = d->index;
 
           usedDims.push_back(mlir::getAffineDimExpr(i, &context));
@@ -1718,7 +1886,17 @@ struct FutharkCompiler {
     }
 
     if (std::get_if<BinOpSub>(&binOp.v)) {
-      Undefined();
+      assert(!isTensor);
+
+      return mlir::arith::SubIOp::create(builder, {op0, op1}).getResult();
+    }
+
+    // Futhark's `squot` truncates towards zero, which is what arith.divsi
+    // does; `sdiv`, which rounds towards negative infinity, is a different op.
+    if (std::get_if<BinOpSQuot>(&binOp.v)) {
+      assert(!isTensor);
+
+      return mlir::arith::DivSIOp::create(builder, {op0, op1}).getResult();
     }
 
     if (auto *div = std::get_if<BinOpSDivUp>(&binOp.v)) {
@@ -1737,6 +1915,32 @@ struct FutharkCompiler {
       assert(!isTensor);
 
       return mlir::arith::MulFOp::create(builder, {op0, op1}).getResult();
+    }
+
+    if (auto *fsub = std::get_if<BinOpFSub>(&binOp.v)) {
+      assert(!isTensor);
+
+      return mlir::arith::SubFOp::create(builder, {op0, op1}).getResult();
+    }
+
+    if (auto *fdiv = std::get_if<BinOpFDiv>(&binOp.v)) {
+      assert(!isTensor);
+
+      return mlir::arith::DivFOp::create(builder, {op0, op1}).getResult();
+    }
+
+    // Futhark's `fmax` follows libm in returning the non-NaN operand, which is
+    // arith.maxnumf rather than arith.maximumf.
+    if (auto *fmax = std::get_if<BinOpFMax>(&binOp.v)) {
+      assert(!isTensor);
+
+      return mlir::arith::MaxNumFOp::create(builder, {op0, op1}).getResult();
+    }
+
+    if (auto *fpow = std::get_if<BinOpFPow>(&binOp.v)) {
+      assert(!isTensor);
+
+      return mlir::math::PowFOp::create(builder, op0, op1).getResult();
     }
 
     Undefined();
@@ -1780,6 +1984,146 @@ struct FutharkCompiler {
     }
 
     return elems;
+  }
+
+  // Futhark's primitive functions (Futhark.IR.Primitive.primFuns) are applied
+  // without ever being defined in the IR, so a name with no definition is one
+  // of these. They all carry the operand width as a suffix -- separated by an
+  // underscore when the name itself ends in a digit -- which we can drop,
+  // because the lowered operands already have the right MLIR type.
+  //
+  //   "sqrt32" -> "sqrt", "log10_64" -> "log10", "atan2_32" -> "atan2"
+  static std::optional<std::string> IntrinsicBaseName(const std::string &name) {
+    auto end = name.size();
+    while (end > 0 && std::isdigit(static_cast<unsigned char>(name[end - 1])))
+      --end;
+    // No width suffix at all, so this is not a primitive function.
+    if (end == name.size())
+      return std::nullopt;
+    if (end > 0 && name[end - 1] == '_')
+      --end;
+    if (end == 0)
+      return std::nullopt;
+    return name.substr(0, end);
+  }
+
+  Values LowerIntrinsic(const std::string &fname, mlir::ValueRange args) {
+    // `cond_t` is Futhark's branchless select; its suffix is a full type name
+    // ("cond_i64", "cond_bool"), not the width suffix IntrinsicBaseName knows.
+    if (fname.starts_with("cond_")) {
+      if (args.size() != 3)
+        Undefined();
+      return {mlir::arith::SelectOp::create(builder, args[0], args[1], args[2])
+                  .getResult()};
+    }
+
+    auto base = IntrinsicBaseName(fname);
+    if (!base)
+      throw std::runtime_error(
+          std::format("no definition of function '{}'", fname));
+
+    auto unary = [&]<typename Op>() -> Values {
+      if (args.size() != 1)
+        Undefined();
+      return {Op::create(builder, args[0]).getResult()};
+    };
+    auto binary = [&]<typename Op>() -> Values {
+      if (args.size() != 2)
+        Undefined();
+      return {Op::create(builder, args[0], args[1]).getResult()};
+    };
+
+    using namespace mlir::math;
+    const auto &n = *base;
+    if (n == "sqrt")
+      return unary.operator()<SqrtOp>();
+    if (n == "rsqrt")
+      return unary.operator()<RsqrtOp>();
+    if (n == "cbrt")
+      return unary.operator()<CbrtOp>();
+    if (n == "exp")
+      return unary.operator()<ExpOp>();
+    if (n == "exp2")
+      return unary.operator()<Exp2Op>();
+    if (n == "expm1")
+      return unary.operator()<ExpM1Op>();
+    if (n == "log")
+      return unary.operator()<LogOp>();
+    if (n == "log2")
+      return unary.operator()<Log2Op>();
+    if (n == "log10")
+      return unary.operator()<Log10Op>();
+    if (n == "log1p")
+      return unary.operator()<Log1pOp>();
+    if (n == "sin")
+      return unary.operator()<SinOp>();
+    if (n == "cos")
+      return unary.operator()<CosOp>();
+    if (n == "tan")
+      return unary.operator()<TanOp>();
+    if (n == "asin")
+      return unary.operator()<AsinOp>();
+    if (n == "acos")
+      return unary.operator()<AcosOp>();
+    if (n == "atan")
+      return unary.operator()<AtanOp>();
+    if (n == "sinh")
+      return unary.operator()<SinhOp>();
+    if (n == "cosh")
+      return unary.operator()<CoshOp>();
+    if (n == "tanh")
+      return unary.operator()<TanhOp>();
+    if (n == "asinh")
+      return unary.operator()<AsinhOp>();
+    if (n == "acosh")
+      return unary.operator()<AcoshOp>();
+    if (n == "atanh")
+      return unary.operator()<AtanhOp>();
+    if (n == "erf")
+      return unary.operator()<ErfOp>();
+    if (n == "erfc")
+      return unary.operator()<ErfcOp>();
+    if (n == "ceil")
+      return unary.operator()<CeilOp>();
+    if (n == "floor")
+      return unary.operator()<FloorOp>();
+    if (n == "trunc")
+      return unary.operator()<TruncOp>();
+    // Futhark's `round` is C's `rint` under the default rounding mode, i.e.
+    // ties go to even.
+    if (n == "round")
+      return unary.operator()<RoundEvenOp>();
+    if (n == "isnan")
+      return unary.operator()<IsNaNOp>();
+    if (n == "isinf")
+      return unary.operator()<IsInfOp>();
+    if (n == "popc")
+      return unary.operator()<CtPopOp>();
+    if (n == "clz")
+      return unary.operator()<CountLeadingZerosOp>();
+    if (n == "ctz")
+      return unary.operator()<CountTrailingZerosOp>();
+    if (n == "atan2")
+      return binary.operator()<Atan2Op>();
+    if (n == "copysign")
+      return binary.operator()<CopySignOp>();
+    if (n == "fma" || n == "mad") {
+      if (args.size() != 3)
+        Undefined();
+      return {FmaOp::create(builder, args[0], args[1], args[2]).getResult()};
+    }
+
+    throw std::runtime_error(std::format(
+        "'{}' is neither defined in the IR nor a primitive function we lower",
+        fname));
+  }
+
+  static const FunDef *FindFunction(const Prog &prog,
+                                    const std::string &fname) {
+    for (const auto &f : prog.funs)
+      if (f.name == fname)
+        return &f;
+    return nullptr;
   }
 
   std::vector<int64_t> LowerShape(const Shape &shape) {
@@ -1845,18 +2189,5 @@ struct FutharkCompiler {
     if (width == 64)
       return builder.getF64Type();
     Undefined();
-  }
-
-  static FunDef GetFunction(Prog &prog, std::string fname) {
-    for (auto f : prog.funs) {
-      if (f.name == fname)
-        return f;
-    }
-
-    // Futhark's intrinsics (sqrt32, exp32, log32, tanh32, ...) are applied
-    // without ever being defined in the IR; they need lowering to the math
-    // dialect.
-    throw std::runtime_error(
-        std::format("no definition of function '{}'", fname));
   }
 };
