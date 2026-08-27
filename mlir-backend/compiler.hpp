@@ -501,9 +501,6 @@ struct FutharkCompiler {
                           mlir::Value original) {
     namespace LinalgExt = mlir::iree_compiler::IREE::LinalgExt;
 
-    llvm::errs() << " index="; index.getType().print(llvm::errs());
-    llvm::errs() << " original="; original.getType().print(llvm::errs());
-    llvm::errs() << "\n";
     auto originalType = mlir::dyn_cast<mlir::RankedTensorType>(original.getType());
     if (!originalType)
       Undefined();
@@ -803,62 +800,154 @@ struct FutharkCompiler {
     auto k = replicatedInt(ksT);
     auto n = replicatedInt(nsT);
 
-    // rhs: static [g][k][n]. b is not ragged, so its flat length is static.
-    auto rhsTy = mlir::RankedTensorType::get({g, k, n}, elementTy);
-    if (!mlir::ShapedType::isStaticShape(rhsTy.getShape()))
-      throw std::runtime_error(
-          "ragged_dot_nonuniform: shape of rhs tensor must be static.");
-    auto bDataTy = getRankedType(bData.getType());
-    mlir::Value rhs =
-        bDataTy == rhsTy
-            ? bData
-            : mlir::tensor::ExpandShapeOp::create(
-                  builder, rhsTy, bData,
-                  *mlir::getReassociationIndicesForReshape(bDataTy, rhsTy))
-                  .getResult();
-
-    // lhs: [m][k] with m = a_k / k dynamic. Expand the flat, dynamically-sized
-    // a_data; CHLO ragged_dot permits a dynamic lhs (only rhs must be static).
+    // m = a_k / k. Prefer a static m: from a_data's static flat length, else
+    // from a folded-constant a_k argument (k is already static, from ks).
     auto dyn = mlir::ShapedType::kDynamic;
-    auto aK = mlir::tensor::DimOp::create(builder, aData, 0).getResult();
-    auto kIdx = mlir::arith::ConstantIndexOp::create(builder, k).getResult();
-    auto mIdx = mlir::arith::DivUIOp::create(builder, aK, kIdx).getResult();
-    auto lhsTy = mlir::RankedTensorType::get({dyn, k}, elementTy);
-    mlir::SmallVector<mlir::ReassociationIndices> lhsReassoc{{0, 1}};
-    mlir::SmallVector<mlir::OpFoldResult> lhsOutShape{mlir::OpFoldResult(mIdx),
-                                                      builder.getIndexAttr(k)};
-    mlir::Value lhs = mlir::tensor::ExpandShapeOp::create(
-                          builder, lhsTy, aData, lhsReassoc, lhsOutShape)
-                          .getResult();
+    auto aDataTy = getRankedType(aData.getType());
+    int64_t m = aDataTy.hasStaticShape() ? aDataTy.getDimSize(0) / k : dyn;
+    if (mlir::ShapedType::isDynamic(m)) {
+      mlir::APInt aKConst;
+      if (mlir::matchPattern(args[4], mlir::m_ConstantInt(&aKConst)))
+        m = aKConst.getSExtValue() / k;
+    }
+    // TEMP: until the flatten threads a_k statically, uncomment to force a static
+    // m for the m=128 bench and exercise the static chlo.ragged_dot path.
+    // if (mlir::ShapedType::isDynamic(m)) m = 128;
 
-    // Mode 1: ragged dim is lhs axis 0 (m); contract lhs axis 1 with rhs axis 1;
-    // rhs group dim is axis 0; no batching.
-    mlir::SmallVector<int64_t> noBatching{};
-    mlir::SmallVector<int64_t> lhsContracting{1};
-    mlir::SmallVector<int64_t> rhsContracting{1};
-    int64_t lhsRaggedDim = 0;
-    mlir::SmallVector<int64_t> rhsGroupDims{0};
+    mlir::Value resultMN; // the [m][n] product
+    if (!mlir::ShapedType::isDynamic(m)) {
+      // ---- static m: a faithful, minimal chlo.ragged_dot ----
+      // rhs: static [g][k][n]; b is not ragged so its flat length is static.
+      auto rhsTy = mlir::RankedTensorType::get({g, k, n}, elementTy);
+      auto bDataTy = getRankedType(bData.getType());
+      mlir::Value rhs =
+          bDataTy == rhsTy
+              ? bData
+              : mlir::tensor::ExpandShapeOp::create(
+                    builder, rhsTy, bData,
+                    *mlir::getReassociationIndicesForReshape(bDataTy, rhsTy))
+                    .getResult();
+      // lhs [m][k]: expand_shape needs a statically-sized source, so cast the
+      // (possibly dynamic) flat a_data to [m*k] first.
+      auto lhsTy = mlir::RankedTensorType::get({m, k}, elementTy);
+      auto flatTy = mlir::RankedTensorType::get({m * k}, elementTy);
+      mlir::Value flat =
+          aDataTy.hasStaticShape()
+              ? aData
+              : mlir::tensor::CastOp::create(builder, flatTy, aData).getResult();
+      mlir::SmallVector<mlir::ReassociationIndices> reassoc{{0, 1}};
+      mlir::Value lhs =
+          mlir::tensor::ExpandShapeOp::create(builder, lhsTy, flat, reassoc)
+              .getResult();
+      // Mode 1: ragged dim lhs axis 0; contract lhs axis 1 with rhs axis 1;
+      // rhs group dim axis 0; no batching.
+      mlir::SmallVector<int64_t> noBatch{};
+      resultMN = mlir::chlo::RaggedDotOp::create(
+                     builder, mlir::RankedTensorType::get({m, n}, elementTy),
+                     lhs, rhs, ms,
+                     mlir::chlo::RaggedDotDimensionNumbersAttr::get(
+                         &context, noBatch, noBatch,
+                         mlir::SmallVector<int64_t>{1},
+                         mlir::SmallVector<int64_t>{1},
+                         mlir::SmallVector<int64_t>{0},
+                         mlir::SmallVector<int64_t>{0}),
+                     {})
+                     ->getResult(0);
+    } else {
+      // ---- dynamic m: the dense masked dot_general strategy (gg/ragged_matmul).
+      // IREE cannot legalize chlo.ragged_dot's internal dynamic_broadcast for a
+      // runtime m, but stablehlo.dot_general handles dynamic dims, and the mask
+      // is a single affine linalg.generic (no dynamic broadcast).
+      auto mIdx =
+          mlir::arith::DivUIOp::create(
+              builder,
+              mlir::tensor::DimOp::create(builder, aData, 0).getResult(),
+              mlir::arith::ConstantIndexOp::create(builder, k).getResult())
+              .getResult();
+      // lhs2d [m][k]
+      auto lhs2dTy = mlir::RankedTensorType::get({dyn, k}, elementTy);
+      mlir::SmallVector<mlir::ReassociationIndices> lhs2dReassoc{{0, 1}};
+      mlir::SmallVector<mlir::OpFoldResult> lhs2dOut{mlir::OpFoldResult(mIdx),
+                                                     builder.getIndexAttr(k)};
+      mlir::Value lhs2d = mlir::tensor::ExpandShapeOp::create(
+                              builder, lhs2dTy, aData, lhs2dReassoc, lhs2dOut)
+                              .getResult();
 
-    auto ragged = mlir::chlo::RaggedDotOp::create(
-        builder,
-        mlir::RankedTensorType::get({dyn, n}, elementTy),
-        lhs,
-        rhs,
-        ms,
-        mlir::chlo::RaggedDotDimensionNumbersAttr::get(&context,
-                                                       noBatching,
-                                                       noBatching,
-                                                       lhsContracting,
-                                                       rhsContracting,
-                                                       {lhsRaggedDim},
-                                                       rhsGroupDims),
-        {});
+      // masked [m][g][k]: masked[i,e,j] = lhs2d[i,j] if row i in group e else 0,
+      // where group e spans rows [a_offsets[e]/k, a_offsets[e]/k + ms[e]).
+      auto aOffsets = args[7]; // [g]i64 flat offsets
+      auto maskedTy = mlir::RankedTensorType::get({dyn, g, k}, elementTy);
+      mlir::Value maskedInit = mlir::tensor::EmptyOp::create(
+          builder, maskedTy, mlir::ValueRange{mIdx});
+      auto d0 = mlir::getAffineDimExpr(0, &context);
+      auto d1 = mlir::getAffineDimExpr(1, &context);
+      auto d2 = mlir::getAffineDimExpr(2, &context);
+      mlir::SmallVector<mlir::AffineMap> maps{
+          mlir::AffineMap::get(3, 0, {d0, d2}, &context), // lhs2d (i,j)
+          mlir::AffineMap::get(3, 0, {d1}, &context),     // a_offsets (e)
+          mlir::AffineMap::get(3, 0, {d1}, &context),     // ms (e)
+          mlir::AffineMap::getMultiDimIdentityMap(3, &context)}; // out
+      std::vector<mlir::utils::IteratorType> iters(
+          3, mlir::utils::IteratorType::parallel);
+      auto kI64 =
+          mlir::arith::ConstantOp::create(builder, builder.getI64IntegerAttr(k));
+      auto zeroElem = mlir::arith::ConstantOp::create(
+          builder, builder.getZeroAttr(elementTy));
+      mlir::Value masked =
+          mlir::linalg::GenericOp::create(
+              builder, mlir::TypeRange{maskedTy},
+              mlir::ValueRange{lhs2d, aOffsets, ms},
+              mlir::ValueRange{maskedInit}, maps, iters,
+              [&](mlir::OpBuilder &b, mlir::Location loc, mlir::ValueRange a) {
+                mlir::OpBuilder::InsertionGuard guard(builder);
+                builder.setInsertionPointToEnd(b.getInsertionBlock());
+                auto iIdx = mlir::linalg::IndexOp::create(builder, loc, 0);
+                auto iI64 = mlir::arith::IndexCastOp::create(
+                    builder, loc, builder.getI64Type(), iIdx);
+                auto start =
+                    mlir::arith::DivUIOp::create(builder, loc, a[1], kI64);
+                auto end = mlir::arith::AddIOp::create(builder, loc, start, a[2]);
+                auto ge = mlir::arith::CmpIOp::create(
+                    builder, loc, mlir::arith::CmpIPredicate::sge, iI64, start);
+                auto lt = mlir::arith::CmpIOp::create(
+                    builder, loc, mlir::arith::CmpIPredicate::slt, iI64, end);
+                auto inR = mlir::arith::AndIOp::create(builder, loc, ge, lt);
+                auto val = mlir::arith::SelectOp::create(builder, loc, inR, a[0],
+                                                         zeroElem);
+                mlir::linalg::YieldOp::create(builder, loc, val.getResult());
+              })
+              ->getResult(0);
+
+      // fuse masked [m][g][k] -> [m][g*k] and rhs -> [g*k][n], then dot_general
+      // contracting the fused axis (reproduces the two-axis g,k contraction).
+      auto masked2dTy = mlir::RankedTensorType::get({dyn, g * k}, elementTy);
+      mlir::SmallVector<mlir::ReassociationIndices> fuse{{0}, {1, 2}};
+      mlir::Value masked2d = mlir::tensor::CollapseShapeOp::create(
+                                 builder, masked2dTy, masked, fuse)
+                                 .getResult();
+      auto rhsFusedTy = mlir::RankedTensorType::get({g * k, n}, elementTy);
+      auto bDataTy = getRankedType(bData.getType());
+      mlir::Value rhsFused =
+          mlir::tensor::ExpandShapeOp::create(
+              builder, rhsFusedTy, bData,
+              *mlir::getReassociationIndicesForReshape(bDataTy, rhsFusedTy))
+              .getResult();
+      resultMN = mlir::stablehlo::DotGeneralOp::create(
+                     builder, mlir::RankedTensorType::get({dyn, n}, elementTy),
+                     masked2d, rhsFused,
+                     mlir::stablehlo::DotDimensionNumbersAttr::get(
+                         &context, /*lhsBatch=*/{}, /*rhsBatch=*/{},
+                         /*lhsContract=*/{1}, /*rhsContract=*/{0}),
+                     {}, {})
+                     .getResult();
+    }
 
     // data: flatten [m][n] -> [m*n].
-    auto dataTy = mlir::RankedTensorType::get({dyn}, elementTy);
+    auto dataTy = mlir::RankedTensorType::get(
+        {mlir::ShapedType::isDynamic(m) ? dyn : m * n}, elementTy);
     mlir::SmallVector<mlir::ReassociationIndices> dataReassoc{{0, 1}};
     mlir::Value data = mlir::tensor::CollapseShapeOp::create(
-                           builder, dataTy, ragged->getResult(0), dataReassoc)
+                           builder, dataTy, resultMN, dataReassoc)
                            .getResult();
 
     // r = length of data (= m*n), as i64.
@@ -1135,14 +1224,31 @@ struct FutharkCompiler {
 
           auto reassociation =
               mlir::getReassociationIndicesForReshape(sourceTy, resultTy);
-          if (!reassociation)
-            Undefined();
-
-          if (resultTy.getRank() < sourceTy.getRank())
-            return mlir::tensor::CollapseShapeOp::create(
+          if (reassociation) {
+            if (resultTy.getRank() < sourceTy.getRank())
+              return mlir::tensor::CollapseShapeOp::create(
+                  builder, resultTy, op0, *reassociation);
+            return mlir::tensor::ExpandShapeOp::create(
                 builder, resultTy, op0, *reassociation);
-          return mlir::tensor::ExpandShapeOp::create(
-              builder, resultTy, op0, *reassociation);
+          }
+
+          // No single collapse/expand expresses this reshape (e.g. a dynamic
+          // dim flattened to/from static dims). Fall back to tensor.reshape,
+          // which takes the target extents as a shape operand.
+          Values dims;
+          for (int64_t d : resultTy.getShape()) {
+            if (mlir::ShapedType::isDynamic(d))
+              Undefined();
+            dims.push_back(mlir::arith::ConstantOp::create(
+                               builder, builder.getI64IntegerAttr(d))
+                               .getResult());
+          }
+          auto shapeTy = mlir::RankedTensorType::get(
+              {static_cast<int64_t>(dims.size())}, builder.getI64Type());
+          auto shape = mlir::tensor::FromElementsOp::create(builder, shapeTy,
+                                                            dims);
+          return mlir::tensor::ReshapeOp::create(builder, resultTy, op0, shape)
+              .getResult();
         },
         [&](const BasicOpRearrange &val) -> mlir::Value {
           auto op = LowerSubExp(val.arr.name, ctx);
