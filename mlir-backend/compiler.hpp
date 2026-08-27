@@ -493,6 +493,10 @@ struct FutharkCompiler {
     return {value, index};
   }
 
+  // TODO: tests/moe_black_box.fut regressed when scatter stopped being a
+  // black box: its scatter use is beyond what the current with_acc lowering
+  // handles. Reintroduce a scatter black box for that file and lower it via
+  // EmitScatter below.
   mlir::Value EmitScatter(mlir::Value update, mlir::Value index,
                           mlir::Value original) {
     namespace LinalgExt = mlir::iree_compiler::IREE::LinalgExt;
@@ -1319,7 +1323,22 @@ struct FutharkCompiler {
         op,
         [&](const SizeOp &v) { return Values{LowerSizeOp(v, ctx)}; },
         [&](const std::shared_ptr<SegOp> &v) { return LowerSegOp(v, ctx); },
-        [&](const GPUBody &) -> Values { Undefined(); });
+        [&](const GPUBody &g) -> Values {
+          // A single-thread device body returning scalars, whose results are
+          // each lifted into a size-1 array (see the [1] result types).
+          Ctx local = ctx;
+          Values scalars = LowerBody(*g.body, local);
+          Values results;
+          for (auto [v, ty] : llvm::zip_equal(scalars, g.retType)) {
+            // The body's type is the inner (scalar) type; the gpu op lifts each
+            // result into a size-1 array.
+            auto lifted = mlir::RankedTensorType::get({1}, LowerTy(ty));
+            results.push_back(mlir::tensor::FromElementsOp::create(
+                                  builder, lifted, mlir::ValueRange{v})
+                                  .getResult());
+          }
+          return results;
+        });
   }
 
   mlir::Value LowerSizeOp(const SizeOp &sizeOp, Ctx &ctx) { Undefined(); }
@@ -2045,6 +2064,88 @@ struct FutharkCompiler {
       assert(!isTensor);
 
       return mlir::arith::CeilDivSIOp::create(builder, {op0, op1}).getResult();
+    }
+
+    // Integer division/remainder. `sdiv` rounds toward negative infinity
+    // (floordivsi); `srem`/`smod` are truncated/floored remainder -- for the
+    // non-negative sizes and indices in this IR they coincide.
+    if (std::get_if<BinOpSDiv>(&binOp.v)) {
+      assert(!isTensor);
+      return mlir::arith::FloorDivSIOp::create(builder, {op0, op1}).getResult();
+    }
+    if (std::get_if<BinOpSRem>(&binOp.v)) {
+      assert(!isTensor);
+      return mlir::arith::RemSIOp::create(builder, {op0, op1}).getResult();
+    }
+    if (std::get_if<BinOpSMod>(&binOp.v)) {
+      assert(!isTensor);
+      return mlir::arith::RemSIOp::create(builder, {op0, op1}).getResult();
+    }
+    if (std::get_if<BinOpUDiv>(&binOp.v)) {
+      assert(!isTensor);
+      return mlir::arith::DivUIOp::create(builder, {op0, op1}).getResult();
+    }
+    if (std::get_if<BinOpUDivUp>(&binOp.v)) {
+      assert(!isTensor);
+      return mlir::arith::CeilDivUIOp::create(builder, {op0, op1}).getResult();
+    }
+    if (std::get_if<BinOpUMod>(&binOp.v)) {
+      assert(!isTensor);
+      return mlir::arith::RemUIOp::create(builder, {op0, op1}).getResult();
+    }
+
+    // Bitwise / logical.
+    if (std::get_if<BinOpAnd>(&binOp.v) || std::get_if<BinOpLogAnd>(&binOp.v)) {
+      assert(!isTensor);
+      return mlir::arith::AndIOp::create(builder, {op0, op1}).getResult();
+    }
+    if (std::get_if<BinOpOr>(&binOp.v) || std::get_if<BinOpLogOr>(&binOp.v)) {
+      assert(!isTensor);
+      return mlir::arith::OrIOp::create(builder, {op0, op1}).getResult();
+    }
+    if (std::get_if<BinOpXor>(&binOp.v)) {
+      assert(!isTensor);
+      return mlir::arith::XOrIOp::create(builder, {op0, op1}).getResult();
+    }
+    if (std::get_if<BinOpShl>(&binOp.v)) {
+      assert(!isTensor);
+      return mlir::arith::ShLIOp::create(builder, {op0, op1}).getResult();
+    }
+    if (std::get_if<BinOpLShr>(&binOp.v)) {
+      assert(!isTensor);
+      return mlir::arith::ShRUIOp::create(builder, {op0, op1}).getResult();
+    }
+    if (std::get_if<BinOpAShr>(&binOp.v)) {
+      assert(!isTensor);
+      return mlir::arith::ShRSIOp::create(builder, {op0, op1}).getResult();
+    }
+
+    // Integer min/max.
+    if (std::get_if<BinOpSMin>(&binOp.v)) {
+      assert(!isTensor);
+      return mlir::arith::MinSIOp::create(builder, {op0, op1}).getResult();
+    }
+    if (std::get_if<BinOpSMax>(&binOp.v)) {
+      assert(!isTensor);
+      return mlir::arith::MaxSIOp::create(builder, {op0, op1}).getResult();
+    }
+    if (std::get_if<BinOpUMin>(&binOp.v)) {
+      assert(!isTensor);
+      return mlir::arith::MinUIOp::create(builder, {op0, op1}).getResult();
+    }
+    if (std::get_if<BinOpUMax>(&binOp.v)) {
+      assert(!isTensor);
+      return mlir::arith::MaxUIOp::create(builder, {op0, op1}).getResult();
+    }
+
+    // Float min / modulo.
+    if (std::get_if<BinOpFMin>(&binOp.v)) {
+      assert(!isTensor);
+      return mlir::arith::MinNumFOp::create(builder, {op0, op1}).getResult();
+    }
+    if (std::get_if<BinOpFMod>(&binOp.v)) {
+      assert(!isTensor);
+      return mlir::arith::RemFOp::create(builder, {op0, op1}).getResult();
     }
 
     if (auto *fadd = std::get_if<BinOpFAdd>(&binOp.v)) {

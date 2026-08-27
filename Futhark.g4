@@ -144,7 +144,7 @@ pLambda: '\\' '{' pLParam? (',' pLParam)* '}' ':' pTypes '->' pBody;
 
 pLParam: ID ':' pType;
 
-pApply: ('apply') ID '(' pSubExp?   (',' pSubExp)* ')' ':' pRetTypes;
+pApply: ('apply') ('<unsafe>' | '<safe>')? ID '(' pSubExp?   (',' pSubExp)* ')' ':' pRetTypes;
 
 pArg: pSubExp;
 
@@ -282,7 +282,10 @@ COLON_PLUS: ':+';
 
 // A leading '?' allows existential size names (e.g. `?0`) printed by irregular
 // flattening; these parse as variable sizes and lower to dynamic dimensions.
-ID : ( [?a-zA-Z_+'-'*/%!<>|&^.] ) ([a-zA-Z0-9_+\-*/%!<>|&^.₀-₉])*;
+// A `<{...}>` chunk is Futhark's descriptive-name annotation embedded in a
+// variable name (e.g. `d<{group_sizes[i]}>_9743`); consume it as part of the ID.
+ID : ( [?a-zA-Z_+'-'*/%!<>|&^.] ) ([a-zA-Z0-9_+\-*/%!<>|&^.₀-₉] | DESCNAME)*;
+fragment DESCNAME : '<{' ~[}]* '}>';
 
 LPARAM      : '(';
 RPARAM      : ')';
