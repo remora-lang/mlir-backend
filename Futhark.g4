@@ -1,5 +1,12 @@
 grammar Futhark;
 
+@parser::members {
+  // Set while parsing a function's attributes if it is a blackbox; its body is
+  // then consumed opaquely (see pFunDef) since blackbox bodies are replaced at
+  // lowering and may contain constructs the grammar does not model.
+  bool funIsBlackBox = false;
+}
+
 root: header? pStm* pFunDef+ EOF;
 
 header: 'name_source' '{' NUMBER '}' 'types' '{' pTypeBind* '}';
@@ -13,9 +20,15 @@ pRecordField: NUMBER ':' pType;
 
 pRank: NUMBER ID;
 
-pFunDef: pAttr* (pEntry? | 'fun') ID LPARAM fParam? (',' fParam)* RPARAM ':' OPEN_BRACKET '*'? pType (',' '*'? pType)* CLOSE_BRACKET '=' OPEN_BRACKET pBody CLOSE_BRACKET;
+pFunDef: {funIsBlackBox = false;} pAttr* (pEntry? | 'fun') ID LPARAM fParam? (',' fParam)* RPARAM ':' OPEN_BRACKET '*'? pType (',' '*'? pType)* CLOSE_BRACKET '='
+         ( {funIsBlackBox}? pOpaqueBody
+         | OPEN_BRACKET pBody CLOSE_BRACKET );
 
-pAttr: '#' '[' ID ('(' (ID (',' ID)*)? ')')? ']';
+// A brace-balanced blob, used to swallow blackbox function bodies without
+// interpreting their contents.
+pOpaqueBody: OPEN_BRACKET ( ~(OPEN_BRACKET | CLOSE_BRACKET) | pOpaqueBody )* CLOSE_BRACKET;
+
+pAttr: '#' '[' name=ID {if ($name.text == "blackbox") funIsBlackBox = true;} ('(' (ID (',' ID)*)? ')')? ']';
 
 pEntry: ('entry') LPARAM STRING_LITERAL COMMA OPEN_BRACKET pEntryPointInput? (COMMA pEntryPointInput)* CLOSE_BRACKET COMMA (OPAQUE STRING_LITERAL | '*'? pType) RPARAM;
 
