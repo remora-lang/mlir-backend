@@ -346,6 +346,9 @@ struct FutharkTranslationVisitor {
       return {VisitBasicOpConvOp(pConv)};
     if (auto *pUnOp = dynamic_cast<FutharkParser::BasicOpUnOpContext *>(ctx))
       return {VisitBasicOpUnOp(pUnOp)};
+    // `copy` is a no-op under MLIR value semantics, so lower it as its operand.
+    if (auto *pCopy = dynamic_cast<FutharkParser::BasicOpCopyContext *>(ctx))
+      return {BasicOpSubExp{VisitSubExp(pCopy->pSubExp())}};
     if (auto *pConcat =
             dynamic_cast<FutharkParser::BasicOpConcatContext *>(ctx))
       return {VisitBasicOpConcat(pConcat)};

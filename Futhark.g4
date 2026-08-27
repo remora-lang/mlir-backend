@@ -166,6 +166,7 @@ pBasicOp: 'replicate' '(' pExtShape ',' pSubExp ')' #BasicOpReplicate
     | 'scratch' '(' pPrimType (',' pSubExp)* ')' #BasicOpScratch
     | 'update_acc' '(' ID ',' '{' pSubExp '}' ',' '{' pSubExp '}' ')' #BasicOpUpdateAcc
     | 'manifest' '(' pSubExp ',' '(' NUMBER (',' NUMBER)* ')' ')' #BasicOpManifest
+    | 'copy' '(' pSubExp ')' #BasicOpCopy
     ;
 
 pDimIndex: pSubExp COLON_PLUS pSubExp '*' pSubExp #DimSlice
