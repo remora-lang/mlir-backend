@@ -333,6 +333,8 @@ struct FutharkCompiler {
                   return LowerDotGeneral(args, retTypes, ctx);
                 case BlackBox::RaggedDot:
                   return LowerRaggedDot(args, retTypes, ctx);
+                case BlackBox::RaggedDotNonUniform:
+                  return LowerRaggedDotNonUniform(args, retTypes, ctx);
                 case BlackBox::ArgSort:
                   return LowerArgSort(args, retTypes, ctx);
                 }
@@ -739,6 +741,142 @@ struct FutharkCompiler {
         {});
 
     return op->getResults();
+  }
+
+  Values LowerRaggedDotNonUniform(mlir::ValueRange args,
+                                  mlir::TypeRange retTypes, Ctx &ctx) {
+    // A nonuniform ragged_dot expressed over the flat segmented representation
+    // produced by irregular flattening. This blackbox sits on matmul_nonuniform,
+    // so it is lowered at its application site where the actual (constant) size
+    // arguments are visible: k = ks[0], n = ns[0], b_data static.
+    //
+    // Inputs (matmul_nonuniform's signature)
+    // ------
+    // 0: g          number of segments
+    // 1: ms         [g] group sizes (== ragged_dot's group_sizes)
+    // 2: ks         [g] replicate(k) -- k uniform across groups
+    // 3: ns         [g] replicate(n) -- n uniform across groups
+    // 4: a_k        flat lhs length (dynamic)
+    // 5..7:         a_segment_sizes / a_flag / a_offsets (unused)
+    // 8: a_data     flat lhs [a_k]         (dynamic in m)
+    // 9: b_k        flat rhs length (static, = g*k*n)
+    // 10..12:       b_segment_sizes / b_flag / b_offsets (unused)
+    // 13: b_data    flat rhs [b_k]         (static)
+    //
+    // Outputs: the existential size r followed by the segmented tuple
+    //   (r : i64, sizes : [g]i64, flags : [r]i1, offsets : [g]i64, data : [r]f32)
+    // Only `data` (the flattened [m][n] result) is meaningful; the auxiliary
+    // segment structures are dummies for this demonstration.
+    assert(args.size() == 14);
+    assert(retTypes.size() == 5);
+    auto ms = args[1];
+    auto ksT = args[2];
+    auto nsT = args[3];
+    auto aData = args[8];
+    auto bData = args[13];
+
+    auto elementTy = getRankedType(aData.getType()).getElementType();
+    auto g = getRankedType(ms.getType()).getShape().back();
+
+    // Recover a `replicate`d scalar constant. Futhark's replicate lowers to
+    // linalg.broadcast(from_elements(constant)) (see BasicOpReplicate), so peel
+    // those to reach the scalar; also accept a folded dense constant directly.
+    auto replicatedInt = [&](mlir::Value v) -> int64_t {
+      mlir::DenseIntElementsAttr dense;
+      if (mlir::matchPattern(v, mlir::m_Constant(&dense)))
+        return dense.getValues<int64_t>()[0];
+      mlir::Value cur = v;
+      if (auto bcast = cur.getDefiningOp<mlir::linalg::BroadcastOp>())
+        cur = bcast.getInput();
+      if (auto fe = cur.getDefiningOp<mlir::tensor::FromElementsOp>())
+        cur = fe.getOperand(0);
+      return getConstantInt(cur);
+    };
+
+    auto k = replicatedInt(ksT);
+    auto n = replicatedInt(nsT);
+
+    // rhs: static [g][k][n]. b is not ragged, so its flat length is static.
+    auto rhsTy = mlir::RankedTensorType::get({g, k, n}, elementTy);
+    if (!mlir::ShapedType::isStaticShape(rhsTy.getShape()))
+      throw std::runtime_error(
+          "ragged_dot_nonuniform: shape of rhs tensor must be static.");
+    auto bDataTy = getRankedType(bData.getType());
+    mlir::Value rhs =
+        bDataTy == rhsTy
+            ? bData
+            : mlir::tensor::ExpandShapeOp::create(
+                  builder, rhsTy, bData,
+                  *mlir::getReassociationIndicesForReshape(bDataTy, rhsTy))
+                  .getResult();
+
+    // lhs: [m][k] with m = a_k / k dynamic. Expand the flat, dynamically-sized
+    // a_data; CHLO ragged_dot permits a dynamic lhs (only rhs must be static).
+    auto dyn = mlir::ShapedType::kDynamic;
+    auto aK = mlir::tensor::DimOp::create(builder, aData, 0).getResult();
+    auto kIdx = mlir::arith::ConstantIndexOp::create(builder, k).getResult();
+    auto mIdx = mlir::arith::DivUIOp::create(builder, aK, kIdx).getResult();
+    auto lhsTy = mlir::RankedTensorType::get({dyn, k}, elementTy);
+    mlir::SmallVector<mlir::ReassociationIndices> lhsReassoc{{0, 1}};
+    mlir::SmallVector<mlir::OpFoldResult> lhsOutShape{mlir::OpFoldResult(mIdx),
+                                                      builder.getIndexAttr(k)};
+    mlir::Value lhs = mlir::tensor::ExpandShapeOp::create(
+                          builder, lhsTy, aData, lhsReassoc, lhsOutShape)
+                          .getResult();
+
+    // Mode 1: ragged dim is lhs axis 0 (m); contract lhs axis 1 with rhs axis 1;
+    // rhs group dim is axis 0; no batching.
+    mlir::SmallVector<int64_t> noBatching{};
+    mlir::SmallVector<int64_t> lhsContracting{1};
+    mlir::SmallVector<int64_t> rhsContracting{1};
+    int64_t lhsRaggedDim = 0;
+    mlir::SmallVector<int64_t> rhsGroupDims{0};
+
+    auto ragged = mlir::chlo::RaggedDotOp::create(
+        builder,
+        mlir::RankedTensorType::get({dyn, n}, elementTy),
+        lhs,
+        rhs,
+        ms,
+        mlir::chlo::RaggedDotDimensionNumbersAttr::get(&context,
+                                                       noBatching,
+                                                       noBatching,
+                                                       lhsContracting,
+                                                       rhsContracting,
+                                                       {lhsRaggedDim},
+                                                       rhsGroupDims),
+        {});
+
+    // data: flatten [m][n] -> [m*n].
+    auto dataTy = mlir::RankedTensorType::get({dyn}, elementTy);
+    mlir::SmallVector<mlir::ReassociationIndices> dataReassoc{{0, 1}};
+    mlir::Value data = mlir::tensor::CollapseShapeOp::create(
+                           builder, dataTy, ragged->getResult(0), dataReassoc)
+                           .getResult();
+
+    // r = length of data (= m*n), as i64.
+    auto rIdx = mlir::tensor::DimOp::create(builder, data, 0).getResult();
+    mlir::Value r = mlir::arith::IndexCastOp::create(
+                        builder, builder.getI64Type(), rIdx)
+                        .getResult();
+
+    // Dummy auxiliary segment structures.
+    auto i64Ty = builder.getI64Type();
+    auto gI64Ty = mlir::RankedTensorType::get({g}, i64Ty);
+    auto zeros = mlir::DenseElementsAttr::get(gI64Ty, static_cast<int64_t>(0));
+    mlir::Value sizes = mlir::arith::ConstantOp::create(builder, zeros);
+    mlir::Value offsets = mlir::arith::ConstantOp::create(builder, zeros);
+    auto flagsTy = mlir::RankedTensorType::get({dyn}, builder.getI1Type());
+    auto flagsEmpty = mlir::tensor::EmptyOp::create(builder, flagsTy,
+                                                    mlir::ValueRange{rIdx});
+    auto trueC =
+        mlir::arith::ConstantOp::create(builder, builder.getBoolAttr(true));
+    mlir::Value flags = mlir::linalg::FillOp::create(
+                            builder, mlir::ValueRange{trueC},
+                            mlir::ValueRange{flagsEmpty})
+                            .result();
+
+    return {r, sizes, flags, offsets, data};
   }
 
   Values LowerArgSort(mlir::ValueRange args, mlir::TypeRange retTypes,

@@ -5,7 +5,7 @@
 #include <optional>
 #include <string>
 
-enum class BlackBox { MatMul, DotGeneral, RaggedDot, ArgSort };
+enum class BlackBox { MatMul, DotGeneral, RaggedDot, RaggedDotNonUniform, ArgSort };
 
 inline BlackBox ToBlackBox(const std::string &name) {
   if (name == "matmul") {
@@ -16,6 +16,9 @@ inline BlackBox ToBlackBox(const std::string &name) {
   }
   if (name == "ragged_dot") {
     return BlackBox::RaggedDot;
+  }
+  if (name == "ragged_dot_nonuniform") {
+    return BlackBox::RaggedDotNonUniform;
   }
   if (name == "argsort") {
     return BlackBox::ArgSort;

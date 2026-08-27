@@ -256,7 +256,9 @@ MATCH_SORT: '<' ('equiv' | 'fallback') '>';
 // The separator in a slice: `start :+ n * stride`.
 COLON_PLUS: ':+';
 
-ID : ( [a-zA-Z_+'-'*/%!<>|&^.] ) ([a-zA-Z0-9_+\-*/%!<>|&^.₀-₉])*;
+// A leading '?' allows existential size names (e.g. `?0`) printed by irregular
+// flattening; these parse as variable sizes and lower to dynamic dimensions.
+ID : ( [?a-zA-Z_+'-'*/%!<>|&^.] ) ([a-zA-Z0-9_+\-*/%!<>|&^.₀-₉])*;
 
 LPARAM      : '(';
 RPARAM      : ')';
