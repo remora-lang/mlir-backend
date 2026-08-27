@@ -143,6 +143,7 @@ pBasicOp: 'replicate' '(' pExtShape ',' pSubExp ')' #BasicOpReplicate
     | pBinOp #BasicOpBinary
     | pCmpOp #BasicOpCmp
     | pConvOp #BasicOpConv
+    | UNOP pSubExp #BasicOpUnOp
     | 'reshape' '(' pSubExp ',' '(' (NUMBER '::' NUMBER '=>' pExtShape ';') pExtShape ')' ')'  #BasicOpReshape
     | 'rearrange' '(' pSubExp ',' '(' NUMBER (',' NUMBER)* ')' ')' #BasicOpRearrange
     | 'assert' '(' pSubExp ',' '{' pErrPart (',' pErrPart)* '}' ')' #BasicOpAssert
@@ -186,6 +187,11 @@ pPrimType: INTEGER_TYPE #PrimTypeInteger
 INTEGER_TYPE: 'i8' | 'i16' | 'i32' | 'i64';
 FLOAT_TYPE: 'f16' | 'f32' | 'f64';
 
+// Futhark UnOp, printed as `<op>_<type>` (e.g. `neg_bool`, `abs_i32`,
+// `fabs_f32`). Must precede ID so it wins over the generic identifier rule.
+UNOP: ('neg' | 'abs' | 'complement' | 'ssignum' | 'usignum' | 'fsignum' | 'fabs')
+      '_' ('bool' | INTEGER_TYPE | FLOAT_TYPE);
+
 // Special float literals, printed type-first with an optional sign, matching
 // Futhark's `Pretty FloatValue`: `f32.inf`, `-f32.inf`, `f32.nan`.
 // Declared before ID so it wins the maximal-munch tie against an identifier.
@@ -206,16 +212,18 @@ FMUL: 'fmul' NUMBER;
 ADDNW: 'add_nw' NUMBER;
 SUBNW: 'sub_nw' NUMBER;
 MULNW: 'mul_nw' NUMBER;
-UDIV: 'udiv' NUMBER;
-UDIVUP: 'udiv_up' NUMBER;
-SDIV: 'sdiv' NUMBER;
-SDIVUP: 'sdiv_up' NUMBER;
+// Integer division/modulo carry a Safety flag, printed `_safe` (e.g.
+// `squot_safe64`); it lowers the same as the unchecked kind.
+UDIV: 'udiv' '_safe'? NUMBER;
+UDIVUP: 'udiv_up' '_safe'? NUMBER;
+SDIV: 'sdiv' '_safe'? NUMBER;
+SDIVUP: 'sdiv_up' '_safe'? NUMBER;
 FDIV: 'fdiv' NUMBER;
 FMOD: 'fmod' NUMBER;
-UMOD: 'umod' NUMBER;
-SMOD: 'smod' NUMBER;
-SQUOT: 'squot' NUMBER;
-SREM: 'srem' NUMBER;
+UMOD: 'umod' '_safe'? NUMBER;
+SMOD: 'smod' '_safe'? NUMBER;
+SQUOT: 'squot' '_safe'? NUMBER;
+SREM: 'srem' '_safe'? NUMBER;
 SMIN: 'smin' NUMBER;
 UMIN: 'umin' NUMBER;
 FMIN: 'fmin' NUMBER;

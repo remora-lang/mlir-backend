@@ -1253,7 +1253,43 @@ struct FutharkCompiler {
         },
         [](const BasicOpOpaque &) -> mlir::Value { Undefined(); },
         [](const BasicOpArrayVal &) -> mlir::Value { Undefined(); },
-        [](const BasicOpUnOp &) -> mlir::Value { Undefined(); },
+        [&](const BasicOpUnOp &val) -> mlir::Value {
+          auto v = LowerSubExp(val.subExp, ctx);
+          auto ty = v.getType();
+          return match(
+              val.op.v,
+              [&](const UnOpNeg &) -> mlir::Value {
+                // Neg on bool is logical not (xor true); on ints it is 0 - x;
+                // on floats it is negation.
+                if (ty.isInteger(1)) {
+                  auto t = mlir::arith::ConstantOp::create(
+                      builder, builder.getBoolAttr(true));
+                  return mlir::arith::XOrIOp::create(builder,
+                                                     mlir::ValueRange{v, t})
+                      .getResult();
+                }
+                if (llvm::isa<mlir::IntegerType>(ty)) {
+                  auto zero = mlir::arith::ConstantOp::create(
+                      builder, builder.getIntegerAttr(ty, 0));
+                  return mlir::arith::SubIOp::create(builder,
+                                                     mlir::ValueRange{zero, v})
+                      .getResult();
+                }
+                return mlir::arith::NegFOp::create(builder, v).getResult();
+              },
+              [&](const UnOpComplement &) -> mlir::Value {
+                auto ones = mlir::arith::ConstantOp::create(
+                    builder, builder.getIntegerAttr(ty, -1));
+                return mlir::arith::XOrIOp::create(builder,
+                                                   mlir::ValueRange{v, ones})
+                    .getResult();
+              },
+              [](const UnOpAbs &) -> mlir::Value { Undefined(); },
+              [](const UnOpFAbs &) -> mlir::Value { Undefined(); },
+              [](const UnOpSSignum &) -> mlir::Value { Undefined(); },
+              [](const UnOpUSignum &) -> mlir::Value { Undefined(); },
+              [](const UnOpFSignum &) -> mlir::Value { Undefined(); });
+        },
         [](const BasicOpFlatIndex &) -> mlir::Value { Undefined(); },
         [](const BasicOpUpdate &) -> mlir::Value { Undefined(); },
         [](const BasicOpAssert &) -> mlir::Value { Undefined(); },

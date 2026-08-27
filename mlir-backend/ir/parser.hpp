@@ -344,6 +344,8 @@ struct FutharkTranslationVisitor {
       return {VisitBasicOpIota(pIota)};
     if (auto *pConv = dynamic_cast<FutharkParser::BasicOpConvContext *>(ctx))
       return {VisitBasicOpConvOp(pConv)};
+    if (auto *pUnOp = dynamic_cast<FutharkParser::BasicOpUnOpContext *>(ctx))
+      return {VisitBasicOpUnOp(pUnOp)};
     if (auto *pConcat =
             dynamic_cast<FutharkParser::BasicOpConcatContext *>(ctx))
       return {VisitBasicOpConcat(pConcat)};
@@ -434,11 +436,81 @@ struct FutharkTranslationVisitor {
     return arr;
   }
 
+  UnOp VisitUnOpName(const std::string &str) {
+    auto us = str.find('_');
+    std::string name = str.substr(0, us);
+    std::string ty = str.substr(us + 1);
+    auto intTy = [&]() -> IntType {
+      if (ty == "i8")
+        return IntType::Int8;
+      if (ty == "i16")
+        return IntType::Int16;
+      if (ty == "i32")
+        return IntType::Int32;
+      if (ty == "i64")
+        return IntType::Int64;
+      Undefined();
+    };
+    auto floatTy = [&]() -> FloatType {
+      if (ty == "f16")
+        return FloatType::Float16;
+      if (ty == "f32")
+        return FloatType::Float32;
+      if (ty == "f64")
+        return FloatType::Float64;
+      Undefined();
+    };
+    auto primTy = [&]() -> PrimType {
+      if (ty == "bool")
+        return {PrimTypeBool{}};
+      if (ty == "i8")
+        return PrimType::Int8();
+      if (ty == "i16")
+        return PrimType::Int16();
+      if (ty == "i32")
+        return PrimType::Int32();
+      if (ty == "i64")
+        return PrimType::Int64();
+      if (ty == "f16")
+        return PrimType::Float16();
+      if (ty == "f32")
+        return PrimType::Float32();
+      if (ty == "f64")
+        return PrimType::Float64();
+      Undefined();
+    };
+    if (name == "neg")
+      return {UnOpNeg{primTy()}};
+    if (name == "complement")
+      return {UnOpComplement{intTy()}};
+    if (name == "abs")
+      return {UnOpAbs{intTy()}};
+    if (name == "ssignum")
+      return {UnOpSSignum{intTy()}};
+    if (name == "usignum")
+      return {UnOpUSignum{intTy()}};
+    if (name == "fabs")
+      return {UnOpFAbs{floatTy()}};
+    if (name == "fsignum")
+      return {UnOpFSignum{floatTy()}};
+    Undefined();
+  }
+
+  BasicOpUnOp VisitBasicOpUnOp(FutharkParser::BasicOpUnOpContext *ctx) {
+    return BasicOpUnOp{VisitUnOpName(ctx->UNOP()->getText()),
+                       VisitSubExp(ctx->pSubExp())};
+  }
+
   BinOp VisitBinOp(FutharkParser::PBinOpContext *ctx) {
     auto str = ctx->binaryOpcode()->getText();
     auto it = std::find_if(str.begin(), str.end(), ::isdigit);
     size_t l = std::distance(str.begin(), it);
     std::string name = str.substr(0, l);
+
+    // Drop Futhark's safe-division marker (`_safe`); safe and unsafe division
+    // lower the same way here.
+    if (auto p = name.find("_safe"); p != std::string::npos)
+      name.erase(p, 5);
 
     // The logical operators are the only ones without a width suffix.
     if (name == "logand")
