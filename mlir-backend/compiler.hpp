@@ -501,6 +501,9 @@ struct FutharkCompiler {
                           mlir::Value original) {
     namespace LinalgExt = mlir::iree_compiler::IREE::LinalgExt;
 
+    llvm::errs() << " index="; index.getType().print(llvm::errs());
+    llvm::errs() << " original="; original.getType().print(llvm::errs());
+    llvm::errs() << "\n";
     auto originalType = mlir::dyn_cast<mlir::RankedTensorType>(original.getType());
     if (!originalType)
       Undefined();
@@ -1631,7 +1634,11 @@ struct FutharkCompiler {
       Undefined();
 
     const int64_t scanValueCount = segBinOp.neutral.size();
-    const int64_t outputCount = pSegScan.ret.size();
+    // The segscan's outputs are the post-op's results, which may project the
+    // scan carries to fewer values (e.g. a segmented (flag,value) scan whose
+    // post-op keeps only the value). `pSegScan.ret` is the scan-carry types, so
+    // the output count/types come from the post-op lambda instead.
+    const int64_t outputCount = pSegScan.post_op.lambda.ret.size();
 
     IterationSpace iterSpace = LowerSegSpace(pSegScan.space, ctx);
     if (iterSpace.size() == 0)
@@ -1649,7 +1656,7 @@ struct FutharkCompiler {
     auto shape = toShapeType(std::views::values(pSegScan.space.dims));
     mlir::SmallVector<mlir::RankedTensorType> returnTypes;
     returnTypes.reserve(outputCount);
-    for (const Type &ret : pSegScan.ret)
+    for (const Type &ret : pSegScan.post_op.lambda.ret)
       returnTypes.push_back(
           mlir::RankedTensorType::get(shape, LowerSegOpBaseType(ret, ctx)));
 
