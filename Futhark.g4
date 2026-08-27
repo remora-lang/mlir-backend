@@ -28,7 +28,10 @@ pFunDef: {funIsBlackBox = false;} pAttr* (pEntry? | 'fun') ID LPARAM fParam? (',
 // interpreting their contents.
 pOpaqueBody: OPEN_BRACKET ( ~(OPEN_BRACKET | CLOSE_BRACKET) | pOpaqueBody )* CLOSE_BRACKET;
 
-pAttr: '#' '[' name=ID {if ($name.text == "blackbox") funIsBlackBox = true;} ('(' (ID (',' ID)*)? ')')? ']';
+pAttr: '#' '[' name=ID ('(' (arg=ID (',' ID)*)? ')')? ']'
+       // Only real blackboxes have their bodies replaced at lowering; a
+       // `blackbox(dummy)` keeps and lowers its body, so do not skip it.
+       {if ($name.text == "blackbox" && $arg != nullptr && $arg.text != "dummy") funIsBlackBox = true;};
 
 pEntry: ('entry') LPARAM STRING_LITERAL COMMA OPEN_BRACKET pEntryPointInput? (COMMA pEntryPointInput)* CLOSE_BRACKET COMMA (OPAQUE STRING_LITERAL | '*'? pType) RPARAM;
 
