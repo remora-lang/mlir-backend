@@ -23,6 +23,7 @@
 #include <mlir/Dialect/Linalg/IR/Linalg.h>
 #include <mlir/Dialect/Math/IR/Math.h>
 #include <mlir/Dialect/Tensor/IR/Tensor.h>
+#include <mlir/Dialect/Vector/IR/VectorOps.h>
 #include <mlir/IR/AffineMap.h>
 #include <mlir/IR/BuiltinTypeInterfaces.h>
 #include <optional>
@@ -152,6 +153,7 @@ struct FutharkCompiler {
     context.getOrLoadDialect<mlir::func::FuncDialect>();
     context.getOrLoadDialect<mlir::stablehlo::StablehloDialect>();
     context.getOrLoadDialect<mlir::chlo::ChloDialect>();
+    context.getOrLoadDialect<mlir::vector::VectorDialect>();
     module = mlir::ModuleOp::create(builder.getUnknownLoc());
     builder.setInsertionPointToStart(module.getBody());
   }
@@ -1843,39 +1845,56 @@ struct FutharkCompiler {
       return {pg.getResult(0)};
     }
 
-    // Segmented (2-value: flag + integer value) scan -- e.g. the segmented iota
-    // used by irregular flattening. iree_linalg_ext.scan is single-value, so we
-    // pack (flag, value) into one i64 (flag in bit 62), scan with a region that
-    // unpacks/combines/repacks, and unpack in the post-op. This keeps it on the
-    // parallel scan op rather than the serial scf.for below.
-    // This packing only handles a (i1 flag, i64 value) pair; any other 2-value
-    // scan falls through to the serial scf.for below (correct, just slower).
-    if (scanValueCount == 2 && outputCount == 1 &&
-        LowerSegOpBaseType(pSegScan.ret[0], ctx).isInteger(1) &&
-        LowerSegOpBaseType(pSegScan.ret[1], ctx).isInteger(64)) {
+    // Segmented multi-value scan (e.g. the (flag, value) segmented iota used by
+    // irregular flattening). iree_linalg_ext.scan carries a single element per
+    // lane, so we pack the N scan values into one vector<N x i64> element: each
+    // value is zero-extended to i64 into its own lane, the scan region unpacks
+    // (truncating each lane back to its original type), applies the Futhark
+    // binop, and repacks; the post-op unpacks and runs. This keeps the scan on
+    // the parallel scan op rather than the serial scf.for below, with no bit
+    // packing -- it works for any number of integer-typed scan values. Any
+    // other case (non-integer values, >64-bit) falls through to the serial loop.
+    mlir::SmallVector<mlir::Type> valueTypes;
+    bool allInt = scanValueCount >= 2 && outputCount == 1;
+    for (int64_t i = 0; allInt && i < scanValueCount; ++i) {
+      auto t = LowerSegOpBaseType(pSegScan.ret[i], ctx);
+      valueTypes.push_back(t);
+      auto it = mlir::dyn_cast<mlir::IntegerType>(t);
+      if (!it || it.getWidth() > 64)
+        allInt = false;
+    }
+    if (allInt) {
       namespace LinalgExt = mlir::iree_compiler::IREE::LinalgExt;
       mlir::Location sloc = builder.getLoc();
       auto i64Ty = builder.getI64Type();
-      auto i1Ty = builder.getI1Type();
-      auto mask = mlir::arith::ConstantOp::create(
-          builder, builder.getI64IntegerAttr((int64_t(1) << 62) - 1));
-      auto c62 = mlir::arith::ConstantOp::create(builder,
-                                                 builder.getI64IntegerAttr(62));
-      // pack(flag,value) and unpack(packed) as MLIR-value helpers.
-      auto packV = [&](mlir::Value flag, mlir::Value value) -> mlir::Value {
-        auto fe = mlir::arith::ExtUIOp::create(builder, i64Ty, flag);
-        auto fb = mlir::arith::ShLIOp::create(builder,
-                                              mlir::ValueRange{fe, c62});
-        return mlir::arith::OrIOp::create(builder, mlir::ValueRange{value, fb})
+      auto vecTy = mlir::VectorType::get({scanValueCount}, i64Ty);
+      // extend a value to an i64 lane / truncate a lane back to its type.
+      auto toLane = [&](mlir::Value v) -> mlir::Value {
+        if (v.getType().isInteger(64))
+          return v;
+        return mlir::arith::ExtUIOp::create(builder, i64Ty, v).getResult();
+      };
+      auto fromLane = [&](mlir::Value lane, mlir::Type ty) -> mlir::Value {
+        if (ty.isInteger(64))
+          return lane;
+        return mlir::arith::TruncIOp::create(builder, ty, lane).getResult();
+      };
+      auto packVec = [&](mlir::ValueRange vals) -> mlir::Value {
+        mlir::SmallVector<mlir::Value> lanes;
+        for (auto v : vals)
+          lanes.push_back(toLane(v));
+        return mlir::vector::FromElementsOp::create(builder, vecTy, lanes)
             .getResult();
       };
-      auto unpackFlag = [&](mlir::Value p) -> mlir::Value {
-        auto s = mlir::arith::ShRUIOp::create(builder, mlir::ValueRange{p, c62});
-        return mlir::arith::TruncIOp::create(builder, i1Ty, s).getResult();
-      };
-      auto unpackVal = [&](mlir::Value p) -> mlir::Value {
-        return mlir::arith::AndIOp::create(builder, mlir::ValueRange{p, mask})
-            .getResult();
+      auto unpackVec = [&](mlir::Value vec) -> Values {
+        Values out;
+        for (int64_t i = 0; i < scanValueCount; ++i) {
+          auto lane = mlir::vector::ExtractOp::create(
+                          builder, vec, mlir::ArrayRef<int64_t>{i})
+                          .getResult();
+          out.push_back(fromLane(lane, valueTypes[i]));
+        }
+        return out;
       };
 
       Values scanIn = LowerSegMap(pSegScan.lvl, pSegScan.space, pSegScan.body,
@@ -1890,67 +1909,68 @@ struct FutharkCompiler {
                 mlir::tensor::DimOp::create(builder, scanIn[0], i).getResult());
         return ds;
       };
-      auto packedTy = mlir::RankedTensorType::get(inTy.getShape(), i64Ty);
+      auto packedTy = mlir::RankedTensorType::get(inTy.getShape(), vecTy);
       auto idMap = mlir::AffineMap::getMultiDimIdentityMap(inTy.getRank(),
                                                            &context);
       std::vector<mlir::utils::IteratorType> its(
           inTy.getRank(), mlir::utils::IteratorType::parallel);
 
-      // pack the (flag, value) element tensors into a single i64 tensor.
-      mlir::Value packEmpty =
-          mlir::tensor::EmptyOp::create(builder, packedTy, dynOf(inTy.getShape()));
+      // pack the per-value element tensors into one vector-element tensor.
+      mlir::Value packEmpty = mlir::tensor::EmptyOp::create(
+          builder, packedTy, dynOf(inTy.getShape()));
+      mlir::SmallVector<mlir::AffineMap> packMaps(scanValueCount + 1, idMap);
       mlir::Value packed =
           mlir::linalg::GenericOp::create(
               builder, mlir::TypeRange{packedTy},
-              mlir::ValueRange{scanIn[0], scanIn[1]}, mlir::ValueRange{packEmpty},
-              mlir::SmallVector<mlir::AffineMap>{idMap, idMap, idMap}, its,
+              mlir::ValueRange{scanIn}, mlir::ValueRange{packEmpty}, packMaps,
+              its,
               [&](mlir::OpBuilder &b, mlir::Location l, mlir::ValueRange a) {
                 mlir::OpBuilder::InsertionGuard g(builder);
                 builder.setInsertionPointToEnd(b.getInsertionBlock());
-                mlir::linalg::YieldOp::create(builder, l, packV(a[0], a[1]));
+                mlir::linalg::YieldOp::create(
+                    builder, l, packVec(a.take_front(scanValueCount)));
               })
               ->getResult(0);
 
-      // scan the packed values.
+      // scan the packed vector values.
       auto accTy = mlir::RankedTensorType::get(
-          llvm::to_vector(inTy.getShape().drop_back()), i64Ty);
+          llvm::to_vector(inTy.getShape().drop_back()), vecTy);
       mlir::Value accEmpty = mlir::tensor::EmptyOp::create(
           builder, accTy, dynOf(inTy.getShape().drop_back()));
-      // neutral packed = pack(neutral_flag, neutral_value).
-      mlir::Value nFlag = LowerSubExp(segBinOp.neutral[0], ctx);
-      mlir::Value nVal = LowerSubExp(segBinOp.neutral[1], ctx);
+      Values neutralVals;
+      for (int64_t i = 0; i < scanValueCount; ++i)
+        neutralVals.push_back(LowerSubExp(segBinOp.neutral[i], ctx));
       mlir::Value accInit = mlir::linalg::FillOp::create(
-                                builder, mlir::ValueRange{packV(nFlag, nVal)},
+                                builder, mlir::ValueRange{packVec(neutralVals)},
                                 mlir::ValueRange{accEmpty})
                                 .result();
-      mlir::Value scanOut =
-          mlir::tensor::EmptyOp::create(builder, packedTy, dynOf(inTy.getShape()));
+      mlir::Value scanOut = mlir::tensor::EmptyOp::create(
+          builder, packedTy, dynOf(inTy.getShape()));
       auto scan = LinalgExt::ScanOp::create(
           builder, sloc, mlir::TypeRange{packedTy, accTy}, packed, scanOut,
           accInit, static_cast<uint64_t>(scanDimPos), /*inclusive=*/true);
       {
         mlir::OpBuilder::InsertionGuard g(builder);
-        mlir::SmallVector<mlir::Type> argTys{i64Ty, i64Ty};
+        mlir::SmallVector<mlir::Type> argTys{vecTy, vecTy};
         mlir::SmallVector<mlir::Location> argLocs(2, sloc);
         mlir::Block *body =
             builder.createBlock(&scan.getRegion(), {}, argTys, argLocs);
         builder.setInsertionPointToStart(body);
         // region(in_packed=arg0, acc_packed=arg1); binop lambda(acc.., in..).
+        Values accVals = unpackVec(body->getArgument(1));
+        Values inVals = unpackVec(body->getArgument(0));
         Ctx rlocal = ctx;
-        rlocal.subexps.insert(segBinOp.lambda.params[0].name,
-                              unpackFlag(body->getArgument(1)));
-        rlocal.subexps.insert(segBinOp.lambda.params[1].name,
-                              unpackVal(body->getArgument(1)));
-        rlocal.subexps.insert(segBinOp.lambda.params[2].name,
-                              unpackFlag(body->getArgument(0)));
-        rlocal.subexps.insert(segBinOp.lambda.params[3].name,
-                              unpackVal(body->getArgument(0)));
+        for (int64_t i = 0; i < scanValueCount; ++i) {
+          rlocal.subexps.insert(segBinOp.lambda.params[i].name, accVals[i]);
+          rlocal.subexps.insert(segBinOp.lambda.params[scanValueCount + i].name,
+                                inVals[i]);
+        }
         Values res = LowerBody(segBinOp.lambda.body, rlocal);
-        LinalgExt::YieldOp::create(builder, sloc, packV(res[0], res[1]));
+        LinalgExt::YieldOp::create(builder, sloc, packVec(res));
       }
       mlir::Value scanned = scan.getResult(0);
 
-      // unpack the scanned packed values and apply the post-op.
+      // unpack the scanned vectors and apply the post-op.
       auto outTy = mlir::RankedTensorType::get(
           inTy.getShape(),
           LowerSegOpBaseType(pSegScan.post_op.lambda.ret[0], ctx));
@@ -1963,11 +1983,11 @@ struct FutharkCompiler {
           [&](mlir::OpBuilder &b, mlir::Location l, mlir::ValueRange a) {
             mlir::OpBuilder::InsertionGuard g(builder);
             builder.setInsertionPointToEnd(b.getInsertionBlock());
+            Values pv = unpackVec(a[0]);
             Ctx plocal = ctx;
-            plocal.subexps.insert(pSegScan.post_op.lambda.params[0].name,
-                                  unpackFlag(a[0]));
-            plocal.subexps.insert(pSegScan.post_op.lambda.params[1].name,
-                                  unpackVal(a[0]));
+            for (int64_t i = 0; i < scanValueCount; ++i)
+              plocal.subexps.insert(pSegScan.post_op.lambda.params[i].name,
+                                    pv[i]);
             Values r = LowerBody(pSegScan.post_op.lambda.body, plocal);
             mlir::linalg::YieldOp::create(builder, l, r);
           });
