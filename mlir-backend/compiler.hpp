@@ -531,6 +531,58 @@ struct FutharkCompiler {
     return scatter.getResult(0);
   }
 
+  // True if the with_acc's accumulator element type is an array (a row scatter)
+  // rather than a scalar.
+  bool AccElemIsArray(const Lambda &lambda) {
+    for (const LParam &p : lambda.params)
+      if (auto *at = GetAccType(p.dec.v))
+        if (at->ts.size() == 1)
+          return std::holds_alternative<TypeArray<Shape, NoUniqueness>>(
+              at->ts[0].t.v);
+    return false;
+  }
+
+  // Recognise the flattened row-scatter shape inside a with_acc lambda:
+  //   segmap(gtid): update_acc(acc, idxArr[gtid], valArr[gtid, :])
+  // and return the source array names (valArr, idxArr). The linalg.generic acc
+  // path in LowerSegMap can't yield the [d]-row update, so we scatter the whole
+  // source arrays directly instead. Returns false if the body isn't this shape.
+  bool MatchRowScatter(const Lambda &lambda, std::string &valArr,
+                       std::string &idxArr) {
+    const SegMap *seg = nullptr;
+    for (const Stm &s : lambda.body.stms)
+      if (auto *h = std::get_if<ExpHostOp>(&s.exp.v))
+        if (auto *sp = std::get_if<std::shared_ptr<SegOp>>(&h->op.v))
+          if (auto *m = std::get_if<SegMap>(&(*sp)->v))
+            seg = m;
+    if (!seg || seg->body.result.size() != 1)
+      return false;
+    std::string accName = seg->body.result[0].result.GetVName().name;
+    const BasicOpUpdateAcc *upd = nullptr;
+    for (const Stm &s : seg->body.stms)
+      if (s.pat.elems[0].name.name == accName)
+        if (auto *b = std::get_if<ExpBasicOp>(&s.exp.v))
+          if (auto *u = std::get_if<BasicOpUpdateAcc>(&b->op.v))
+            upd = u;
+    if (!upd || upd->indices.size() != 1 || upd->values.size() != 1)
+      return false;
+    // Trace the update_acc index/value subexps back to the arrays they read.
+    auto srcArray = [&](const SubExp &se, std::string &out) -> bool {
+      auto *var = std::get_if<VarSubExp>(&se.v);
+      if (!var)
+        return false;
+      for (const Stm &s : seg->body.stms)
+        if (s.pat.elems[0].name.name == var->v.name)
+          if (auto *b = std::get_if<ExpBasicOp>(&s.exp.v))
+            if (auto *ix = std::get_if<BasicOpIndex>(&b->op.v)) {
+              out = ix->vName.name;
+              return true;
+            }
+      return false;
+    };
+    return srcArray(upd->values[0], valArr) && srcArray(upd->indices[0], idxArr);
+  }
+
   Values LowerWithAcc(const ExpWithAcc &withAcc, Ctx &ctx) {
     assert(withAcc.inputs.size() == 1);
     const WithAccInput &input = withAcc.inputs[0];
@@ -538,6 +590,28 @@ struct FutharkCompiler {
     assert(!input.op.has_value());
 
     const Lambda &lambda = *withAcc.lambda;
+    mlir::Value original = ctx.subexps.lookup(input.arrays[0].name);
+
+    // Array-valued (row) scatter: scatter the source arrays directly instead of
+    // going through the scalar-yielding acc path in LowerSegMap.
+    std::string valArr, idxArr;
+    if (AccElemIsArray(lambda) && MatchRowScatter(lambda, valArr, idxArr)) {
+      if (lambda.body.result.size() != 1)
+        Undefined(); // only the single-accumulator row scatter is handled
+      mlir::Value update = ctx.subexps.lookup(valArr);
+      mlir::Value index = ctx.subexps.lookup(idxArr);
+      // indices: [n] -> [n][1] (each index addresses dim 0 of original).
+      auto idxTy = getRankedType(index.getType());
+      auto idx2dTy = mlir::RankedTensorType::get(
+          {idxTy.getShape()[0], int64_t{1}}, idxTy.getElementType());
+      mlir::SmallVector<mlir::ReassociationIndices> reassoc{{0, 1}};
+      mlir::Value index2d =
+          mlir::tensor::ExpandShapeOp::create(builder, idx2dTy, index, reassoc)
+              .getResult();
+      return {EmitScatter(update, index2d, original)};
+    }
+
+    // Scalar path.
     Ctx local = ctx;
     for (const Stm &stm : lambda.body.stms)
       LowerStm(stm, local);
@@ -545,7 +619,6 @@ struct FutharkCompiler {
     assert(lambda.body.result.size() >= withAcc.inputs.size());
     VName returnedAcc = lambda.body.result[0].GetVName();
     AccValue acc = local.accs.lookup(returnedAcc.name);
-    mlir::Value original = ctx.subexps.lookup(input.arrays[0].name);
 
     Values results{EmitScatter(acc.update, acc.index, original)};
     for (size_t i = withAcc.inputs.size(); i < lambda.body.result.size(); ++i)

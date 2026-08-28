@@ -5,10 +5,6 @@
 -- See Figure 1 in particular.
 --
 
-#[noinline] #[blackbox(scatter)]
-def scatter [k] [n] [d] (dest: [k][d]f32) (is: [n]i64) (vs: [n][d]f32) : [k][d]f32 =
-  #[unsafe] ???
-
 #[noinline] #[blackbox(matmul)]
 def matmul [n] [k] [m] (x: [n][k]f32) (y: [k][m]f32) : [n][m]f32 =
   #[unsafe] ???
