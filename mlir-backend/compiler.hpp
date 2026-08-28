@@ -786,10 +786,21 @@ struct FutharkCompiler {
     // linalg.broadcast(from_elements(constant)) (see BasicOpReplicate), so peel
     // those to reach the scalar; also accept a folded dense constant directly.
     auto replicatedInt = [&](mlir::Value v) -> int64_t {
-      mlir::DenseIntElementsAttr dense;
-      if (mlir::matchPattern(v, mlir::m_Constant(&dense)))
-        return dense.getValues<int64_t>()[0];
       mlir::Value cur = v;
+      // Peel any shape-only wrappers (a `:>` size coercion in the source lowers
+      // to reshape/cast) to reach the underlying replicate.
+      while (auto *op = cur.getDefiningOp()) {
+        if (mlir::isa<mlir::tensor::ReshapeOp, mlir::tensor::CastOp,
+                      mlir::tensor::ExpandShapeOp, mlir::tensor::CollapseShapeOp>(
+                op))
+          cur = op->getOperand(0);
+        else
+          break;
+      }
+      mlir::DenseIntElementsAttr dense;
+      if (mlir::matchPattern(cur, mlir::m_Constant(&dense)))
+        return dense.getValues<int64_t>()[0];
+      // Futhark's replicate lowers to linalg.broadcast(from_elements(constant)).
       if (auto bcast = cur.getDefiningOp<mlir::linalg::BroadcastOp>())
         cur = bcast.getInput();
       if (auto fe = cur.getDefiningOp<mlir::tensor::FromElementsOp>())
