@@ -160,7 +160,7 @@ pBasicOp: 'replicate' '(' pExtShape ',' pSubExp ')' #BasicOpReplicate
     | pCmpOp #BasicOpCmp
     | pConvOp #BasicOpConv
     | UNOP pSubExp #BasicOpUnOp
-    | 'reshape' '(' pSubExp ',' '(' (NUMBER '::' NUMBER '=>' pExtShape ';') pExtShape ')' ')'  #BasicOpReshape
+    | 'reshape' '(' pSubExp ',' '(' NUMBER '::' NUMBER '=>' pExtShape (',' NUMBER '::' NUMBER '=>' pExtShape)* ';' pExtShape ')' ')'  #BasicOpReshape
     | 'rearrange' '(' pSubExp ',' '(' NUMBER (',' NUMBER)* ')' ')' #BasicOpRearrange
     | 'assert' '(' pSubExp ',' '{' pErrPart (',' pErrPart)* '}' ')' #BasicOpAssert
     | 'scratch' '(' pPrimType (',' pSubExp)* ')' #BasicOpScratch

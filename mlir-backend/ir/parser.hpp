@@ -660,10 +660,14 @@ struct FutharkTranslationVisitor {
   VisitBasicOpReshape(FutharkParser::BasicOpReshapeContext *ctx) {
     BasicOpReshape reshape{};
     reshape.op0 = VisitSubExp(ctx->pSubExp());
+    // A reshape carries one or more `d0::d1=>shape` splice clauses followed by
+    // the remainder (the whole target shape). Lowering uses only op0 and the
+    // remainder, so record the first clause and take the last pExtShape as the
+    // remainder (a multi-dim reshape has one clause per rewritten dimension).
     reshape.dimBegin = std::stoull(ctx->NUMBER(0)->getText());
     reshape.dimEnd = std::stoull(ctx->NUMBER(1)->getText());
     reshape.reshapedDim = VisitExtShape(ctx->pExtShape(0));
-    reshape.remainder = VisitExtShape(ctx->pExtShape(1));
+    reshape.remainder = VisitExtShape(ctx->pExtShape(ctx->pExtShape().size() - 1));
     return reshape;
   }
 
