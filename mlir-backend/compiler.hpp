@@ -950,39 +950,49 @@ struct FutharkCompiler {
         },
         [&](const BasicOpReplicate &val) -> mlir::Value {
           auto op = LowerSubExp(val.val, ctx);
+
+          // `copy(x)` is a replicate by the empty shape, and so has the type
+          // of `x`. Tensors are values here, so it is the identity.
+          if (val.shape.dims.empty())
+            return op;
+
+          // The outer dimensions come from the replicate shape; the inner ones
+          // from the replicated value, which contributes none if it is scalar.
           auto elementTy = op.getType();
+          std::vector<int64_t> shape = toShapeType(val.shape.dims);
+          int64_t addedRank = std::ssize(shape);
 
-          // TODO dynamic replicate
-          std::vector<int64_t> before;
-          for (auto d : val.shape.dims)
-            before.push_back(match(
-                d,
-                [&](const ConstantSubExp &) { return d.GetIntValue(); },
-                [&](const VarSubExp &) -> int64_t { Undefined(); }));
+          // tensor.empty wants an operand for every dynamic dimension of the
+          // destination: the replicate shape supplies the outer ones, and the
+          // inner ones have to be read back off the value being replicated.
+          Values dynamicSizes;
+          for (auto [d, t] : llvm::zip_equal(val.shape.dims, shape))
+            if (mlir::ShapedType::isDynamic(t))
+              dynamicSizes.push_back(mlir::arith::IndexCastOp::create(
+                  builder, builder.getIndexType(), LowerSubExp(d, ctx)));
 
-          std::vector<int64_t> original;
-          auto t = op.getType();
-          if (auto tensorTy = llvm::dyn_cast<mlir::RankedTensorType>(t)) {
-            auto dims = tensorTy.getShape();
-            before.insert(before.end(), dims.begin(), dims.end());
-            original.insert(original.end(), dims.begin(), dims.end());
+          if (auto tensorTy =
+                  llvm::dyn_cast<mlir::RankedTensorType>(op.getType())) {
             elementTy = tensorTy.getElementType();
+            auto dims = tensorTy.getShape();
+            shape.insert(shape.end(), dims.begin(), dims.end());
+            for (auto [i, d] : llvm::enumerate(dims))
+              if (mlir::ShapedType::isDynamic(d))
+                dynamicSizes.push_back(
+                    mlir::tensor::DimOp::create(builder, op, i).getResult());
+          } else {
+            op = mlir::tensor::FromElementsOp::create(
+                builder, mlir::RankedTensorType::get({}, elementTy), op);
           }
 
-          else {
-            auto rankedType = mlir::RankedTensorType::get({}, elementTy);
-            op = mlir::tensor::FromElementsOp::create(builder, rankedType, op);
-          }
-
-          auto transposedTy = mlir::RankedTensorType::get(before, elementTy);
-          auto destination =
-              mlir::tensor::EmptyOp::create(builder, transposedTy, {});
+          auto destination = mlir::tensor::EmptyOp::create(
+              builder,
+              mlir::RankedTensorType::get(shape, elementTy),
+              dynamicSizes);
 
           std::vector<int64_t> addedDims;
-          for (int64_t i = 0; i < std::ssize(before) - std::ssize(original);
-               i++) {
+          for (int64_t i = 0; i < addedRank; i++)
             addedDims.push_back(i);
-          }
 
           auto broadcasted = mlir::linalg::BroadcastOp::create(
               builder, op, destination, addedDims);

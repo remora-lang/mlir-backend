@@ -332,6 +332,8 @@ struct FutharkTranslationVisitor {
     if (auto *pFlatIndex =
             dynamic_cast<FutharkParser::BasicOpReplicateContext *>(ctx))
       return {VisitBasicOpReplicate(pFlatIndex)};
+    if (auto *pCopy = dynamic_cast<FutharkParser::BasicOpCopyContext *>(ctx))
+      return {VisitBasicOpCopy(pCopy)};
     if (auto *pFlatIndex =
             dynamic_cast<FutharkParser::BasicOpRearrangeContext *>(ctx))
       return {VisitBasicOpRearrange(pFlatIndex)};
@@ -567,6 +569,14 @@ struct FutharkTranslationVisitor {
   VisitBasicOpReplicate(FutharkParser::BasicOpReplicateContext *ctx) {
     BasicOpReplicate replicate;
     replicate.shape = VisitExtShape(ctx->pExtShape());
+    replicate.val = VisitSubExp(ctx->pSubExp());
+    return replicate;
+  }
+
+  // `copy(x)` is `replicate([], x)`: Futhark prints it specially, but it is the
+  // same BasicOp.
+  BasicOpReplicate VisitBasicOpCopy(FutharkParser::BasicOpCopyContext *ctx) {
+    BasicOpReplicate replicate;
     replicate.val = VisitSubExp(ctx->pSubExp());
     return replicate;
   }

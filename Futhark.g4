@@ -128,6 +128,7 @@ pArrayLit: '[' pSubExp (',' pSubExp)* ']';
 
 // https://hackage-content.haskell.org/package/futhark-0.25.34/docs/Futhark-IR-Syntax.html#t:BasicOp
 pBasicOp: 'replicate' '(' pExtShape ',' pSubExp ')' #BasicOpReplicate
+    | 'copy' '(' pSubExp ')' #BasicOpCopy
     | pArrayLit ':' pType #BasicOpArrayLit
     | pSubExp '[' pDimIndex (',' pDimIndex)* ']' #BasicOpIndex
     | CONCAT '(' pSubExp (',' pSubExp)* ')' #BasicOpConcat
