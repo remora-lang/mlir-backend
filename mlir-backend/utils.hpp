@@ -2,6 +2,7 @@
 #include <format>
 #include <source_location>
 #include <stdexcept>
+#include <string_view>
 #include <utility>
 #include <variant>
 
@@ -35,8 +36,16 @@ decltype(auto) match(V &&v, Fs &&...fs) {
 }
 
 // Errors.
+//
+// `construct` names the untranslatable Futhark construct, e.g.
+// `Undefined("SegHist")`. Bare `Undefined()` is still allowed for call sites
+// that haven't been given a name yet.
 [[noreturn]] inline void
-Undefined(std::source_location loc = std::source_location::current()) {
-  throw std::runtime_error(
-      std::format("undefined at {}:{}", loc.file_name(), loc.line()));
+Undefined(std::string_view construct = {},
+          std::source_location loc = std::source_location::current()) {
+  if (construct.empty())
+    throw std::runtime_error(
+        std::format("undefined at {}:{}", loc.file_name(), loc.line()));
+  throw std::runtime_error(std::format(
+      "Undefined(): {} (at {}:{})", construct, loc.file_name(), loc.line()));
 }

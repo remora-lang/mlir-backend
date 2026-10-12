@@ -1,22 +1,21 @@
 {
   "nodes": {
-    "iree": {
+    "llvm-project": {
       "flake": false,
       "locked": {
-        "lastModified": 1786121953,
-        "narHash": "sha256-Is/6bewx3XftudGfSvsCWRkQYug+/IEYBOXR5TmRMaY=",
+        "lastModified": 1787081661,
+        "narHash": "sha256-V29gubRJ4VT84tvVddUWL8/Gflww7HeAfVVMxAM5WHg=",
         "ref": "refs/heads/main",
-        "rev": "3699452d60c6dfe483df4675c7e98299fe790ec4",
-        "revCount": 20359,
-        "submodules": true,
+        "rev": "ab547095ead5464dc024d66264d9b8a987f429f3",
+        "shallow": true,
         "type": "git",
-        "url": "https://github.com/iree-org/iree.git"
+        "url": "https://github.com/llvm/llvm-project.git"
       },
       "original": {
-        "rev": "3699452d60c6dfe483df4675c7e98299fe790ec4",
-        "submodules": true,
+        "rev": "ab547095ead5464dc024d66264d9b8a987f429f3",
+        "shallow": true,
         "type": "git",
-        "url": "https://github.com/iree-org/iree.git"
+        "url": "https://github.com/llvm/llvm-project.git"
       }
     },
     "nixpkgs": {
@@ -37,8 +36,27 @@
     },
     "root": {
       "inputs": {
-        "iree": "iree",
-        "nixpkgs": "nixpkgs"
+        "llvm-project": "llvm-project",
+        "nixpkgs": "nixpkgs",
+        "stablehlo": "stablehlo"
+      }
+    },
+    "stablehlo": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1788194806,
+        "narHash": "sha256-RZ3D8zJ0lMjHS/hQRrgjdxQdlF3RJfWKezeRu024gYY=",
+        "ref": "refs/heads/main",
+        "rev": "639335932274930617d9724fb25ec9f2f52c5e40",
+        "shallow": true,
+        "type": "git",
+        "url": "https://github.com/openxla/stablehlo.git"
+      },
+      "original": {
+        "rev": "639335932274930617d9724fb25ec9f2f52c5e40",
+        "shallow": true,
+        "type": "git",
+        "url": "https://github.com/openxla/stablehlo.git"
       }
     }
   },

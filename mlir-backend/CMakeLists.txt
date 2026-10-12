@@ -22,12 +22,10 @@ set(LIBS
   MLIRSCFDialect
   MLIRSupport
   MLIRTensorDialect
+  MLIRVectorDialect
 
   StablehloOps
   ChloOps
-
-  iree::compiler::Dialect::LinalgExt::IR
-  iree::compiler::Dialect::Flow::IR
 )
 
 add_executable  (mlir-backend "mlir-backend.cpp" "${GEN_DIR}/FutharkLexer.cpp" "${GEN_DIR}/FutharkParser.cpp" "ir/core.hpp" "ir/parser.hpp" "ir/primitive.hpp" "ir/segop.hpp" "ir/gpu.hpp" "ir/syntax.hpp")
@@ -44,6 +42,20 @@ configure_file(
 target_include_directories(mlir-backend PRIVATE
     ${CMAKE_CURRENT_BINARY_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}
+)
+
+# MLIR/LLVM dialect libraries built via add_mlir_dialect_library/add_llvm_library
+# don't export their own include dirs as INTERFACE properties (that's a
+# directory-scoped `include_directories()` convention instead, which doesn't
+# propagate to this sibling subdirectory via target_link_libraries), so these
+# have to be added explicitly. Paths match the layout actually produced by
+# add_subdirectory("${MOCHA_LLVM_SOURCE_DIR}/llvm" llvm-mlir ...) in the
+# top-level CMakeLists.txt.
+target_include_directories(mlir-backend PRIVATE
+    ${MOCHA_LLVM_SOURCE_DIR}/llvm/include
+    ${CMAKE_BINARY_DIR}/llvm-mlir/include
+    ${MOCHA_LLVM_SOURCE_DIR}/mlir/include
+    ${CMAKE_BINARY_DIR}/llvm-mlir/tools/mlir/include
 )
 
 message(STATUS "Build type of mlir-backend is : ${CMAKE_BUILD_TYPE}")

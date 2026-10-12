@@ -5,10 +5,6 @@
 #include "ir/core.hpp"
 #include "ir/segop.hpp"
 #include "ir/syntax.hpp"
-#include "iree/compiler/Dialect/Flow/IR/FlowOps.h"
-#include "iree/compiler/Dialect/LinalgExt/IR/LinalgExtDialect.h"
-#include "iree/compiler/Dialect/LinalgExt/IR/LinalgExtInterfaces.h"
-#include "iree/compiler/Dialect/LinalgExt/IR/LinalgExtOps.h"
 #include "mlir/Dialect/Arith/Utils/Utils.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/Matchers.h"
@@ -143,9 +139,6 @@ struct FutharkCompiler {
       : prog(prog), context(context), builder(builder) {
     context.getOrLoadDialect<mlir::linalg::LinalgDialect>();
     context.getOrLoadDialect<mlir::math::MathDialect>();
-    context.getOrLoadDialect<mlir::iree_compiler::IREE::Flow::FlowDialect>();
-    context.getOrLoadDialect<
-        mlir::iree_compiler::IREE::LinalgExt::IREELinalgExtDialect>();
     context.getOrLoadDialect<mlir::tensor::TensorDialect>();
     context.getOrLoadDialect<mlir::scf::SCFDialect>();
     context.getOrLoadDialect<mlir::index::IndexDialect>();
@@ -495,136 +488,11 @@ struct FutharkCompiler {
     return {value, index};
   }
 
-  // TODO: tests/moe_black_box.fut regressed when scatter stopped being a
-  // black box: its scatter use is beyond what the current with_acc lowering
-  // handles. Reintroduce a scatter black box for that file and lower it via
-  // EmitScatter below.
-  mlir::Value EmitScatter(mlir::Value update, mlir::Value index,
-                          mlir::Value original) {
-    namespace LinalgExt = mlir::iree_compiler::IREE::LinalgExt;
-
-    auto originalType = mlir::dyn_cast<mlir::RankedTensorType>(original.getType());
-    if (!originalType)
-      Undefined();
-
-    llvm::SmallVector<int64_t> dimensionMap{0};
-    auto scatter = LinalgExt::ScatterOp::create(
-        builder,
-        mlir::TypeRange{originalType},
-        update,
-        index,
-        /*mask=*/mlir::Value(),
-        original,
-        dimensionMap,
-        /*unique_indices=*/false);
-
-    {
-      mlir::OpBuilder::InsertionGuard guard(builder);
-      mlir::Type elementType = originalType.getElementType();
-      mlir::SmallVector<mlir::Type> argumentTypes{elementType, elementType};
-      mlir::SmallVector<mlir::Location> argumentLocations(2, builder.getLoc());
-      mlir::Block *body = builder.createBlock(&scatter.getRegion(), {}, argumentTypes, argumentLocations);
-      builder.setInsertionPointToStart(body);
-      LinalgExt::YieldOp::create(builder, body->getArgument(0));
-    }
-
-    return scatter.getResult(0);
-  }
-
-  // True if the with_acc's accumulator element type is an array (a row scatter)
-  // rather than a scalar.
-  bool AccElemIsArray(const Lambda &lambda) {
-    for (const LParam &p : lambda.params)
-      if (auto *at = GetAccType(p.dec.v))
-        if (at->ts.size() == 1)
-          return std::holds_alternative<TypeArray<Shape, NoUniqueness>>(
-              at->ts[0].t.v);
-    return false;
-  }
-
-  // Recognise the flattened row-scatter shape inside a with_acc lambda:
-  //   segmap(gtid): update_acc(acc, idxArr[gtid], valArr[gtid, :])
-  // and return the source array names (valArr, idxArr). The linalg.generic acc
-  // path in LowerSegMap can't yield the [d]-row update, so we scatter the whole
-  // source arrays directly instead. Returns false if the body isn't this shape.
-  bool MatchRowScatter(const Lambda &lambda, std::string &valArr,
-                       std::string &idxArr) {
-    const SegMap *seg = nullptr;
-    for (const Stm &s : lambda.body.stms)
-      if (auto *h = std::get_if<ExpHostOp>(&s.exp.v))
-        if (auto *sp = std::get_if<std::shared_ptr<SegOp>>(&h->op.v))
-          if (auto *m = std::get_if<SegMap>(&(*sp)->v))
-            seg = m;
-    if (!seg || seg->body.result.size() != 1)
-      return false;
-    std::string accName = seg->body.result[0].result.GetVName().name;
-    const BasicOpUpdateAcc *upd = nullptr;
-    for (const Stm &s : seg->body.stms)
-      if (s.pat.elems[0].name.name == accName)
-        if (auto *b = std::get_if<ExpBasicOp>(&s.exp.v))
-          if (auto *u = std::get_if<BasicOpUpdateAcc>(&b->op.v))
-            upd = u;
-    if (!upd || upd->indices.size() != 1 || upd->values.size() != 1)
-      return false;
-    // Trace the update_acc index/value subexps back to the arrays they read.
-    auto srcArray = [&](const SubExp &se, std::string &out) -> bool {
-      auto *var = std::get_if<VarSubExp>(&se.v);
-      if (!var)
-        return false;
-      for (const Stm &s : seg->body.stms)
-        if (s.pat.elems[0].name.name == var->v.name)
-          if (auto *b = std::get_if<ExpBasicOp>(&s.exp.v))
-            if (auto *ix = std::get_if<BasicOpIndex>(&b->op.v)) {
-              out = ix->vName.name;
-              return true;
-            }
-      return false;
-    };
-    return srcArray(upd->values[0], valArr) && srcArray(upd->indices[0], idxArr);
-  }
-
-  Values LowerWithAcc(const ExpWithAcc &withAcc, Ctx &ctx) {
-    assert(withAcc.inputs.size() == 1);
-    const WithAccInput &input = withAcc.inputs[0];
-    assert(input.arrays.size() == 1);
-    assert(!input.op.has_value());
-
-    const Lambda &lambda = *withAcc.lambda;
-    mlir::Value original = ctx.subexps.lookup(input.arrays[0].name);
-
-    // Array-valued (row) scatter: scatter the source arrays directly instead of
-    // going through the scalar-yielding acc path in LowerSegMap.
-    std::string valArr, idxArr;
-    if (AccElemIsArray(lambda) && MatchRowScatter(lambda, valArr, idxArr)) {
-      if (lambda.body.result.size() != 1)
-        Undefined(); // only the single-accumulator row scatter is handled
-      mlir::Value update = ctx.subexps.lookup(valArr);
-      mlir::Value index = ctx.subexps.lookup(idxArr);
-      // indices: [n] -> [n][1] (each index addresses dim 0 of original).
-      auto idxTy = getRankedType(index.getType());
-      auto idx2dTy = mlir::RankedTensorType::get(
-          {idxTy.getShape()[0], int64_t{1}}, idxTy.getElementType());
-      mlir::SmallVector<mlir::ReassociationIndices> reassoc{{0, 1}};
-      mlir::Value index2d =
-          mlir::tensor::ExpandShapeOp::create(builder, idx2dTy, index, reassoc)
-              .getResult();
-      return {EmitScatter(update, index2d, original)};
-    }
-
-    // Scalar path.
-    Ctx local = ctx;
-    for (const Stm &stm : lambda.body.stms)
-      LowerStm(stm, local);
-
-    assert(lambda.body.result.size() >= withAcc.inputs.size());
-    VName returnedAcc = lambda.body.result[0].GetVName();
-    AccValue acc = local.accs.lookup(returnedAcc.name);
-
-    Values results{EmitScatter(acc.update, acc.index, original)};
-    for (size_t i = withAcc.inputs.size(); i < lambda.body.result.size(); ++i)
-      results.push_back(LowerSubExp(lambda.body.result[i], local));
-    return results;
-  }
+  // TODO(StableHLO rewrite): with_acc scattering used to go through IREE's
+  // iree_linalg_ext.scatter (both the array/row-scatter and scalar paths).
+  // That dialect is gone now; this needs a stablehlo.scatter-based lowering,
+  // landing alongside SegHist's (see LowerSegHist below).
+  Values LowerWithAcc(const ExpWithAcc &, Ctx &) { Undefined("with_acc"); }
 
   Values LowerDotGeneral(mlir::ValueRange args, mlir::TypeRange retTypes,
                          Ctx &ctx) {
@@ -1755,272 +1623,19 @@ struct FutharkCompiler {
     return op.getResults();
   }
 
-  Values LowerSegHist(const SegHist &pSegHist, Ctx &ctx) {
-    RequireThreadLevel(pSegHist.lvl);
+  // TODO(StableHLO rewrite, Phase 7): was IREE's iree_linalg_ext.scatter.
+  // Needs a stablehlo.scatter-based lowering (see prompt.md's SegHist
+  // mapping): operand = dest, scatter_indices = indices, updates = values,
+  // update_computation = the HistOp's combining lambda.
+  Values LowerSegHist(const SegHist &, Ctx &) { Undefined("SegHist"); }
 
-    // If this map is the identity function, IREE will kill it.
-    Values inputs = LowerSegMap(
-        pSegHist.lvl, pSegHist.space, pSegHist.body, pSegHist.ret, ctx);
-    if (inputs.size() != 2)
-      Undefined();
-    mlir::Value indices = inputs[0];
-    mlir::Value values = inputs[1];
-
-    // Histogram
-    if (pSegHist.ops.size() != 1) {
-      Undefined();
-    }
-    auto pHistOp = pSegHist.ops[0];
-
-    Values dests;
-    for (auto const &vn : pHistOp.dest) {
-      dests.push_back(LowerSubExp(vn.name, ctx));
-    }
-    if (dests.size() != 1)
-      Undefined();
-    auto dest = dests[0];
-
-    if (getRankedType(indices.getType()).getRank() != 1)
-      Undefined();
-
-    auto op = mlir::iree_compiler::IREE::LinalgExt::ScatterOp::create(
-        builder, dest.getType(), values, indices, {}, dest, {0}, false);
-
-    // Lower the histogram's combining op.
-    mlir::SmallVector<mlir::Type> opInputTypes;
-    for (const auto &param : pHistOp.lambda.params)
-      opInputTypes.push_back(LowerTy(param.dec.v));
-    mlir::SmallVector<mlir::Location> locs;
-    for (const auto &_ : opInputTypes)
-      locs.push_back(builder.getLoc());
-    {
-      mlir::OpBuilder::InsertionGuard guard(builder);
-      auto *blk = builder.createBlock(&op.getRegion(), {}, opInputTypes, locs);
-      Ctx local = ctx;
-      for (auto [param, arg] :
-           llvm::zip_equal(pHistOp.lambda.params, blk->getArguments()))
-        local.subexps.insert(param.name, arg);
-      auto returns = LowerBody(pHistOp.lambda.body, local);
-      mlir::iree_compiler::IREE::LinalgExt::YieldOp::create(builder, returns);
-    }
-
-    return {op.getResult(0)};
-  }
-
-  // TODOs:
-  // Support vector SegBinOps
-  // Support multiple SegBinOps
-  // Support size(SegBinOp) > 0
-  // Parallelise
-  // XXX: There seems to be bug in IREE forall and IREE code result in segfault.
-  // (#24775)
-  // Lower a segmented scan to a single parallel iree_linalg_ext.scan.
-  //
-  // iree_linalg_ext.scan carries one element per lane, so:
-  //   * a single-value scan carries that value directly (any element type);
-  //   * a tuple scan packs its N scalar values into one vector<N x i64> element
-  //     -- each value is bitcast to an integer and zero-extended into its own
-  //     lane; the scan region and post-op unpack (truncate + bitcast back) to
-  //     the original types.
-  // This keeps every scan on the parallel scan op (no serial loop) with a
-  // single code path. Tuple values must be scalar int/float no wider than 64
-  // bits; array-valued scans and anything else are rejected.
-  Values LowerSegScan(const SegScan &pSegScan, Ctx &ctx) {
-    RequireThreadLevel(pSegScan.lvl);
-
-    if (pSegScan.ops.size() != 1)
-      Undefined();
-
-    const SegBinOp &segBinOp = pSegScan.ops[0];
-
-    // Reject scans whose values are themselves arrays; only scalar scan values
-    // (single or tuple) are supported.
-    if (!segBinOp.shape.dims.empty())
-      Undefined();
-
-    const int64_t scanValueCount = segBinOp.neutral.size();
-    // The outputs are the post-op's results, which may project the scan carries
-    // to fewer values (e.g. a (flag,value) scan whose post-op keeps the value).
-    const int64_t outputCount = pSegScan.post_op.lambda.ret.size();
-    if (scanValueCount < 1 || outputCount < 1)
-      Undefined();
-
-    namespace LinalgExt = mlir::iree_compiler::IREE::LinalgExt;
-    mlir::Location sloc = builder.getLoc();
-    auto i64Ty = builder.getI64Type();
-
-    // The kernel body is a parallel map producing the per-element scan values.
-    Values scanIn = LowerSegMap(pSegScan.lvl, pSegScan.space, pSegScan.body,
-                                pSegScan.ret, ctx);
-    auto inTy = getRankedType(scanIn[0].getType());
-    int64_t rank = inTy.getRank();
-    int64_t scanDimPos = rank - 1;
-    auto idMap = mlir::AffineMap::getMultiDimIdentityMap(rank, &context);
-    std::vector<mlir::utils::IteratorType> its(
-        rank, mlir::utils::IteratorType::parallel);
-
-    auto dynOf = [&](llvm::ArrayRef<int64_t> shp) {
-      Values ds;
-      for (auto [i, d] : llvm::enumerate(shp))
-        if (mlir::ShapedType::isDynamic(d))
-          ds.push_back(
-              mlir::tensor::DimOp::create(builder, scanIn[0], i).getResult());
-      return ds;
-    };
-
-    // Scan-carry element type: the value itself, or a vector of i64 lanes.
-    const bool isTuple = scanValueCount > 1;
-    mlir::SmallVector<mlir::Type> valueTypes;
-    valueTypes.reserve(scanValueCount);
-    for (int64_t i = 0; i < scanValueCount; ++i)
-      valueTypes.push_back(LowerSegOpBaseType(pSegScan.ret[i], ctx));
-    mlir::Type carryTy;
-    if (!isTuple) {
-      carryTy = inTy.getElementType();
-    } else {
-      for (mlir::Type t : valueTypes)
-        if (!mlir::isa<mlir::IntegerType, mlir::FloatType>(t) ||
-            t.getIntOrFloatBitWidth() > 64)
-          Undefined();
-      carryTy = mlir::VectorType::get({scanValueCount}, i64Ty);
-    }
-
-    // pack a scalar value into an i64 lane / unpack a lane back to its type.
-    auto toLane = [&](mlir::Value v) -> mlir::Value {
-      mlir::Type t = v.getType();
-      unsigned w = t.getIntOrFloatBitWidth();
-      mlir::Value iw = v;
-      if (mlir::isa<mlir::FloatType>(t))
-        iw = mlir::arith::BitcastOp::create(builder, builder.getIntegerType(w),
-                                            v);
-      if (w < 64)
-        iw = mlir::arith::ExtUIOp::create(builder, i64Ty, iw);
-      return iw;
-    };
-    auto fromLane = [&](mlir::Value lane, mlir::Type t) -> mlir::Value {
-      unsigned w = t.getIntOrFloatBitWidth();
-      mlir::Value iw = lane;
-      if (w < 64)
-        iw = mlir::arith::TruncIOp::create(builder, builder.getIntegerType(w),
-                                           lane);
-      if (mlir::isa<mlir::FloatType>(t))
-        return mlir::arith::BitcastOp::create(builder, t, iw).getResult();
-      return iw;
-    };
-    // pack a full value tuple into one carry element / unpack it back.
-    auto packCarry = [&](mlir::ValueRange vals) -> mlir::Value {
-      if (!isTuple)
-        return vals[0];
-      mlir::SmallVector<mlir::Value> lanes;
-      for (mlir::Value v : vals)
-        lanes.push_back(toLane(v));
-      return mlir::vector::FromElementsOp::create(builder, carryTy, lanes)
-          .getResult();
-    };
-    auto unpackCarry = [&](mlir::Value carry) -> Values {
-      if (!isTuple)
-        return {carry};
-      Values out;
-      for (int64_t i = 0; i < scanValueCount; ++i) {
-        auto lane = mlir::vector::ExtractOp::create(
-                        builder, carry, mlir::ArrayRef<int64_t>{i})
-                        .getResult();
-        out.push_back(fromLane(lane, valueTypes[i]));
-      }
-      return out;
-    };
-
-    auto carryTensorTy = mlir::RankedTensorType::get(inTy.getShape(), carryTy);
-
-    // Carry-element input tensor: identity for a single value, a pack map for a
-    // tuple.
-    mlir::Value packed;
-    if (!isTuple) {
-      packed = scanIn[0];
-    } else {
-      mlir::Value packEmpty = mlir::tensor::EmptyOp::create(
-          builder, carryTensorTy, dynOf(inTy.getShape()));
-      mlir::SmallVector<mlir::AffineMap> packMaps(scanValueCount + 1, idMap);
-      packed = mlir::linalg::GenericOp::create(
-                   builder, mlir::TypeRange{carryTensorTy},
-                   mlir::ValueRange{scanIn}, mlir::ValueRange{packEmpty},
-                   packMaps, its,
-                   [&](mlir::OpBuilder &b, mlir::Location l, mlir::ValueRange a) {
-                     mlir::OpBuilder::InsertionGuard g(builder);
-                     builder.setInsertionPointToEnd(b.getInsertionBlock());
-                     mlir::linalg::YieldOp::create(
-                         builder, l, packCarry(a.take_front(scanValueCount)));
-                   })
-                   ->getResult(0);
-    }
-
-    // accumulator = carry shape without the scan dim, filled with the neutral.
-    auto accShape = llvm::to_vector(inTy.getShape().drop_back());
-    auto accTy = mlir::RankedTensorType::get(accShape, carryTy);
-    mlir::Value accEmpty =
-        mlir::tensor::EmptyOp::create(builder, accTy, dynOf(accShape));
-    Values neutralVals;
-    for (int64_t i = 0; i < scanValueCount; ++i)
-      neutralVals.push_back(LowerSubExp(segBinOp.neutral[i], ctx));
-    mlir::Value acc = mlir::linalg::FillOp::create(
-                          builder, mlir::ValueRange{packCarry(neutralVals)},
-                          mlir::ValueRange{accEmpty})
-                          .result();
-
-    mlir::Value scanOut = mlir::tensor::EmptyOp::create(
-        builder, carryTensorTy, dynOf(inTy.getShape()));
-    auto scan = LinalgExt::ScanOp::create(
-        builder, sloc, mlir::TypeRange{carryTensorTy, accTy}, packed, scanOut,
-        acc, static_cast<uint64_t>(scanDimPos), /*inclusive=*/true);
-    {
-      mlir::OpBuilder::InsertionGuard g(builder);
-      mlir::SmallVector<mlir::Type> argTys{carryTy, carryTy};
-      mlir::SmallVector<mlir::Location> argLocs(2, sloc);
-      mlir::Block *body =
-          builder.createBlock(&scan.getRegion(), {}, argTys, argLocs);
-      builder.setInsertionPointToStart(body);
-      // Region args are (in_carry = arg0, acc_carry = arg1); the Futhark binop
-      // is lambda(acc.., in..) (acc-params first).
-      Values accVals = unpackCarry(body->getArgument(1));
-      Values inVals = unpackCarry(body->getArgument(0));
-      Ctx rlocal = ctx;
-      for (int64_t i = 0; i < scanValueCount; ++i) {
-        rlocal.subexps.insert(segBinOp.lambda.params[i].name, accVals[i]);
-        rlocal.subexps.insert(segBinOp.lambda.params[scanValueCount + i].name,
-                              inVals[i]);
-      }
-      Values res = LowerBody(segBinOp.lambda.body, rlocal);
-      LinalgExt::YieldOp::create(builder, sloc, packCarry(res));
-    }
-    mlir::Value scanned = scan.getResult(0);
-
-    // post-op: a per-element map from the (unpacked) scan carries to outputs.
-    mlir::SmallVector<mlir::Type> outTys;
-    Values outEmpties;
-    for (int64_t j = 0; j < outputCount; ++j) {
-      auto ty = mlir::RankedTensorType::get(
-          inTy.getShape(),
-          LowerSegOpBaseType(pSegScan.post_op.lambda.ret[j], ctx));
-      outTys.push_back(ty);
-      outEmpties.push_back(
-          mlir::tensor::EmptyOp::create(builder, ty, dynOf(inTy.getShape())));
-    }
-    mlir::SmallVector<mlir::AffineMap> postMaps(outputCount + 1, idMap);
-    auto pg = mlir::linalg::GenericOp::create(
-        builder, mlir::TypeRange(outTys), mlir::ValueRange{scanned},
-        mlir::ValueRange(outEmpties), postMaps, its,
-        [&](mlir::OpBuilder &b, mlir::Location l, mlir::ValueRange a) {
-          mlir::OpBuilder::InsertionGuard g(builder);
-          builder.setInsertionPointToEnd(b.getInsertionBlock());
-          Values pv = unpackCarry(a[0]);
-          Ctx plocal = ctx;
-          for (int64_t i = 0; i < scanValueCount; ++i)
-            plocal.subexps.insert(pSegScan.post_op.lambda.params[i].name, pv[i]);
-          Values r = LowerBody(pSegScan.post_op.lambda.body, plocal);
-          mlir::linalg::YieldOp::create(builder, l, r);
-        });
-    return Values(pg.getResults().begin(), pg.getResults().end());
-  }
+  // TODO(StableHLO rewrite, Phase 5/6): was IREE's iree_linalg_ext.scan (with
+  // a vector<Nxi64>-lane packing trick for tuple carries, worked around an
+  // IREE-specific bug -- not relevant to the new backend). Needs a
+  // chlo.scan-based lowering first (scalar, associative), then a
+  // slice/pad/concatenate parallel-prefix fallback for tuple/non-scalar
+  // operators, per prompt.md's segscan mapping.
+  Values LowerSegScan(const SegScan &, Ctx &) { Undefined("SegScan"); }
 
   void RequireThreadLevel(const SegLevel &lvl) {
     if (!std::holds_alternative<SegThread>(lvl))

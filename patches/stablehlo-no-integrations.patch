@@ -1,0 +1,22 @@
+Drop stablehlo/integrations (the C++/Python "builder" convenience API).
+
+It's not needed -- this backend builds StableHLO IR directly via normal MLIR
+OpBuilder calls against StablehloOps/ChloOps, same as before. It also
+doesn't build cleanly in STABLEHLO_EXTERNAL_PROJECT_BUILD mode (the mode
+LLVM_EXTERNAL_PROJECTS puts us in): integrations/cpp/builder's CMakeLists.txt
+does `list(GET MLIR_INCLUDE_DIRS 0 mlir_includes)`, but MLIR_INCLUDE_DIRS
+(plural) is only ever set by find_package(MLIR CONFIG) in
+STABLEHLO_STANDALONE_BUILD mode -- in the external-project mode it's unset,
+so the GET resolves to a stale/absent cache entry and the path ends up
+literally containing "NOTFOUND".
+
+--- a/stablehlo/CMakeLists.txt
++++ b/stablehlo/CMakeLists.txt
+@@ -14,7 +14,6 @@
+ add_subdirectory(api)
+ add_subdirectory(conversions)
+ add_subdirectory(dialect)
+-add_subdirectory(integrations)
+ add_subdirectory(reference)
+ add_subdirectory(tests)
+ add_subdirectory(testdata)
