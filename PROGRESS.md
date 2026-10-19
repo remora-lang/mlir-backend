@@ -578,12 +578,32 @@ this rewrite). `custom_flattening_matmul.fut`/`irreg_matmul.fut` remain out
 of scope (dynamic-shaped composite tests, unannotated). 19 passed / 27
 failed overall (up from 18/28).
 
-## Phase 4 — if (not started)
-`ExpIf` → `stablehlo.if`/`stablehlo.return`. **Verify empirically first**
-(JAX `lax.cond` reference lowering) whether `stablehlo.if` branches are
-isolated-from-above (need Phase 1's free-var machinery generalized) or can
-capture freely — don't assume. New test: standalone top-level `if` (today only
-nested inside a reduce lambda).
+## Phase 4 — if (done, verified)
+
+Checked empirically before writing anything, per the plan: StableHLO's own
+`IfOp` ODS has no `IsolatedFromAbove` trait, and an actual JAX reference
+lowering (`jax.jit(lambda c,a,b: lax.cond(c, lambda: a+1, lambda: b-1))
+.lower(...).as_text()`) confirmed the branches have *zero* block arguments
+and reference outer SSA values directly — unlike `stablehlo.map`'s region,
+`stablehlo.if`'s branches can capture freely, same as today's `scf.if`. So
+this was a structural no-op swap, not a rewrite: `ExpIf` → `stablehlo.if`/
+`stablehlo.return`, condition passed straight through (already a 0-d `i1`
+tensor, matching `pred` directly -- no unwrap needed anymore, unlike
+`scf.if`'s bare `i1`). Used the same explicit `createBlock`-per-branch
+pattern as `LowerSegMap`/`LowerSegRed` (guard constructed before
+`createBlock`, same ordering fix from Phase 2) rather than assuming
+`stablehlo::IfOp` has an `scf::IfOp`-style lambda-callback builder.
+
+New test: `tests/if_basic.fut` -- a standalone top-level `if` (today's only
+other usage is nested inside argmax.fut's/moe_black_box.fut's reduce
+lambda). Note: its condition is computed from an integer comparison
+(`c > 0`) rather than a bare `bool` parameter, since `run_tests.py`'s
+literal parser doesn't support `true`/`false` literals at all (a separate,
+pre-existing gap in the test harness, not a backend issue -- not fixed,
+out of scope here).
+
+**Verified, no bugs found this time**: both `if_basic.fut` cases pass.
+21 passed / 27 failed overall (up from 19/27).
 
 ## Phase 5 — segscan, chlo.scan (not started)
 Delete the whole IREE-bug-workaround vector-packing trick outright (not
@@ -663,3 +683,8 @@ writing the corresponding code.
   Phase 3 (matmul) implemented and verified right after: `matmul.fut`
   passes, no new bugs found, clean on the first build. 19 passed / 27
   failed overall.
+  Phase 4 (if) implemented and verified right after: checked empirically
+  first (StableHLO IfOp's traits + an actual JAX lax.cond reference
+  lowering) that stablehlo.if's branches capture freely, same as scf.if --
+  a structural no-op swap, no bugs. New `tests/if_basic.fut` passes both
+  cases. 21 passed / 27 failed overall.

@@ -337,27 +337,36 @@ struct FutharkCompiler {
         },
         [&](const ExpLoop &e) -> Values { return LowerLoop(e, ctx); },
         [&](const ExpIf &e) -> Values {
-          // TODO(StableHLO rewrite, Phase 4): still scf.if (banned by XLA);
-          // needs stablehlo.if. The condition is a 0-d i1 tensor now (scalars
-          // are 0-d tensors), so it's unwrapped here for scf.if's bare i1.
-          mlir::Value cond = mlir::tensor::ExtractOp::create(
-              builder, LowerSubExp(e.cond, ctx), mlir::ValueRange{});
-          return mlir::scf::IfOp::create(
-                     builder,
-                     cond,
-                     [&](mlir::OpBuilder &b, mlir::Location loc) {
-                       mlir::OpBuilder::InsertionGuard guard(builder);
-                       builder.setInsertionPointToEnd(b.getInsertionBlock());
-                       auto thenValue = LowerBody(*e.then_body, ctx);
-                       mlir::scf::YieldOp::create(builder, loc, thenValue);
-                     },
-                     [&](mlir::OpBuilder &b, mlir::Location loc) {
-                       mlir::OpBuilder::InsertionGuard guard(builder);
-                       builder.setInsertionPointToEnd(b.getInsertionBlock());
-                       auto elseValue = LowerBody(*e.else_body, ctx);
-                       mlir::scf::YieldOp::create(builder, loc, elseValue);
-                     })
-              .getResults();
+          // Confirmed via both the spec (no IsolatedFromAbove trait on
+          // IfOp) and an actual JAX lax.cond reference lowering
+          // (jax.jit(...).lower(...).as_text(), branches reference outer
+          // SSA values directly with zero block arguments) that
+          // stablehlo.if's branches, unlike stablehlo.map's region, can
+          // capture freely -- same as today's scf.if, so this is a
+          // structural no-op swap. The condition is already a 0-d i1 tensor
+          // (scalars are 0-d tensors), matching stablehlo.if's `pred`
+          // directly -- no unwrap needed, unlike scf.if's bare i1.
+          mlir::Value cond = LowerSubExp(e.cond, ctx);
+          mlir::SmallVector<mlir::Type> resultTypes;
+          for (auto &t : e.retType)
+            resultTypes.push_back(LowerTy(t));
+
+          auto op = mlir::stablehlo::IfOp::create(builder, resultTypes, cond);
+
+          auto buildBranch = [&](mlir::Region &region,
+                                 const std::shared_ptr<Body> &body) {
+            // The guard must be constructed before createBlock, not after
+            // (see LowerSegMap's comment on the same point).
+            mlir::OpBuilder::InsertionGuard guard(builder);
+            mlir::Block *blk = builder.createBlock(&region);
+            builder.setInsertionPointToStart(blk);
+            Values results = LowerBody(*body, ctx);
+            mlir::stablehlo::ReturnOp::create(builder, results);
+          };
+          buildBranch(op.getTrueBranch(), e.then_body);
+          buildBranch(op.getFalseBranch(), e.else_body);
+
+          return op->getResults();
         },
         [&](const ExpWithAcc &e) { return LowerWithAcc(e, ctx); });
   }
