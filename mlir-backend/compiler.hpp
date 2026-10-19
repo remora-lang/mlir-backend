@@ -993,9 +993,13 @@ struct FutharkCompiler {
   // TODO(StableHLO rewrite): the general slice path below still emits
   // tensor.extract_slice, which XLA rejects (tensor.* is banned). Not
   // exercised by any currently-passing test (affine reads inside SegMap
-  // bodies take a separate fast path and never reach this function); needs a
-  // stablehlo.slice (static bounds) / stablehlo.dynamic_slice (dynamic start,
-  // static size) rewrite before anything that indexes with a slice can work.
+  // bodies take a separate fast path and never reach this function with a
+  // slice present); needs a stablehlo.slice (static bounds) /
+  // stablehlo.dynamic_slice (dynamic start, static size) rewrite before
+  // anything that indexes with a slice can work. The no-slice (all-fixed-
+  // index) fast path right below *is* exercised -- e.g. unwrapping a
+  // segred's rank-1 result down to a scalar after reducing a flat,
+  // unsegmented array goes through here -- and is already stablehlo-only.
   mlir::Value LowerIndex(const BasicOpIndex &index, Ctx &ctx) {
     auto tensor = LowerSubExp(index.vName.name, ctx);
 
@@ -1003,19 +1007,23 @@ struct FutharkCompiler {
       return std::holds_alternative<DimSlice<SubExp>>(d.v);
     };
     if (!llvm::any_of(index.slice.dims, isSlice)) {
-      std::vector<mlir::Value> indices;
-      for (const auto &dim : index.slice.dims) {
-        auto i = LowerSubExp(std::get<DimFix<SubExp>>(dim.v).i, ctx);
-        auto bareI = mlir::tensor::ExtractOp::create(builder, i,
-                                                      mlir::ValueRange{});
-        indices.push_back(mlir::arith::IndexCastOp::create(
-            builder, builder.getIndexType(), bareI));
-      }
-      auto elem = mlir::tensor::ExtractOp::create(builder, tensor, indices)
-                      .getResult();
-      // Scalars are 0-d tensors now.
-      return mlir::tensor::FromElementsOp::create(
-          builder, mlir::RankedTensorType::get({}, elem.getType()), elem);
+      // stablehlo.dynamic_slice handles constant and dynamic indices
+      // uniformly (its start_indices are themselves 0-d tensors already, no
+      // unwrapping needed), then stablehlo.reshape drops the resulting
+      // all-ones shape down to a 0-d scalar.
+      Values startIndices;
+      for (const auto &dim : index.slice.dims)
+        startIndices.push_back(
+            LowerSubExp(std::get<DimFix<SubExp>>(dim.v).i, ctx));
+      auto tensorTy = getRankedType(tensor.getType());
+      mlir::SmallVector<int64_t> sliceSizes(tensorTy.getRank(), 1);
+      auto sliceTy =
+          mlir::RankedTensorType::get(sliceSizes, tensorTy.getElementType());
+      auto slice = mlir::stablehlo::DynamicSliceOp::create(
+          builder, sliceTy, tensor, startIndices, sliceSizes);
+      return mlir::stablehlo::ReshapeOp::create(
+          builder, mlir::RankedTensorType::get({}, tensorTy.getElementType()),
+          slice);
     }
 
     // Constants stay attributes so that they remain visible in the shape of
@@ -1338,9 +1346,31 @@ struct FutharkCompiler {
     std::vector<AffineRead> affine_reads =
         FindSegOpAffineReads(iterSpace, body);
 
+    // stablehlo.map has no per-operand indexing map the way linalg.generic
+    // does -- every operand must already be the full iteration-space shape
+    // (SameOperandsAndResultShape). An affine read's array may be lower-rank
+    // (e.g. a plain [m]-shaped array read inside a [1][m] segspace for a
+    // full, unsegmented reduction) or otherwise not already shaped that
+    // way, so broadcast it first using the read's own affine map, whose
+    // results are exactly the iteration-space dim each array dim
+    // corresponds to -- precisely stablehlo.broadcast_in_dim's
+    // broadcast_dimensions.
     Values operands;
-    for (auto &read : affine_reads)
-      operands.push_back(ctx.subexps.lookup(read.array.name));
+    for (auto &read : affine_reads) {
+      mlir::Value arr = ctx.subexps.lookup(read.array.name);
+      auto arrTy = getRankedType(arr.getType());
+      if (arrTy.getShape() != llvm::ArrayRef<int64_t>(shapeTy)) {
+        mlir::SmallVector<int64_t> broadcastDims;
+        for (mlir::AffineExpr e : read.indexMap.getResults())
+          broadcastDims.push_back(
+              mlir::cast<mlir::AffineDimExpr>(e).getPosition());
+        auto broadcastTy =
+            mlir::RankedTensorType::get(shapeTy, arrTy.getElementType());
+        arr = mlir::stablehlo::BroadcastInDimOp::create(builder, broadcastTy,
+                                                        arr, broadcastDims);
+      }
+      operands.push_back(arr);
+    }
     // stablehlo.iota's iota_dimension directly gives the dimension that
     // varies, so each gtid's iota is already full-shape -- no separate
     // broadcast needed.
@@ -1353,20 +1383,16 @@ struct FutharkCompiler {
           builder, iotaTy, builder.getI64IntegerAttr(d.index)));
     }
 
-    mlir::SmallVector<mlir::Type> returnTypes;
+    mlir::SmallVector<mlir::Type> elemTypes;
     for (const Type &resultType : ret) {
       if (GetAccType(resultType))
         Undefined("SegMap: with_acc result");
-      returnTypes.push_back(mlir::RankedTensorType::get(
-          shapeTy, LowerSegOpBaseType(resultType, ctx)));
+      elemTypes.push_back(LowerSegOpBaseType(resultType, ctx));
     }
 
     mlir::SmallVector<int64_t> allDims;
     for (int64_t i = 0; i < (int64_t)shapeTy.size(); ++i)
       allDims.push_back(i);
-
-    auto op = mlir::stablehlo::MapOp::create(builder, returnTypes, operands,
-                                             allDims);
 
     mlir::SmallVector<mlir::Type> blockArgTypes;
     for (mlir::Value v : operands)
@@ -1374,205 +1400,170 @@ struct FutharkCompiler {
           {}, getRankedType(v.getType()).getElementType()));
     mlir::SmallVector<mlir::Location> locs(blockArgTypes.size(),
                                            builder.getLoc());
-    {
-      // The guard must be constructed before createBlock, not after: it
-      // saves/restores the insertion point around its scope, and
-      // createBlock itself moves the insertion point into the new block as
-      // a side effect. Guarding only the body-lowering below would save
-      // "already inside blk" and restore right back to that same place,
-      // leaving the builder's insertion point stuck inside the region
-      // afterward instead of back in the enclosing function body.
-      mlir::OpBuilder::InsertionGuard guard(builder);
-      mlir::Block *blk =
-          builder.createBlock(&op.getRegion(), {}, blockArgTypes, locs);
-      builder.setInsertionPointToStart(blk);
 
-      Ctx local = ctx;
-      mlir::ValueRange blockArgs = blk->getArguments();
-      for (auto [read, arg] : llvm::zip_equal(
-               affine_reads, blockArgs.take_front(affine_reads.size())))
-        local.subexps.insert(read.result.name, arg);
-      for (auto [d, arg] : llvm::zip_equal(
-               iterSpace, blockArgs.drop_front(affine_reads.size())))
-        local.subexps.insert(d.id, arg);
+    // stablehlo.map allows only a single (non-variadic) result, so a
+    // tuple-valued kernel body (ret.size() > 1, e.g. `map (\x -> (x, x+x))`)
+    // needs one map op per output value, each recomputing the shared body
+    // statements. That's redundant work (this backend doesn't run CSE
+    // itself to clean it up) but correct, and avoids reintroducing a
+    // multi-value packing trick like the old IREE scan's lane-packing hack.
+    Values finalResults;
+    for (size_t j = 0; j < ret.size(); ++j) {
+      auto resultTy = mlir::RankedTensorType::get(shapeTy, elemTypes[j]);
+      auto op = mlir::stablehlo::MapOp::create(
+          builder, mlir::TypeRange{resultTy}, operands, allDims);
 
-      std::unordered_set<std::string> skipLowering;
-      for (auto &read : affine_reads)
-        skipLowering.insert(read.result.name);
-      for (const Stm &stm : body.stms) {
-        assert(stm.pat.elems.size() == 1);
-        if (skipLowering.contains(stm.pat.elems[0].name.name))
-          continue;
-        LowerStm(stm, local);
+      {
+        // The guard must be constructed before createBlock, not after: it
+        // saves/restores the insertion point around its scope, and
+        // createBlock itself moves the insertion point into the new block
+        // as a side effect. Guarding only the body-lowering below would
+        // save "already inside blk" and restore right back to that same
+        // place, leaving the builder's insertion point stuck inside the
+        // region afterward instead of back in the enclosing function body.
+        mlir::OpBuilder::InsertionGuard guard(builder);
+        mlir::Block *blk =
+            builder.createBlock(&op.getRegion(), {}, blockArgTypes, locs);
+        builder.setInsertionPointToStart(blk);
+
+        Ctx local = ctx;
+        mlir::ValueRange blockArgs = blk->getArguments();
+        for (auto [read, arg] : llvm::zip_equal(
+                 affine_reads, blockArgs.take_front(affine_reads.size())))
+          local.subexps.insert(read.result.name, arg);
+        for (auto [d, arg] : llvm::zip_equal(
+                 iterSpace, blockArgs.drop_front(affine_reads.size())))
+          local.subexps.insert(d.id, arg);
+
+        std::unordered_set<std::string> skipLowering;
+        for (auto &read : affine_reads)
+          skipLowering.insert(read.result.name);
+        for (const Stm &stm : body.stms) {
+          assert(stm.pat.elems.size() == 1);
+          if (skipLowering.contains(stm.pat.elems[0].name.name))
+            continue;
+          LowerStm(stm, local);
+        }
+        mlir::Value result = LowerSubExp(body.result[j].result, local);
+        mlir::stablehlo::ReturnOp::create(builder, mlir::ValueRange{result});
       }
-      Values results;
-      for (auto [result, type] : llvm::zip_equal(body.result, ret)) {
-        if (IsAccType(type))
-          Undefined("SegMap: with_acc result");
-        results.push_back(LowerSubExp(result.result, local));
+
+      // mlir::makeRegionIsolatedFromAbove needs an mlir::IRRewriter, whose
+      // base class mlir::RewriterBase has no typeinfo in the prebuilt MLIR
+      // libs (LLVM/MLIR defaults to -fno-rtti; this backend builds with
+      // -frtti), which fails at link time. Doing the same thing with the
+      // two plain free functions it's built from avoids needing a
+      // RewriterBase instance.
+      mlir::SetVector<mlir::Value> freeVars;
+      mlir::getUsedValuesDefinedAbove(op.getRegion(), freeVars);
+
+      if (!freeVars.empty()) {
+        mlir::Block &entry = op.getRegion().front();
+        mlir::OpBuilder::InsertionGuard guard(builder);
+        builder.setInsertionPoint(op);
+        Values broadcasts;
+        for (mlir::Value fv : freeVars) {
+          auto fvTy = mlir::dyn_cast<mlir::RankedTensorType>(fv.getType());
+          if (!fvTy || fvTy.getRank() != 0)
+            Undefined("SegMap: non-scalar free variable");
+          auto broadcastTy =
+              mlir::RankedTensorType::get(shapeTy, fvTy.getElementType());
+          broadcasts.push_back(mlir::stablehlo::BroadcastInDimOp::create(
+              builder, broadcastTy, fv, mlir::SmallVector<int64_t>{}));
+          mlir::BlockArgument newArg =
+              entry.addArgument(fv.getType(), builder.getLoc());
+          mlir::replaceAllUsesInRegionWith(fv, newArg, op.getRegion());
+        }
+        op->insertOperands(op->getNumOperands(), broadcasts);
       }
-      mlir::stablehlo::ReturnOp::create(builder, results);
+
+      finalResults.push_back(op->getResult(0));
     }
 
-    // mlir::makeRegionIsolatedFromAbove needs an mlir::IRRewriter, whose base
-    // class mlir::RewriterBase has no typeinfo in the prebuilt MLIR libs
-    // (LLVM/MLIR defaults to -fno-rtti; this backend builds with -frtti),
-    // which fails at link time. Doing the same thing with the two plain free
-    // functions it's built from avoids needing a RewriterBase instance.
-    mlir::SetVector<mlir::Value> freeVars;
-    mlir::getUsedValuesDefinedAbove(op.getRegion(), freeVars);
-
-    if (!freeVars.empty()) {
-      mlir::Block &entry = op.getRegion().front();
-      mlir::OpBuilder::InsertionGuard guard(builder);
-      builder.setInsertionPoint(op);
-      Values broadcasts;
-      for (mlir::Value fv : freeVars) {
-        auto fvTy = mlir::dyn_cast<mlir::RankedTensorType>(fv.getType());
-        if (!fvTy || fvTy.getRank() != 0)
-          Undefined("SegMap: non-scalar free variable");
-        auto broadcastTy =
-            mlir::RankedTensorType::get(shapeTy, fvTy.getElementType());
-        broadcasts.push_back(mlir::stablehlo::BroadcastInDimOp::create(
-            builder, broadcastTy, fv, mlir::SmallVector<int64_t>{}));
-        mlir::BlockArgument newArg =
-            entry.addArgument(fv.getType(), builder.getLoc());
-        mlir::replaceAllUsesInRegionWith(fv, newArg, op.getRegion());
-      }
-      op->insertOperands(op->getNumOperands(), broadcasts);
-    }
-
-    // MapOp has a single, non-variadic result, so (unlike GenericOp) it has
-    // no .getResults() convenience accessor -- Operation::getResults() works
-    // regardless.
-    return op->getResults();
+    return finalResults;
   }
 
   // TODO Same limitations as SegMap, probably.
+  // segred = segmap (the fused per-element part, reused as-is) + a
+  // stablehlo.reduce over the innermost (segment) dimension. Tuple
+  // operators fall out for free -- stablehlo.reduce is natively variadic
+  // (multiple inputs/init_values/region-results), no special-casing needed
+  // beyond what's already generic below.
   Values LowerSegRed(const SegRed &pSegRed, Ctx &ctx) {
     RequireThreadLevel(pSegRed.lvl);
 
-    if (pSegRed.ops.size() != 1) {
-      Undefined();
-    }
+    if (pSegRed.ops.size() != 1)
+      Undefined("segred: multiple operators");
     auto pSegBinOp = pSegRed.ops[0];
-    if (pSegBinOp.shape.dims.size() != 0) {
-      Undefined();
-    }
-    Values neutral;
-    for (auto &e : pSegBinOp.neutral) {
-      neutral.push_back(LowerSubExp(e, ctx));
-    }
+    if (pSegBinOp.shape.dims.size() != 0)
+      Undefined("segred: vector-valued operator");
+    // The StableHLO spec says reduce preserves element order, but XLA's GPU
+    // reduce may assume commutativity -- lower priority to actually solve
+    // (see Phase 8), so flagged rather than risking a silently wrong result.
+    if (pSegBinOp.comm == Commutativity::Noncommutative)
+      Undefined("segred: non-commutative");
 
     IterationSpace iterSpace = LowerSegSpace(pSegRed.space, ctx);
     int64_t rank = std::ssize(iterSpace);
     if (rank == 0)
-      Undefined();
+      Undefined("segred: rank 0");
 
-    std::vector<AffineRead> affine_reads =
-        FindSegOpAffineReads(iterSpace, pSegRed.body);
+    Values mapped = LowerSegMap(pSegRed.lvl, pSegRed.space, pSegRed.body,
+                                pSegRed.ret, ctx);
 
-    Values inputs;
-    for (auto &read : affine_reads)
-      inputs.push_back(ctx.subexps.lookup(read.array.name));
+    Values neutral;
+    for (auto &e : pSegBinOp.neutral)
+      neutral.push_back(LowerSubExp(e, ctx));
+    int64_t valueCount = (int64_t)neutral.size();
 
-    mlir::SmallVector<mlir::Type> returnTypes;
-    for (auto ret : pSegBinOp.lambda.ret) {
-      auto baseTy = LowerSegOpBaseType(ret, ctx);
-      auto shapeTy = toShapeType(std::views::values(pSegRed.space.dims) |
-                                 std::views::take(rank - 1));
-      returnTypes.push_back(mlir::RankedTensorType::get(shapeTy, baseTy));
-    }
-    Values dynamicSizes;
-    int64_t reductionIndex = rank - 1;
-    for (const auto &d : iterSpace) {
-      if (d.index == reductionIndex)
-        continue;
-      if (d.isDynamic) {
-        // d.value is a 0-d tensor now; unwrap before arith.index_cast.
-        auto bare = mlir::tensor::ExtractOp::create(builder, d.value,
-                                                    mlir::ValueRange{})
-                        .getResult();
-        dynamicSizes.push_back(mlir::arith::IndexCastOp::create(
-            builder, builder.getIndexType(), bare));
-      }
-    };
-    Values outputs;
-    for (auto [ty, ne] : llvm::zip_equal(returnTypes, neutral)) {
-      // linalg.fill wants a bare scalar fill value; `ne` is a 0-d tensor.
-      auto bareNe =
-          mlir::tensor::ExtractOp::create(builder, ne, mlir::ValueRange{})
-              .getResult();
-      outputs.push_back(mlir::linalg::FillOp::create(
-                            builder,
-                            bareNe,
-                            mlir::ValueRange{mlir::tensor::EmptyOp::create(
-                                builder, ty, dynamicSizes)})
-                            .result());
+    mlir::SmallVector<int64_t> reduceDims{rank - 1};
+    mlir::SmallVector<mlir::Type> resultTypes;
+    for (mlir::Value v : mapped) {
+      auto ty = getRankedType(v.getType());
+      resultTypes.push_back(
+          mlir::RankedTensorType::get(ty.getShape().drop_back(),
+                                      ty.getElementType()));
     }
 
-    std::vector iterTypes(iterSpace.size(),
-                          mlir::utils::IteratorType::parallel);
-    iterTypes[rank - 1] = mlir::utils::IteratorType::reduction;
+    auto op = mlir::stablehlo::ReduceOp::create(builder, resultTypes, mapped,
+                                                neutral, reduceDims);
 
-    // Map the iteration space to each input's dimensions.
-    mlir::SmallVector<mlir::AffineMap> indexingMaps;
-    for (const auto &read : affine_reads) {
-      indexingMaps.push_back(read.indexMap);
+    // Per the StableHLO spec, the body's block args are (one value per input
+    // slice, then one accumulator per init_value) -- the *opposite* order
+    // from Futhark's own SegBinOp.lambda.params convention (accumulators
+    // first, then new values).
+    mlir::SmallVector<mlir::Type> argTys;
+    for (mlir::Value v : mapped)
+      argTys.push_back(mlir::RankedTensorType::get(
+          {}, getRankedType(v.getType()).getElementType()));
+    for (mlir::Value v : neutral)
+      argTys.push_back(v.getType());
+    mlir::SmallVector<mlir::Location> locs(argTys.size(), builder.getLoc());
+
+    {
+      mlir::OpBuilder::InsertionGuard guard(builder);
+      mlir::Block *blk =
+          builder.createBlock(&op.getBody(), {}, argTys, locs);
+      builder.setInsertionPointToStart(blk);
+
+      Ctx local = ctx;
+      mlir::ValueRange blockArgs = blk->getArguments();
+      mlir::ValueRange newValueArgs = blockArgs.take_front(valueCount);
+      mlir::ValueRange accArgs = blockArgs.drop_front(valueCount);
+      for (auto [param, acc] : llvm::zip_equal(
+               pSegBinOp.lambda.params | std::views::take(valueCount),
+               accArgs))
+        local.subexps.insert(param.name, acc);
+      for (auto [param, nv] : llvm::zip_equal(
+               pSegBinOp.lambda.params | std::views::drop(valueCount),
+               newValueArgs))
+        local.subexps.insert(param.name, nv);
+
+      Values results = LowerBody(pSegBinOp.lambda.body, local);
+      mlir::stablehlo::ReturnOp::create(builder, results);
     }
 
-    // Map the iteration space to each output's dimensions.
-    mlir::SmallVector<mlir::AffineExpr> outDims;
-    for (int64_t i = 0; i < rank - 1; ++i) {
-      outDims.push_back(mlir::getAffineDimExpr(i, &context));
-    }
-    indexingMaps.append(outputs.size(),
-                        mlir::AffineMap::get(rank, 0, outDims, &context));
-
-    auto op = mlir::linalg::GenericOp::create(
-        builder,
-        returnTypes,
-        inputs,
-        outputs,
-        indexingMaps,
-        iterTypes,
-        [&](mlir::OpBuilder &b, mlir::Location loc, mlir::ValueRange args) {
-          mlir::OpBuilder::InsertionGuard guard(builder);
-          builder.setInsertionPointToEnd(b.getInsertionBlock());
-
-          Ctx local = ctx;
-          Values returns = LowerSegOpKernelBody(
-              loc, args, affine_reads, iterSpace, pSegRed.body, pSegRed.ret, local);
-
-          // Bind accumulators and inputs to reduce op. `accs` are bare
-          // scalars from the linalg.generic body; scalars are 0-d tensors
-          // everywhere else.
-          auto accs = args.drop_front(inputs.size());
-          assert(pSegBinOp.lambda.params.size() ==
-                 accs.size() + returns.size());
-          for (auto [param, acc] : llvm::zip(pSegBinOp.lambda.params, accs)) {
-            auto ty = mlir::RankedTensorType::get({}, acc.getType());
-            local.subexps.insert(
-                param.name,
-                mlir::tensor::FromElementsOp::create(builder, ty, acc));
-          }
-          for (auto [param, ret] : llvm::zip_equal(
-                   llvm::drop_begin(pSegBinOp.lambda.params, accs.size()),
-                   returns)) {
-            local.subexps.insert(param.name, ret);
-          }
-          auto results = LowerBody(pSegBinOp.lambda.body, local);
-
-          // linalg.yield wants bare scalars matching the output tensors'
-          // element types; `results` are 0-d tensors.
-          Values bareResults;
-          for (auto r : results)
-            bareResults.push_back(
-                mlir::tensor::ExtractOp::create(builder, r, mlir::ValueRange{}));
-          mlir::linalg::YieldOp::create(builder, loc, bareResults);
-        });
-
-    return op.getResults();
+    return op->getResults();
   }
 
   // TODO(StableHLO rewrite, Phase 7): was IREE's iree_linalg_ext.scatter.
@@ -1673,63 +1664,6 @@ struct FutharkCompiler {
         },
         [](const auto &) -> mlir::Type { Undefined(); });
   };
-
-  // Only used by LowerSegRed now (LowerSegMap builds a stablehlo.map with its
-  // own tensor-native binding instead, since its block args are already 0-d
-  // tensors). `blockArgs` here are bare scalars from a linalg.generic body;
-  // scalars are 0-d tensors everywhere else, so each one is wrapped before
-  // entering the shared LowerStm/LowerBinOp pipeline.
-  Values LowerSegOpKernelBody(mlir::Location loc,
-                              const mlir::ValueRange blockArgs,
-                              const std::vector<AffineRead> &affine_reads,
-                              const IterationSpace &iterSpace,
-                              const KernelBody &body,
-                              const std::vector<Type> &resultTypes,
-                              Ctx &ctx) {
-    auto wrap = [&](mlir::Value bare) -> mlir::Value {
-      auto ty = mlir::RankedTensorType::get({}, bare.getType());
-      return mlir::tensor::FromElementsOp::create(builder, ty, bare);
-    };
-
-    std::unordered_set<std::string> skipLowering;
-    for (auto &read : affine_reads)
-      skipLowering.insert(read.result.name);
-
-    // Lower the kernel's affine reads by binding them to the inputs.
-    for (auto [read, arg] : llvm::zip_equal(affine_reads, blockArgs)) {
-      ctx.subexps.insert(read.result.name, wrap(arg));
-    }
-    // Lower the kernel's gtids by binding them to the iteration indices.
-    // TODO only do this if they're actually used
-    for (auto d : iterSpace) {
-      auto idx = mlir::linalg::IndexOp::create(builder, loc, d.index);
-      // d.value is a 0-d tensor now (scalars are 0-d tensors); arith.index_cast
-      // needs the bare element type.
-      auto futharkIndexTy = getRankedType(d.value.getType()).getElementType();
-      auto val =
-          mlir::arith::IndexCastOp::create(builder, loc, futharkIndexTy, idx);
-      ctx.subexps.insert(d.id, wrap(val));
-    }
-    // Lower the kernel body, skipping the affine reads.
-    for (const Stm &stm : body.stms) {
-      assert(stm.pat.elems.size() == 1);
-      if (skipLowering.contains(stm.pat.elems[0].name.name))
-        continue;
-      LowerStm(stm, ctx);
-    }
-    Values returns;
-    for (auto [result, type] : llvm::zip_equal(body.result, resultTypes)) {
-      if (IsAccType(type)) {
-        AccValue acc = ctx.accs.lookup(result.result.GetVName().name);
-        returns.push_back(acc.update);
-        returns.push_back(acc.index);
-      } else {
-        returns.push_back(LowerSubExp(result.result, ctx));
-      }
-    }
-
-    return returns;
-  }
 
   // Scalars are 0-d tensors now; getPrimValueAttr stays a bare scalar attr
   // (also reused by LowerArrayLit to build a full-array DenseElementsAttr).

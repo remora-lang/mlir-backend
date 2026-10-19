@@ -449,14 +449,112 @@ should newly reach (not necessarily pass) Phase 2's `LowerSegRed`/Phase 3's
 i.e. Phase 2 (segred) now has real tests to verify against once it's
 implemented.
 
-## Phase 2 — segred (not started)
-`LowerSegRed` → `LowerSegMap` (per-element part) + `stablehlo.reduce` over the
-innermost dim. Tuple operators fall out for free (reduce is natively
-variadic). Non-commutative → `Undefined("segred: non-commutative")` for now
-(Phase 8 revisits) — **this regresses `argmax.fut` from passing to
-Undefined() until Phase 8, expected per the brief's own "lower priority"
-framing**. New tests: 2×2 matrix-product reduce, affine-composition
-`(a,b)∘(c,d)` reduce, segmented non-commutative variant.
+## Phase 2 — segred (done, verified)
+
+`LowerSegRed` rewritten to call the shared `LowerSegMap` for the fused
+per-element part, then `stablehlo.reduce` over the innermost dim with
+`init_values` = the lowered neutral elements directly (no more
+`linalg.fill`-broadcast). Non-commutative → `Undefined("segred:
+non-commutative")` (Phase 8 revisits this; `argmax.fut` stays Undefined()
+until then, also still blocked by having two differently-sized test cases —
+not annotated, see Phase 1 notes). `LowerSegOpKernelBody` deleted outright
+(dead code once `LowerSegRed` stopped calling it).
+
+**Verified: `reduce.fut` (plain commutative), `reduce2.fut` (segmented),
+and `reduce3.fut` (tuple operator) all pass.** Tuple operators did *not*
+fall out for free as originally assumed -- see bug below. Final count:
+18 passed / 28 failed (up from 15/31 at the start of this phase).
+
+New tests added (per the original coverage-gap list), using the `-- undefined`
+marker convention since all three are expected to hit the non-commutative
+gate until Phase 8 actually solves it (so no need to hand-verify exact
+numeric outputs -- confirmed each hits `Undefined(): segred: non-commutative`
+specifically, not some other accidental gate):
+- `tests/segred_matmul2x2.fut` -- 2×2 matrix product (tuple-encoded
+  `(a,b,c,d)` for `[[a,b],[c,d]]`), associative but non-commutative.
+- `tests/segred_affine_compose.fut` -- affine-map composition
+  `(a,b)∘(c,d)`, same property.
+- `tests/segred_noncomm_segmented.fut` -- the matmul2x2 operator, but
+  segmented (combines with `reduce2.fut`'s segmentation pattern).
+All three validated to actually parse/typecheck as real Futhark via
+`gpu-ir` before being relied on.
+
+### Bugs found and fixed along the way
+
+1. **`LowerSegMap`'s per-dimension `stablehlo.iota` had the wrong element
+   type** (found via `map.fut`, carried over from Phase 1, actually fixed
+   in this session): `Dim::value` is a 0-d tensor now (scalars are 0-d
+   tensors), but the iota type construction and `LowerSegOpKernelBody`'s
+   (now-deleted) gtid `arith.index_cast` were both using
+   `d.value.getType()` directly as a *bare* element type, producing
+   `tensor<4xtensor<i64>>` (tensor-of-tensor, invalid). Fixed by extracting
+   the bare element type via `getRankedType(d.value.getType())
+   .getElementType()` first, in both places (plus a third, then-
+   unreachable occurrence in `LowerSegRed`'s dynamic-size branch).
+
+2. **Insertion-point ordering bug in `LowerSegMap`**: `'stablehlo.return' op
+   must be the last operation in the parent block`. The
+   `OpBuilder::InsertionGuard` was constructed *after* `builder.
+   createBlock(...)`, not before. `createBlock` moves the insertion point
+   into the new block as a side effect; a guard constructed afterward saves
+   "already inside the new block" and restores to that same place at
+   scope-exit, instead of back to the enclosing function body -- so
+   whatever got lowered next landed inside the region, after its
+   terminator. Fixed by constructing the guard before `createBlock`.
+
+3. **`mlir::makeRegionIsolatedFromAbove`/`mlir::IRRewriter` failed to link**:
+   `undefined symbol: typeinfo for mlir::RewriterBase`. The prebuilt MLIR
+   libs are `-fno-rtti` (LLVM's default); this backend builds `-frtti`.
+   Fixed by dropping `IRRewriter` entirely and using the two plain free
+   functions it's built from (`getUsedValuesDefinedAbove` +
+   `replaceAllUsesInRegionWith` + `Block::addArgument`), which need no
+   `RewriterBase` instance.
+
+4. **`stablehlo.map` has no per-operand indexing map** (found via
+   `reduce.fut`, a *new*, Phase-2-specific gap in `LowerSegMap`, not a
+   leftover from Phase 1): unlike `linalg.generic`, every `stablehlo.map`
+   operand must already be the exact iteration-space shape
+   (`SameOperandsAndResultShape`). An affine read's array can be lower-rank
+   than the iteration space -- e.g. `reduce.fut`'s plain `[4]i32` array,
+   read inside what Futhark's GPU IR models as a `[1][4]` segspace even for
+   a flat, unsegmented reduction. Fixed by broadcasting such arrays to the
+   full iteration-space shape first, via `stablehlo.broadcast_in_dim` using
+   the affine read's own index map (its results are exactly the
+   broadcast_dimensions needed).
+
+5. **`LowerIndex`'s single-element ("no slice") fast path still emitted
+   banned `tensor.extract`/`arith.index_cast`/`tensor.from_elements`**
+   (found via `reduce.fut`: Futhark's GPU IR unwraps a flat reduce's
+   rank-1 `stablehlo.reduce` result down to a scalar via an explicit
+   fixed-index read, `result[0]`, which goes through exactly this path --
+   contradicting Phase 1's note that this path was unreached). Rewritten to
+   `stablehlo.dynamic_slice` (handles constant and dynamic indices
+   uniformly, no unwrapping needed since its `start_indices` are already
+   0-d tensors) + `stablehlo.reshape` down to a 0-d scalar. The *other*
+   (general, slice-containing) path in the same function is still
+   known-banned and still unreached; left as-is.
+
+6. **`stablehlo.map` allows only a single, non-variadic result** (found via
+   `reduce3.fut`'s tuple operator: `'stablehlo.map' op requires one
+   result`) -- contradicting the Phase 1 assumption that tuple results
+   would "fall out for free" the way `stablehlo.reduce`'s variadic
+   inputs/results do. Restructured `LowerSegMap` to build one
+   `stablehlo.map` *per output value* when the kernel body returns more
+   than one result, each recomputing the full set of shared body
+   statements (redundant work -- this backend doesn't run CSE itself to
+   clean it up -- but correct, and avoids reintroducing a multi-value
+   packing trick like the old IREE scan's lane-packing hack). Free-variable
+   discovery/broadcast-fixup now happens per sub-map independently.
+
+### Note for Phase 3+
+`stablehlo.reduce`'s region block-argument order is the *opposite* of
+Futhark's own `SegBinOp.lambda.params` convention: StableHLO orders
+`(new_value_args..., accumulator_args...)`, while Futhark orders
+`(accumulator_params..., new_value_params...)` (confirmed via the spec's
+`func_inputs(body)[:len//2]` / `[len//2:]` split, and matches the existing
+`chlo.scan`-era comment "the Futhark binop is lambda(acc.., in..)"). Keep
+this in mind for Phase 5/6's `chlo.scan`, which will have the same
+Futhark-vs-StableHLO param-order mismatch to handle.
 
 ## Phase 3 — matmul (not started)
 `LowerMatMul` → `stablehlo.dot_general`, reusing `LowerDotGeneral`'s existing
@@ -532,3 +630,18 @@ writing the corresponding code.
   across its test cases, plus a non-commutative operator Phase 2 gates to
   `Undefined()` regardless). **Paused here, per request, before rebuilding
   against the just-edited test files or starting Phase 2.**
+- 2026-10-19: Now running directly inside the nix devShell (can run `build`/
+  `run-tests` myself, no more relaying through the user). Phase 2 (segred)
+  implemented and verified: `reduce.fut`/`reduce2.fut`/`reduce3.fut` all
+  pass (commutative, segmented, and tuple operators respectively). Along
+  the way, found and fixed two Phase-1 carryover bugs (iota element type,
+  an insertion-point ordering bug) and three genuinely new Phase-2 gaps:
+  `stablehlo.map` has no per-operand indexing map (needed explicit
+  broadcasting for lower-rank affine reads), `LowerIndex`'s single-element
+  fast path was reachable after all (unwrapping a flat reduce's rank-1
+  result to a scalar) and still emitted banned ops, and `stablehlo.map`
+  turned out to allow only one result (tuple operators needed one map op
+  per output value, not "falls out for free" as Phase 1 assumed). Added
+  three new non-commutative segred tests per the original coverage-gap
+  list. 18 passed / 28 failed overall (up from 15/31 at the start of this
+  session). Full details in the Phase 2 section above.
