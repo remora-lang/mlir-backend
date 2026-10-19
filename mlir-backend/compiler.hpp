@@ -28,6 +28,8 @@
 #include <source_location>
 #include <variant>
 
+namespace hlo = mlir::stablehlo;
+
 template <typename K, typename V> class Env {
   using env_t = std::unordered_map<K, V>;
 
@@ -106,9 +108,7 @@ inline const TypeAcc<Shape, NoUniqueness> *GetAccType(const Type &type) {
   return std::get_if<TypeAcc<Shape, NoUniqueness>>(&type.t.v);
 }
 
-inline bool IsAccType(const Type &type) {
-  return GetAccType(type) != nullptr;
-}
+inline bool IsAccType(const Type &type) { return GetAccType(type) != nullptr; }
 
 template <typename R, typename V>
 concept Iterable = std::ranges::input_range<R> &&
@@ -139,15 +139,15 @@ struct FutharkCompiler {
   // lowering starts; applied uniformly to every dot_general this backend
   // emits. Replaces the old scheme of relying on example_run.py's
   // set_precision regex rewrite of the already-compiled text.
-  mlir::stablehlo::Precision precision = mlir::stablehlo::Precision::DEFAULT;
+  hlo::Precision precision = hlo::Precision::DEFAULT;
 
   // DEFAULT prints as no precision_config attribute at all (StableHLO
   // treats "omitted" and "[DEFAULT, DEFAULT]" identically), matching the
   // output this backend has always produced for the common case.
   mlir::ArrayAttr PrecisionConfig() {
-    if (precision == mlir::stablehlo::Precision::DEFAULT)
+    if (precision == hlo::Precision::DEFAULT)
       return {};
-    auto attr = mlir::stablehlo::PrecisionAttr::get(&context, precision);
+    auto attr = hlo::PrecisionAttr::get(&context, precision);
     return builder.getArrayAttr({attr, attr});
   }
 
@@ -161,7 +161,7 @@ struct FutharkCompiler {
     context.getOrLoadDialect<mlir::index::IndexDialect>();
     context.getOrLoadDialect<mlir::BuiltinDialect>();
     context.getOrLoadDialect<mlir::func::FuncDialect>();
-    context.getOrLoadDialect<mlir::stablehlo::StablehloDialect>();
+    context.getOrLoadDialect<hlo::StablehloDialect>();
     context.getOrLoadDialect<mlir::chlo::ChloDialect>();
     context.getOrLoadDialect<mlir::vector::VectorDialect>();
     module = mlir::ModuleOp::create(builder.getUnknownLoc());
@@ -367,7 +367,7 @@ struct FutharkCompiler {
           for (auto &t : e.retType)
             resultTypes.push_back(LowerTy(t));
 
-          auto op = mlir::stablehlo::IfOp::create(builder, resultTypes, cond);
+          auto op = hlo::IfOp::create(builder, resultTypes, cond);
 
           auto buildBranch = [&](mlir::Region &region,
                                  const std::shared_ptr<Body> &body) {
@@ -377,7 +377,7 @@ struct FutharkCompiler {
             mlir::Block *blk = builder.createBlock(&region);
             builder.setInsertionPointToStart(blk);
             Values results = LowerBody(*body, ctx);
-            mlir::stablehlo::ReturnOp::create(builder, results);
+            hlo::ReturnOp::create(builder, results);
           };
           buildBranch(op.getTrueBranch(), e.then_body);
           buildBranch(op.getFalseBranch(), e.else_body);
@@ -404,7 +404,7 @@ struct FutharkCompiler {
     if (vTy && tTy && vTy.hasStaticShape() && tTy.hasStaticShape() &&
         vTy.getElementType() == tTy.getElementType() &&
         vTy.getNumElements() == tTy.getNumElements()) {
-      return mlir::stablehlo::ReshapeOp::create(builder, tTy, value);
+      return hlo::ReshapeOp::create(builder, tTy, value);
     }
     llvm::errs() << "error: tried to cast\n\n"
                  << value << "\n\nto type\n"
@@ -430,10 +430,13 @@ struct FutharkCompiler {
     if (!resultTy.hasStaticShape())
       Undefined("matmul: dynamic shape");
 
-    auto dotDims = mlir::stablehlo::DotDimensionNumbersAttr::get(
-        &context, /*lhsBatchingDimensions=*/{}, /*rhsBatchingDimensions=*/{},
-        /*lhsContractingDimensions=*/{1}, /*rhsContractingDimensions=*/{0});
-    auto op = mlir::stablehlo::DotGeneralOp::create(
+    auto dotDims =
+        hlo::DotDimensionNumbersAttr::get(&context,
+                                          /*lhsBatchingDimensions=*/{},
+                                          /*rhsBatchingDimensions=*/{},
+                                          /*lhsContractingDimensions=*/{1},
+                                          /*rhsContractingDimensions=*/{0});
+    auto op = hlo::DotGeneralOp::create(
         builder, resultTy, x, y, dotDims, PrecisionConfig(), {});
     return op->getResults();
   }
@@ -508,16 +511,16 @@ struct FutharkCompiler {
           !llvm::is_contained(rhsContractingDimensions, d.index()))
         resultShape.push_back(rhsShape[d.index()]);
 
-    auto op = mlir::stablehlo::DotGeneralOp::create(
+    auto op = hlo::DotGeneralOp::create(
         builder,
         mlir::RankedTensorType::get(resultShape, lhsType.getElementType()),
         lhs,
         rhs,
-        mlir::stablehlo::DotDimensionNumbersAttr::get(&context,
-                                                      lhsBatchingDimensions,
-                                                      rhsBatchingDimensions,
-                                                      lhsContractingDimensions,
-                                                      rhsContractingDimensions),
+        hlo::DotDimensionNumbersAttr::get(&context,
+                                          lhsBatchingDimensions,
+                                          rhsBatchingDimensions,
+                                          lhsContractingDimensions,
+                                          rhsContractingDimensions),
         PrecisionConfig(),
         {});
 
@@ -653,9 +656,10 @@ struct FutharkCompiler {
   Values LowerRaggedDotNonUniform(mlir::ValueRange args,
                                   mlir::TypeRange retTypes, Ctx &ctx) {
     // A nonuniform ragged_dot expressed over the flat segmented representation
-    // produced by irregular flattening. This blackbox sits on matmul_nonuniform,
-    // so it is lowered at its application site where the actual (constant) size
-    // arguments are visible: k = ks[0], n = ns[0], b_data static.
+    // produced by irregular flattening. This blackbox sits on
+    // matmul_nonuniform, so it is lowered at its application site where the
+    // actual (constant) size arguments are visible: k = ks[0], n = ns[0],
+    // b_data static.
     //
     // Inputs (matmul_nonuniform's signature)
     // ------
@@ -671,7 +675,8 @@ struct FutharkCompiler {
     // 13: b_data    flat rhs [b_k]         (static)
     //
     // Outputs: the existential size r followed by the segmented tuple
-    //   (r : i64, sizes : [g]i64, flags : [r]i1, offsets : [g]i64, data : [r]f32)
+    //   (r : i64, sizes : [g]i64, flags : [r]i1, offsets : [g]i64, data :
+    //   [r]f32)
     // Only `data` (the flattened [m][n] result) is meaningful; the auxiliary
     // segment structures are dummies for this demonstration.
     assert(args.size() == 14);
@@ -693,9 +698,10 @@ struct FutharkCompiler {
       // Peel any shape-only wrappers (a `:>` size coercion in the source lowers
       // to reshape/cast) to reach the underlying replicate.
       while (auto *op = cur.getDefiningOp()) {
-        if (mlir::isa<mlir::tensor::ReshapeOp, mlir::tensor::CastOp,
-                      mlir::tensor::ExpandShapeOp, mlir::tensor::CollapseShapeOp>(
-                op))
+        if (mlir::isa<mlir::tensor::ReshapeOp,
+                      mlir::tensor::CastOp,
+                      mlir::tensor::ExpandShapeOp,
+                      mlir::tensor::CollapseShapeOp>(op))
           cur = op->getOperand(0);
         else
           break;
@@ -703,7 +709,8 @@ struct FutharkCompiler {
       mlir::DenseIntElementsAttr dense;
       if (mlir::matchPattern(cur, mlir::m_Constant(&dense)))
         return dense.getValues<int64_t>()[0];
-      // Futhark's replicate lowers to linalg.broadcast(from_elements(constant)).
+      // Futhark's replicate lowers to
+      // linalg.broadcast(from_elements(constant)).
       if (auto bcast = cur.getDefiningOp<mlir::linalg::BroadcastOp>())
         cur = bcast.getInput();
       if (auto fe = cur.getDefiningOp<mlir::tensor::FromElementsOp>())
@@ -724,9 +731,9 @@ struct FutharkCompiler {
       if (mlir::matchPattern(args[4], mlir::m_ConstantInt(&aKConst)))
         m = aKConst.getSExtValue() / k;
     }
-    // TEMP: until the flatten threads a_k statically, uncomment to force a static
-    // m for the m=128 bench and exercise the static chlo.ragged_dot path.
-    // if (mlir::ShapedType::isDynamic(m)) m = 128;
+    // TEMP: until the flatten threads a_k statically, uncomment to force a
+    // static m for the m=128 bench and exercise the static chlo.ragged_dot
+    // path. if (mlir::ShapedType::isDynamic(m)) m = 128;
 
     mlir::Value resultMN; // the [m][n] product
     if (!mlir::ShapedType::isDynamic(m)) {
@@ -738,7 +745,9 @@ struct FutharkCompiler {
           bDataTy == rhsTy
               ? bData
               : mlir::tensor::ExpandShapeOp::create(
-                    builder, rhsTy, bData,
+                    builder,
+                    rhsTy,
+                    bData,
                     *mlir::getReassociationIndicesForReshape(bDataTy, rhsTy))
                     .getResult();
       // lhs [m][k]: expand_shape needs a statically-sized source, so cast the
@@ -748,7 +757,8 @@ struct FutharkCompiler {
       mlir::Value flat =
           aDataTy.hasStaticShape()
               ? aData
-              : mlir::tensor::CastOp::create(builder, flatTy, aData).getResult();
+              : mlir::tensor::CastOp::create(builder, flatTy, aData)
+                    .getResult();
       mlir::SmallVector<mlir::ReassociationIndices> reassoc{{0, 1}};
       mlir::Value lhs =
           mlir::tensor::ExpandShapeOp::create(builder, lhsTy, flat, reassoc)
@@ -757,10 +767,15 @@ struct FutharkCompiler {
       // rhs group dim axis 0; no batching.
       mlir::SmallVector<int64_t> noBatch{};
       resultMN = mlir::chlo::RaggedDotOp::create(
-                     builder, mlir::RankedTensorType::get({m, n}, elementTy),
-                     lhs, rhs, ms,
+                     builder,
+                     mlir::RankedTensorType::get({m, n}, elementTy),
+                     lhs,
+                     rhs,
+                     ms,
                      mlir::chlo::RaggedDotDimensionNumbersAttr::get(
-                         &context, noBatch, noBatch,
+                         &context,
+                         noBatch,
+                         noBatch,
                          mlir::SmallVector<int64_t>{1},
                          mlir::SmallVector<int64_t>{1},
                          mlir::SmallVector<int64_t>{0},
@@ -768,10 +783,11 @@ struct FutharkCompiler {
                      {})
                      ->getResult(0);
     } else {
-      // ---- dynamic m: the dense masked dot_general strategy (gg/ragged_matmul).
-      // IREE cannot legalize chlo.ragged_dot's internal dynamic_broadcast for a
-      // runtime m, but stablehlo.dot_general handles dynamic dims, and the mask
-      // is a single affine linalg.generic (no dynamic broadcast).
+      // ---- dynamic m: the dense masked dot_general strategy
+      // (gg/ragged_matmul). IREE cannot legalize chlo.ragged_dot's internal
+      // dynamic_broadcast for a runtime m, but stablehlo.dot_general handles
+      // dynamic dims, and the mask is a single affine linalg.generic (no
+      // dynamic broadcast).
       auto mIdx =
           mlir::arith::DivUIOp::create(
               builder,
@@ -787,8 +803,8 @@ struct FutharkCompiler {
                               builder, lhs2dTy, aData, lhs2dReassoc, lhs2dOut)
                               .getResult();
 
-      // masked [m][g][k]: masked[i,e,j] = lhs2d[i,j] if row i in group e else 0,
-      // where group e spans rows [a_offsets[e]/k, a_offsets[e]/k + ms[e]).
+      // masked [m][g][k]: masked[i,e,j] = lhs2d[i,j] if row i in group e else
+      // 0, where group e spans rows [a_offsets[e]/k, a_offsets[e]/k + ms[e]).
       auto aOffsets = args[7]; // [g]i64 flat offsets
       auto maskedTy = mlir::RankedTensorType::get({dyn, g, k}, elementTy);
       mlir::Value maskedInit = mlir::tensor::EmptyOp::create(
@@ -803,15 +819,18 @@ struct FutharkCompiler {
           mlir::AffineMap::getMultiDimIdentityMap(3, &context)}; // out
       std::vector<mlir::utils::IteratorType> iters(
           3, mlir::utils::IteratorType::parallel);
-      auto kI64 =
-          mlir::arith::ConstantOp::create(builder, builder.getI64IntegerAttr(k));
+      auto kI64 = mlir::arith::ConstantOp::create(builder,
+                                                  builder.getI64IntegerAttr(k));
       auto zeroElem = mlir::arith::ConstantOp::create(
           builder, builder.getZeroAttr(elementTy));
       mlir::Value masked =
           mlir::linalg::GenericOp::create(
-              builder, mlir::TypeRange{maskedTy},
+              builder,
+              mlir::TypeRange{maskedTy},
               mlir::ValueRange{lhs2d, aOffsets, ms},
-              mlir::ValueRange{maskedInit}, maps, iters,
+              mlir::ValueRange{maskedInit},
+              maps,
+              iters,
               [&](mlir::OpBuilder &b, mlir::Location loc, mlir::ValueRange a) {
                 mlir::OpBuilder::InsertionGuard guard(builder);
                 builder.setInsertionPointToEnd(b.getInsertionBlock());
@@ -820,14 +839,15 @@ struct FutharkCompiler {
                     builder, loc, builder.getI64Type(), iIdx);
                 auto start =
                     mlir::arith::DivUIOp::create(builder, loc, a[1], kI64);
-                auto end = mlir::arith::AddIOp::create(builder, loc, start, a[2]);
+                auto end =
+                    mlir::arith::AddIOp::create(builder, loc, start, a[2]);
                 auto ge = mlir::arith::CmpIOp::create(
                     builder, loc, mlir::arith::CmpIPredicate::sge, iI64, start);
                 auto lt = mlir::arith::CmpIOp::create(
                     builder, loc, mlir::arith::CmpIPredicate::slt, iI64, end);
                 auto inR = mlir::arith::AndIOp::create(builder, loc, ge, lt);
-                auto val = mlir::arith::SelectOp::create(builder, loc, inR, a[0],
-                                                         zeroElem);
+                auto val = mlir::arith::SelectOp::create(
+                    builder, loc, inR, a[0], zeroElem);
                 mlir::linalg::YieldOp::create(builder, loc, val.getResult());
               })
               ->getResult(0);
@@ -843,16 +863,23 @@ struct FutharkCompiler {
       auto bDataTy = getRankedType(bData.getType());
       mlir::Value rhsFused =
           mlir::tensor::ExpandShapeOp::create(
-              builder, rhsFusedTy, bData,
+              builder,
+              rhsFusedTy,
+              bData,
               *mlir::getReassociationIndicesForReshape(bDataTy, rhsFusedTy))
               .getResult();
-      resultMN = mlir::stablehlo::DotGeneralOp::create(
-                     builder, mlir::RankedTensorType::get({dyn, n}, elementTy),
-                     masked2d, rhsFused,
-                     mlir::stablehlo::DotDimensionNumbersAttr::get(
-                         &context, /*lhsBatch=*/{}, /*rhsBatch=*/{},
-                         /*lhsContract=*/{1}, /*rhsContract=*/{0}),
-                     {}, {})
+      resultMN = hlo::DotGeneralOp::create(
+                     builder,
+                     mlir::RankedTensorType::get({dyn, n}, elementTy),
+                     masked2d,
+                     rhsFused,
+                     hlo::DotDimensionNumbersAttr::get(&context,
+                                                       /*lhsBatch=*/{},
+                                                       /*rhsBatch=*/{},
+                                                       /*lhsContract=*/{1},
+                                                       /*rhsContract=*/{0}),
+                     {},
+                     {})
                      .getResult();
     }
 
@@ -866,9 +893,9 @@ struct FutharkCompiler {
 
     // r = length of data (= m*n), as i64.
     auto rIdx = mlir::tensor::DimOp::create(builder, data, 0).getResult();
-    mlir::Value r = mlir::arith::IndexCastOp::create(
-                        builder, builder.getI64Type(), rIdx)
-                        .getResult();
+    mlir::Value r =
+        mlir::arith::IndexCastOp::create(builder, builder.getI64Type(), rIdx)
+            .getResult();
 
     // Dummy auxiliary segment structures.
     auto i64Ty = builder.getI64Type();
@@ -877,14 +904,14 @@ struct FutharkCompiler {
     mlir::Value sizes = mlir::arith::ConstantOp::create(builder, zeros);
     mlir::Value offsets = mlir::arith::ConstantOp::create(builder, zeros);
     auto flagsTy = mlir::RankedTensorType::get({dyn}, builder.getI1Type());
-    auto flagsEmpty = mlir::tensor::EmptyOp::create(builder, flagsTy,
-                                                    mlir::ValueRange{rIdx});
+    auto flagsEmpty =
+        mlir::tensor::EmptyOp::create(builder, flagsTy, mlir::ValueRange{rIdx});
     auto trueC =
         mlir::arith::ConstantOp::create(builder, builder.getBoolAttr(true));
-    mlir::Value flags = mlir::linalg::FillOp::create(
-                            builder, mlir::ValueRange{trueC},
-                            mlir::ValueRange{flagsEmpty})
-                            .result();
+    mlir::Value flags =
+        mlir::linalg::FillOp::create(
+            builder, mlir::ValueRange{trueC}, mlir::ValueRange{flagsEmpty})
+            .result();
 
     return {r, sizes, flags, offsets, data};
   }
@@ -913,18 +940,18 @@ struct FutharkCompiler {
 
     auto i64Scalar = mlir::RankedTensorType::get({}, builder.getI64Type());
     mlir::Value indices = createIota(
-        mlir::stablehlo::ConstantOp::create(
-            builder, mlir::DenseElementsAttr::get(
-                         i64Scalar, builder.getI64IntegerAttr(0))),
-        mlir::stablehlo::ConstantOp::create(
-            builder, mlir::DenseElementsAttr::get(
-                         i64Scalar, builder.getI64IntegerAttr(1))),
+        hlo::ConstantOp::create(builder,
+                                mlir::DenseElementsAttr::get(
+                                    i64Scalar, builder.getI64IntegerAttr(0))),
+        hlo::ConstantOp::create(builder,
+                                mlir::DenseElementsAttr::get(
+                                    i64Scalar, builder.getI64IntegerAttr(1))),
         builder.getI64Type(),
         inputsTy.getShape()[0]);
 
     // Sort the values and the indices together, keyed on the values; the
     // permuted indices are the argsort result.
-    auto op = mlir::stablehlo::SortOp::create(
+    auto op = hlo::SortOp::create(
         builder, mlir::ValueRange{inputs, indices}, (int64_t)0, isStable);
 
     // The comparator has two arguments per sorted operand: the values first
@@ -941,13 +968,12 @@ struct FutharkCompiler {
                                builder.getLoc(),
                                builder.getLoc(),
                                builder.getLoc()});
-      auto lt = mlir::stablehlo::CompareOp::create(
-          builder,
-          block->getArgument(0),
-          block->getArgument(1),
-          mlir::stablehlo::ComparisonDirection::LT,
-          mlir::stablehlo::ComparisonType::SIGNED);
-      mlir::stablehlo::ReturnOp::create(builder, mlir::ValueRange{lt});
+      auto lt = hlo::CompareOp::create(builder,
+                                       block->getArgument(0),
+                                       block->getArgument(1),
+                                       hlo::ComparisonDirection::LT,
+                                       hlo::ComparisonType::SIGNED);
+      hlo::ReturnOp::create(builder, mlir::ValueRange{lt});
     }
 
     return {op.getResult(1)};
@@ -993,14 +1019,14 @@ struct FutharkCompiler {
     if (mlir::ShapedType::isDynamic(dimTy))
       Undefined("iota: dynamic size");
     auto returnTy = mlir::RankedTensorType::get({dimTy}, elementTy);
-    mlir::Value base = mlir::stablehlo::IotaOp::create(
-        builder, returnTy, builder.getI64IntegerAttr(0));
-    auto bx = mlir::stablehlo::BroadcastInDimOp::create(
+    mlir::Value base =
+        hlo::IotaOp::create(builder, returnTy, builder.getI64IntegerAttr(0));
+    auto bx = hlo::BroadcastInDimOp::create(
         builder, returnTy, x, mlir::SmallVector<int64_t>{});
-    auto bs = mlir::stablehlo::BroadcastInDimOp::create(
+    auto bs = hlo::BroadcastInDimOp::create(
         builder, returnTy, s, mlir::SmallVector<int64_t>{});
-    auto scaled = mlir::stablehlo::MulOp::create(builder, base, bs);
-    return mlir::stablehlo::AddOp::create(builder, scaled, bx);
+    auto scaled = hlo::MulOp::create(builder, base, bs);
+    return hlo::AddOp::create(builder, scaled, bx);
   }
 
   // `arr[i, j]` reads a single element, but a slice among the indices makes the
@@ -1035,10 +1061,11 @@ struct FutharkCompiler {
       mlir::SmallVector<int64_t> sliceSizes(tensorTy.getRank(), 1);
       auto sliceTy =
           mlir::RankedTensorType::get(sliceSizes, tensorTy.getElementType());
-      auto slice = mlir::stablehlo::DynamicSliceOp::create(
+      auto slice = hlo::DynamicSliceOp::create(
           builder, sliceTy, tensor, startIndices, sliceSizes);
-      return mlir::stablehlo::ReshapeOp::create(
-          builder, mlir::RankedTensorType::get({}, tensorTy.getElementType()),
+      return hlo::ReshapeOp::create(
+          builder,
+          mlir::RankedTensorType::get({}, tensorTy.getElementType()),
           slice);
     }
 
@@ -1047,11 +1074,10 @@ struct FutharkCompiler {
     auto toIndex = [&](const SubExp &e) -> mlir::OpFoldResult {
       if (auto *c = std::get_if<ConstantSubExp>(&e.v))
         return builder.getIndexAttr(c->GetIntValue());
-      auto bare = mlir::tensor::ExtractOp::create(builder, LowerSubExp(e, ctx),
-                                                   mlir::ValueRange{});
-      return mlir::OpFoldResult(
-          mlir::arith::IndexCastOp::create(builder, builder.getIndexType(),
-                                           bare));
+      auto bare = mlir::tensor::ExtractOp::create(
+          builder, LowerSubExp(e, ctx), mlir::ValueRange{});
+      return mlir::OpFoldResult(mlir::arith::IndexCastOp::create(
+          builder, builder.getIndexType(), bare));
     };
 
     mlir::SmallVector<mlir::OpFoldResult> offsets, sizes, strides;
@@ -1125,7 +1151,7 @@ struct FutharkCompiler {
                 Undefined("ConvOp: ZExt");
               },
               [&](const ConvOpSExt &sext) -> mlir::Value {
-                return mlir::stablehlo::ConvertOp::create(
+                return hlo::ConvertOp::create(
                     builder,
                     LowerTy(Type::CreatePrim(PrimType::Int(sext.to))),
                     op0);
@@ -1133,7 +1159,7 @@ struct FutharkCompiler {
               [&](const ConvOpSIToFP &sitofp) -> mlir::Value {
                 auto ty = mlir::RankedTensorType::get(
                     {}, GetFloatType(builder, GetWidth(sitofp.to)));
-                return mlir::stablehlo::ConvertOp::create(builder, ty, op0);
+                return hlo::ConvertOp::create(builder, ty, op0);
               },
               [](const auto &) -> mlir::Value { Undefined("convOp"); });
         },
@@ -1152,7 +1178,7 @@ struct FutharkCompiler {
           // stablehlo.reshape is a flat reinterpretation for any two static
           // shapes with the same element count -- no collapse/expand
           // distinction needed, unlike tensor.{collapse,expand}_shape.
-          return mlir::stablehlo::ReshapeOp::create(builder, resultTy, op0);
+          return hlo::ReshapeOp::create(builder, resultTy, op0);
         },
         [&](const BasicOpRearrange &val) -> mlir::Value {
           auto op = LowerSubExp(val.arr.name, ctx);
@@ -1171,8 +1197,7 @@ struct FutharkCompiler {
           auto transposedTy =
               mlir::RankedTensorType::get(dims, tensorTy.getElementType());
           mlir::SmallVector<int64_t> perm(val.perm.begin(), val.perm.end());
-          return mlir::stablehlo::TransposeOp::create(builder, transposedTy,
-                                                       op, perm);
+          return hlo::TransposeOp::create(builder, transposedTy, op, perm);
         },
         [&](const BasicOpReplicate &val) -> mlir::Value {
           auto op = LowerSubExp(val.val, ctx);
@@ -1193,7 +1218,7 @@ struct FutharkCompiler {
           int64_t rankDiff = (int64_t)before.size() - (int64_t)original.size();
           for (int64_t i = 0; i < (int64_t)original.size(); ++i)
             broadcastDims.push_back(rankDiff + i);
-          return mlir::stablehlo::BroadcastInDimOp::create(
+          return hlo::BroadcastInDimOp::create(
               builder, resultTy, op, broadcastDims);
         },
         [&](const BasicOpScratch &val) -> mlir::Value {
@@ -1215,11 +1240,10 @@ struct FutharkCompiler {
         [&](const BasicOpCmpOp &val) -> mlir::Value {
           auto lhs = LowerSubExp(val.op0, ctx);
           auto rhs = LowerSubExp(val.op1, ctx);
-          using CD = mlir::stablehlo::ComparisonDirection;
-          using CT = mlir::stablehlo::ComparisonType;
+          using CD = hlo::ComparisonDirection;
+          using CT = hlo::ComparisonType;
           auto cmp = [&](CD dir, CT ty) -> mlir::Value {
-            return mlir::stablehlo::CompareOp::create(builder, lhs, rhs, dir,
-                                                      ty);
+            return hlo::CompareOp::create(builder, lhs, rhs, dir, ty);
           };
           return match(
               val.op,
@@ -1255,11 +1279,11 @@ struct FutharkCompiler {
                 // Neg on bool is logical not; stablehlo.negate covers both
                 // int (0 - x) and float negation uniformly.
                 if (elemTy.isInteger(1))
-                  return mlir::stablehlo::NotOp::create(builder, v);
-                return mlir::stablehlo::NegOp::create(builder, v);
+                  return hlo::NotOp::create(builder, v);
+                return hlo::NegOp::create(builder, v);
               },
               [&](const UnOpComplement &) -> mlir::Value {
-                return mlir::stablehlo::NotOp::create(builder, v);
+                return hlo::NotOp::create(builder, v);
               },
               [](const UnOpAbs &) -> mlir::Value { Undefined(); },
               [](const UnOpFAbs &) -> mlir::Value { Undefined(); },
@@ -1382,8 +1406,8 @@ struct FutharkCompiler {
               mlir::cast<mlir::AffineDimExpr>(e).getPosition());
         auto broadcastTy =
             mlir::RankedTensorType::get(shapeTy, arrTy.getElementType());
-        arr = mlir::stablehlo::BroadcastInDimOp::create(builder, broadcastTy,
-                                                        arr, broadcastDims);
+        arr = hlo::BroadcastInDimOp::create(
+            builder, broadcastTy, arr, broadcastDims);
       }
       operands.push_back(arr);
     }
@@ -1395,7 +1419,7 @@ struct FutharkCompiler {
       // (scalars are 0-d tensors) -- the iota needs its bare element type.
       auto idxElemTy = getRankedType(d.value.getType()).getElementType();
       auto iotaTy = mlir::RankedTensorType::get(shapeTy, idxElemTy);
-      operands.push_back(mlir::stablehlo::IotaOp::create(
+      operands.push_back(hlo::IotaOp::create(
           builder, iotaTy, builder.getI64IntegerAttr(d.index)));
     }
 
@@ -1426,7 +1450,7 @@ struct FutharkCompiler {
     Values finalResults;
     for (size_t j = 0; j < ret.size(); ++j) {
       auto resultTy = mlir::RankedTensorType::get(shapeTy, elemTypes[j]);
-      auto op = mlir::stablehlo::MapOp::create(
+      auto op = hlo::MapOp::create(
           builder, mlir::TypeRange{resultTy}, operands, allDims);
 
       {
@@ -1461,7 +1485,7 @@ struct FutharkCompiler {
           LowerStm(stm, local);
         }
         mlir::Value result = LowerSubExp(body.result[j].result, local);
-        mlir::stablehlo::ReturnOp::create(builder, mlir::ValueRange{result});
+        hlo::ReturnOp::create(builder, mlir::ValueRange{result});
       }
 
       // mlir::makeRegionIsolatedFromAbove needs an mlir::IRRewriter, whose
@@ -1484,7 +1508,7 @@ struct FutharkCompiler {
             Undefined("SegMap: non-scalar free variable");
           auto broadcastTy =
               mlir::RankedTensorType::get(shapeTy, fvTy.getElementType());
-          broadcasts.push_back(mlir::stablehlo::BroadcastInDimOp::create(
+          broadcasts.push_back(hlo::BroadcastInDimOp::create(
               builder, broadcastTy, fv, mlir::SmallVector<int64_t>{}));
           mlir::BlockArgument newArg =
               entry.addArgument(fv.getType(), builder.getLoc());
@@ -1546,8 +1570,8 @@ struct FutharkCompiler {
     if (rank == 0)
       Undefined("segred: rank 0");
 
-    Values mapped = LowerSegMap(pSegRed.lvl, pSegRed.space, pSegRed.body,
-                                pSegRed.ret, ctx);
+    Values mapped =
+        LowerSegMap(pSegRed.lvl, pSegRed.space, pSegRed.body, pSegRed.ret, ctx);
 
     Values neutral;
     for (auto &e : pSegBinOp.neutral)
@@ -1559,13 +1583,12 @@ struct FutharkCompiler {
     mlir::SmallVector<mlir::Type> resultTypes;
     for (mlir::Value v : mapped) {
       auto ty = getRankedType(v.getType());
-      resultTypes.push_back(
-          mlir::RankedTensorType::get(ty.getShape().drop_back(),
-                                      ty.getElementType()));
+      resultTypes.push_back(mlir::RankedTensorType::get(
+          ty.getShape().drop_back(), ty.getElementType()));
     }
 
-    auto op = mlir::stablehlo::ReduceOp::create(builder, resultTypes, mapped,
-                                                neutral, reduceDims);
+    auto op = hlo::ReduceOp::create(
+        builder, resultTypes, mapped, neutral, reduceDims);
 
     // Per the StableHLO spec, the body's block args are (one accumulator
     // per init_value, then one value per input slice) -- confirmed by
@@ -1583,8 +1606,7 @@ struct FutharkCompiler {
 
     {
       mlir::OpBuilder::InsertionGuard guard(builder);
-      mlir::Block *blk =
-          builder.createBlock(&op.getBody(), {}, argTys, locs);
+      mlir::Block *blk = builder.createBlock(&op.getBody(), {}, argTys, locs);
       builder.setInsertionPointToStart(blk);
 
       Ctx local = ctx;
@@ -1592,16 +1614,15 @@ struct FutharkCompiler {
       mlir::ValueRange accArgs = blockArgs.take_front(valueCount);
       mlir::ValueRange newValueArgs = blockArgs.drop_front(valueCount);
       for (auto [param, acc] : llvm::zip_equal(
-               pSegBinOp.lambda.params | std::views::take(valueCount),
-               accArgs))
+               pSegBinOp.lambda.params | std::views::take(valueCount), accArgs))
         local.subexps.insert(param.name, acc);
-      for (auto [param, nv] : llvm::zip_equal(
-               pSegBinOp.lambda.params | std::views::drop(valueCount),
-               newValueArgs))
+      for (auto [param, nv] : llvm::zip_equal(pSegBinOp.lambda.params |
+                                                  std::views::drop(valueCount),
+                                              newValueArgs))
         local.subexps.insert(param.name, nv);
 
       Values results = LowerBody(pSegBinOp.lambda.body, local);
-      mlir::stablehlo::ReturnOp::create(builder, results);
+      hlo::ReturnOp::create(builder, results);
     }
 
     return op->getResults();
@@ -1642,8 +1663,8 @@ struct FutharkCompiler {
     // histOp.shape.dims.size() results are the index components (one per
     // destination dimension), the last one is the value being scattered in
     // (neutral.size() == 1, checked above).
-    Values mapped = LowerSegMap(pSegHist.lvl, pSegHist.space, pSegHist.body,
-                                pSegHist.ret, ctx);
+    Values mapped = LowerSegMap(
+        pSegHist.lvl, pSegHist.space, pSegHist.body, pSegHist.ret, ctx);
 
     int64_t indexRank = (int64_t)histOp.shape.dims.size();
     if (indexRank == 0)
@@ -1662,13 +1683,12 @@ struct FutharkCompiler {
     // selecting the per-update index vector, not R separate 1-D arrays.
     Values reshaped;
     for (mlir::Value idx : indexComponents)
-      reshaped.push_back(mlir::stablehlo::ReshapeOp::create(
+      reshaped.push_back(hlo::ReshapeOp::create(
           builder, mlir::RankedTensorType::get({n, 1}, idxElemTy), idx));
     mlir::Value scatterIndices =
-        indexRank == 1
-            ? reshaped[0]
-            : mlir::stablehlo::ConcatenateOp::create(
-                  builder, mlir::ValueRange(reshaped), (uint64_t)1);
+        indexRank == 1 ? reshaped[0]
+                       : hlo::ConcatenateOp::create(
+                             builder, mlir::ValueRange(reshaped), (uint64_t)1);
 
     // The destination array is a separate, already-lowered statement
     // (Futhark materializes it as its own `replicate`/zero-fill before the
@@ -1680,15 +1700,23 @@ struct FutharkCompiler {
       insertedWindowDims.push_back(i);
       scatterDimsToOperandDims.push_back(i);
     }
-    auto scatterDims = mlir::stablehlo::ScatterDimensionNumbersAttr::get(
-        &context, /*updateWindowDims=*/{}, insertedWindowDims,
-        /*inputBatchingDims=*/{}, /*scatterIndicesBatchingDims=*/{},
-        scatterDimsToOperandDims, /*indexVectorDim=*/1);
+    auto scatterDims =
+        hlo::ScatterDimensionNumbersAttr::get(&context,
+                                              /*updateWindowDims=*/{},
+                                              insertedWindowDims,
+                                              /*inputBatchingDims=*/{},
+                                              /*scatterIndicesBatchingDims=*/{},
+                                              scatterDimsToOperandDims,
+                                              /*indexVectorDim=*/1);
 
-    auto op = mlir::stablehlo::ScatterOp::create(
-        builder, mlir::TypeRange{dest.getType()}, mlir::ValueRange{dest},
-        scatterIndices, mlir::ValueRange{updateValue}, scatterDims,
-        /*indices_are_sorted=*/false, /*unique_indices=*/false);
+    auto op = hlo::ScatterOp::create(builder,
+                                     mlir::TypeRange{dest.getType()},
+                                     mlir::ValueRange{dest},
+                                     scatterIndices,
+                                     mlir::ValueRange{updateValue},
+                                     scatterDims,
+                                     /*indices_are_sorted=*/false,
+                                     /*unique_indices=*/false);
 
     mlir::Type elemTy = getRankedType(dest.getType()).getElementType();
     mlir::SmallVector<mlir::Type> argTys = {
@@ -1697,8 +1725,8 @@ struct FutharkCompiler {
     mlir::SmallVector<mlir::Location> locs(2, builder.getLoc());
     {
       mlir::OpBuilder::InsertionGuard guard(builder);
-      mlir::Block *blk = builder.createBlock(&op.getUpdateComputation(), {},
-                                             argTys, locs);
+      mlir::Block *blk =
+          builder.createBlock(&op.getUpdateComputation(), {}, argTys, locs);
       builder.setInsertionPointToStart(blk);
 
       // Per the spec, update_computation(results[result_index],
@@ -1710,7 +1738,7 @@ struct FutharkCompiler {
       local.subexps.insert(histOp.lambda.params[0].name, blk->getArgument(0));
       local.subexps.insert(histOp.lambda.params[1].name, blk->getArgument(1));
       Values results = LowerBody(histOp.lambda.body, local);
-      mlir::stablehlo::ReturnOp::create(builder, mlir::ValueRange{results[0]});
+      hlo::ReturnOp::create(builder, mlir::ValueRange{results[0]});
     }
 
     return Values(op->getResults().begin(), op->getResults().end());
@@ -1728,8 +1756,7 @@ struct FutharkCompiler {
   // output value" structure as LowerSegMap, since map allows only a single
   // result; duplicated rather than shared since this call site has no
   // affine-reads/iota operands to thread through.
-  Values LowerElementwiseLambda(const Lambda &lambda, Values inputs,
-                                Ctx &ctx) {
+  Values LowerElementwiseLambda(const Lambda &lambda, Values inputs, Ctx &ctx) {
     auto shapeTy = getRankedType(inputs[0].getType()).getShape();
     mlir::SmallVector<int64_t> allDims;
     for (int64_t i = 0; i < (int64_t)shapeTy.size(); ++i)
@@ -1745,7 +1772,7 @@ struct FutharkCompiler {
     for (size_t j = 0; j < lambda.ret.size(); ++j) {
       auto resultTy = mlir::RankedTensorType::get(
           shapeTy, LowerSegOpBaseType(lambda.ret[j], ctx));
-      auto op = mlir::stablehlo::MapOp::create(
+      auto op = hlo::MapOp::create(
           builder, mlir::TypeRange{resultTy}, inputs, allDims);
 
       {
@@ -1759,8 +1786,7 @@ struct FutharkCompiler {
              llvm::zip_equal(lambda.params, blk->getArguments()))
           local.subexps.insert(param.name, arg);
         Values results = LowerBody(lambda.body, local);
-        mlir::stablehlo::ReturnOp::create(builder,
-                                          mlir::ValueRange{results[j]});
+        hlo::ReturnOp::create(builder, mlir::ValueRange{results[j]});
       }
 
       mlir::SetVector<mlir::Value> freeVars;
@@ -1776,7 +1802,7 @@ struct FutharkCompiler {
             Undefined("elementwise lambda: non-scalar free variable");
           auto broadcastTy =
               mlir::RankedTensorType::get(shapeTy, fvTy.getElementType());
-          broadcasts.push_back(mlir::stablehlo::BroadcastInDimOp::create(
+          broadcasts.push_back(hlo::BroadcastInDimOp::create(
               builder, broadcastTy, fv, mlir::SmallVector<int64_t>{}));
           mlir::BlockArgument newArg =
               entry.addArgument(fv.getType(), builder.getLoc());
@@ -1823,8 +1849,8 @@ struct FutharkCompiler {
     if (rank == 0)
       Undefined("segscan: rank 0");
 
-    Values mapped = LowerSegMap(pSegScan.lvl, pSegScan.space, pSegScan.body,
-                                pSegScan.ret, ctx);
+    Values mapped = LowerSegMap(
+        pSegScan.lvl, pSegScan.space, pSegScan.body, pSegScan.ret, ctx);
 
     Values neutral;
     for (auto &e : segBinOp.neutral)
@@ -1860,11 +1886,11 @@ struct FutharkCompiler {
     // sequential chlo.scan-based implementation it replaced) -- verified
     // correct for both commutative and non-commutative tuple operators,
     // including ones reduce_window gets wrong.
-    Values scanned = valueCount == 1
-                         ? LowerSegScanReduceWindow(mapped, neutral, scanDim,
-                                                     segBinOp, ctx)
-                         : LowerSegScanParallelPrefix(mapped, neutral, scanDim,
-                                                       segBinOp, ctx);
+    Values scanned =
+        valueCount == 1
+            ? LowerSegScanReduceWindow(mapped, neutral, scanDim, segBinOp, ctx)
+            : LowerSegScanParallelPrefix(
+                  mapped, neutral, scanDim, segBinOp, ctx);
 
     return LowerElementwiseLambda(pSegScan.post_op.lambda, scanned, ctx);
   }
@@ -1891,19 +1917,24 @@ struct FutharkCompiler {
     mlir::SmallVector<int64_t> windowDilations(rank, 1);
     mlir::SmallVector<int64_t> paddingFlat(rank * 2, 0);
     paddingFlat[scanDim * 2] = n - 1;
-    auto paddingTy = mlir::RankedTensorType::get({rank, 2}, builder.getI64Type());
+    auto paddingTy =
+        mlir::RankedTensorType::get({rank, 2}, builder.getI64Type());
     auto paddingAttr = mlir::DenseIntElementsAttr::get(paddingTy, paddingFlat);
 
     mlir::SmallVector<mlir::Type> resultTypes;
     for (mlir::Value v : mapped)
       resultTypes.push_back(v.getType());
 
-    auto op = mlir::stablehlo::ReduceWindowOp::create(
-        builder, resultTypes, mapped, neutral,
+    auto op = hlo::ReduceWindowOp::create(
+        builder,
+        resultTypes,
+        mapped,
+        neutral,
         builder.getDenseI64ArrayAttr(windowDims),
         builder.getDenseI64ArrayAttr(windowStrides),
         builder.getDenseI64ArrayAttr(baseDilations),
-        builder.getDenseI64ArrayAttr(windowDilations), paddingAttr);
+        builder.getDenseI64ArrayAttr(windowDilations),
+        paddingAttr);
 
     // Per the StableHLO spec, the body's block args are (one value per
     // windowed input, then one accumulator per init_value) -- same order
@@ -1927,16 +1958,15 @@ struct FutharkCompiler {
       mlir::ValueRange newValueArgs = blockArgs.take_front(valueCount);
       mlir::ValueRange accArgs = blockArgs.drop_front(valueCount);
       for (auto [param, acc] : llvm::zip_equal(
-               segBinOp.lambda.params | std::views::take(valueCount),
-               accArgs))
+               segBinOp.lambda.params | std::views::take(valueCount), accArgs))
         local.subexps.insert(param.name, acc);
-      for (auto [param, nv] : llvm::zip_equal(
-               segBinOp.lambda.params | std::views::drop(valueCount),
-               newValueArgs))
+      for (auto [param, nv] : llvm::zip_equal(segBinOp.lambda.params |
+                                                  std::views::drop(valueCount),
+                                              newValueArgs))
         local.subexps.insert(param.name, nv);
 
       Values results = LowerBody(segBinOp.lambda.body, local);
-      mlir::stablehlo::ReturnOp::create(builder, results);
+      hlo::ReturnOp::create(builder, results);
     }
 
     return Values(op->getResults().begin(), op->getResults().end());
@@ -1948,7 +1978,7 @@ struct FutharkCompiler {
   // operator (see Interleave's comment for why that's still correct).
   mlir::Value ZeroScalar(mlir::Type elemTy) {
     auto ty = mlir::RankedTensorType::get({}, elemTy);
-    return mlir::stablehlo::ConstantOp::create(
+    return hlo::ConstantOp::create(
         builder, mlir::DenseElementsAttr::get(ty, builder.getZeroAttr(elemTy)));
   }
 
@@ -1968,7 +1998,7 @@ struct FutharkCompiler {
       limits[dim] = limit;
       strides[dim] = stride;
       result.push_back(
-          mlir::stablehlo::SliceOp::create(builder, v, starts, limits, strides));
+          hlo::SliceOp::create(builder, v, starts, limits, strides));
     }
     return result;
   }
@@ -1976,7 +2006,7 @@ struct FutharkCompiler {
   Values ConcatDim(Values a, Values b, int64_t dim) {
     Values result;
     for (auto [av, bv] : llvm::zip_equal(a, b))
-      result.push_back(mlir::stablehlo::ConcatenateOp::create(
+      result.push_back(hlo::ConcatenateOp::create(
           builder, mlir::ValueRange{av, bv}, (uint64_t)dim));
     return result;
   }
@@ -2008,7 +2038,7 @@ struct FutharkCompiler {
       aHighV[dim] = aHigh;
       aInterior[dim] = 1;
       mlir::Value aPadded =
-          mlir::stablehlo::PadOp::create(builder, av, zero, aLow, aHighV, aInterior);
+          hlo::PadOp::create(builder, av, zero, aLow, aHighV, aInterior);
 
       mlir::SmallVector<int64_t> bLow(rank, 0), bHighV(rank, 0),
           bInterior(rank, 0);
@@ -2016,11 +2046,12 @@ struct FutharkCompiler {
       bHighV[dim] = bHigh;
       bInterior[dim] = 1;
       mlir::Value bPadded =
-          mlir::stablehlo::PadOp::create(builder, bv, zero, bLow, bHighV, bInterior);
+          hlo::PadOp::create(builder, bv, zero, bLow, bHighV, bInterior);
 
-      mlir::Value combined = elemTy.isInteger(1)
-          ? mlir::Value(mlir::stablehlo::OrOp::create(builder, aPadded, bPadded))
-          : mlir::Value(mlir::stablehlo::AddOp::create(builder, aPadded, bPadded));
+      mlir::Value combined =
+          elemTy.isInteger(1)
+              ? mlir::Value(hlo::OrOp::create(builder, aPadded, bPadded))
+              : mlir::Value(hlo::AddOp::create(builder, aPadded, bPadded));
       result.push_back(combined);
     }
     return result;
@@ -2055,7 +2086,7 @@ struct FutharkCompiler {
     for (size_t j = 0; j < segBinOp.lambda.ret.size(); ++j) {
       auto resultTy = mlir::RankedTensorType::get(
           shapeTy, LowerSegOpBaseType(segBinOp.lambda.ret[j], ctx));
-      auto op = mlir::stablehlo::MapOp::create(
+      auto op = hlo::MapOp::create(
           builder, mlir::TypeRange{resultTy}, inputs, allDims);
 
       {
@@ -2069,8 +2100,7 @@ struct FutharkCompiler {
              llvm::zip_equal(segBinOp.lambda.params, blk->getArguments()))
           local.subexps.insert(param.name, arg);
         Values results = LowerBody(segBinOp.lambda.body, local);
-        mlir::stablehlo::ReturnOp::create(builder,
-                                          mlir::ValueRange{results[j]});
+        hlo::ReturnOp::create(builder, mlir::ValueRange{results[j]});
       }
 
       mlir::SetVector<mlir::Value> freeVars;
@@ -2086,7 +2116,7 @@ struct FutharkCompiler {
             Undefined("segscan parallel prefix: non-scalar free variable");
           auto broadcastTy =
               mlir::RankedTensorType::get(shapeTy, fvTy.getElementType());
-          broadcasts.push_back(mlir::stablehlo::BroadcastInDimOp::create(
+          broadcasts.push_back(hlo::BroadcastInDimOp::create(
               builder, broadcastTy, fv, mlir::SmallVector<int64_t>{}));
           mlir::BlockArgument newArg =
               entry.addArgument(fv.getType(), builder.getLoc());
@@ -2120,16 +2150,19 @@ struct FutharkCompiler {
     if (n < 2)
       return elems;
 
-    Values reduced =
-        Combine(SliceDim(elems, 0, n - 1, 2, dim),
-                SliceDim(elems, 1, n, 2, dim), segBinOp, ctx);
+    Values reduced = Combine(SliceDim(elems, 0, n - 1, 2, dim),
+                             SliceDim(elems, 1, n, 2, dim),
+                             segBinOp,
+                             ctx);
     Values oddElems = ScanRec(reduced, dim, segBinOp, ctx);
 
     Values evenElems;
     int64_t pairCount = n / 2;
     if (n % 2 == 0) {
       evenElems = Combine(SliceDim(oddElems, 0, pairCount - 1, 1, dim),
-                          SliceDim(elems, 2, n, 2, dim), segBinOp, ctx);
+                          SliceDim(elems, 2, n, 2, dim),
+                          segBinOp,
+                          ctx);
     } else {
       evenElems =
           Combine(oddElems, SliceDim(elems, 2, n, 2, dim), segBinOp, ctx);
@@ -2242,7 +2275,7 @@ struct FutharkCompiler {
   mlir::Value LowerPrimValue(PrimValue value, Ctx &ctx) {
     mlir::TypedAttr scalarAttr = getPrimValueAttr(value);
     auto ty = mlir::RankedTensorType::get({}, scalarAttr.getType());
-    return mlir::stablehlo::ConstantOp::create(
+    return hlo::ConstantOp::create(
         builder, mlir::DenseElementsAttr::get(ty, scalarAttr));
   }
 
@@ -2282,8 +2315,9 @@ struct FutharkCompiler {
     // op, flagged rather than risking wrong rounding.
     if (std::get_if<BinOpSQuot>(&binOp.v) || std::get_if<BinOpFDiv>(&binOp.v))
       return hlo::DivOp::create(builder, op0, op1);
-    if (std::get_if<BinOpSDivUp>(&binOp.v) || std::get_if<BinOpSDiv>(&binOp.v) ||
-        std::get_if<BinOpUDiv>(&binOp.v) || std::get_if<BinOpUDivUp>(&binOp.v))
+    if (std::get_if<BinOpSDivUp>(&binOp.v) ||
+        std::get_if<BinOpSDiv>(&binOp.v) || std::get_if<BinOpUDiv>(&binOp.v) ||
+        std::get_if<BinOpUDivUp>(&binOp.v))
       Undefined("binop: rounding div");
 
     // `srem`/`smod` are truncated/floored remainder -- for the non-negative
@@ -2338,7 +2372,7 @@ struct FutharkCompiler {
     }
 
     if (allConstants) {
-      return mlir::stablehlo::ConstantOp::create(
+      return hlo::ConstantOp::create(
           builder,
           mlir::DenseElementsAttr::get(getRankedType(tensorTy), attrs));
     } else {
@@ -2399,8 +2433,7 @@ struct FutharkCompiler {
     if (fname.starts_with("cond_")) {
       if (args.size() != 3)
         Undefined();
-      return {mlir::stablehlo::SelectOp::create(builder, args[0], args[1],
-                                                args[2])
+      return {hlo::SelectOp::create(builder, args[0], args[1], args[2])
                   .getResult()};
     }
 
