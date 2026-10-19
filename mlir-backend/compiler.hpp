@@ -22,6 +22,7 @@
 #include <mlir/Dialect/Vector/IR/VectorOps.h>
 #include <mlir/IR/AffineMap.h>
 #include <mlir/IR/BuiltinTypeInterfaces.h>
+#include <mlir/Transforms/RegionUtils.h>
 #include <optional>
 #include <ranges>
 #include <source_location>
@@ -174,47 +175,39 @@ struct FutharkCompiler {
       inputTypes.push_back(LowerTy(param.dec.v));
     }
 
+    // XLA requires every shape in the module to be static.
+    for (mlir::Type ty : inputTypes)
+      if (auto rt = mlir::dyn_cast<mlir::RankedTensorType>(ty);
+          rt && !rt.hasStaticShape())
+        Undefined("dynamic-shaped function parameter");
+    for (mlir::Type ty : retTypes)
+      if (auto rt = mlir::dyn_cast<mlir::RankedTensorType>(ty);
+          rt && !rt.hasStaticShape())
+        Undefined("dynamic-shaped function result");
+
+    // The entry function becomes @main (XLA's required entry point name)
+    // regardless of its Futhark source name. More than one entry point is
+    // ambiguous, not untranslatable -- a hard error, not Undefined().
+    std::string funcName = fun.name;
+    if (fun.entry) {
+      int numEntries = 0;
+      for (const auto &f : prog.funs)
+        if (f.entry)
+          ++numEntries;
+      if (numEntries > 1)
+        throw std::runtime_error(
+            "multiple entry points: StableHLO/XLA requires exactly one @main");
+      funcName = "main";
+    }
+
     auto fType = builder.getFunctionType(inputTypes, retTypes);
     auto func =
-        mlir::func::FuncOp::create(builder.getUnknownLoc(), fun.name, fType);
+        mlir::func::FuncOp::create(builder.getUnknownLoc(), funcName, fType);
     builder.insert(func);
     functions[fun] = func;
 
     if (!fun.entry) {
       func.setPrivate();
-    }
-
-    // Annotate function arguments with size type information
-    // by mapping tensor dimensions to function argument positions.
-    //
-    // For example, our test runner must infer the values of size parameters:
-    //   -- ==
-    //   -- input { [...] }
-    //   -- output { ... }
-    //   entry f [n] [m] (x: [n][10][m]f32)
-    // has GPU IR with additional arguments n and m
-    //   entry ("f", {n : i64, m : i64, x : [n][10][m]i64}, ...)
-    // so we annotate x with "futhark.size_args = [0, -1, 1]" in MLIR
-    // where -1 denotes a static dimension.
-    if (fun.entry) {
-      std::unordered_map<std::string, int> argPosition;
-      for (auto [i, param] : llvm::enumerate(runtimeParams)) {
-        argPosition[param.name] = i;
-
-        if (auto *arr =
-                std::get_if<TypeArray<Shape, NoUniqueness>>(&param.dec.v.t.v)) {
-          mlir::SmallVector<int64_t> pos;
-          for (const auto &d : arr->shape.dims)
-            pos.push_back(match(
-                d,
-                [&](const VarSubExp &) {
-                  return argPosition.at(d.GetVName().name);
-                },
-                [&](const ConstantSubExp &) { return -1; }));
-
-          func.setArgAttr(i, "futhark.size_args", builder.getI64ArrayAttr(pos));
-        }
-      }
     }
 
     Ctx ctx;
@@ -344,9 +337,14 @@ struct FutharkCompiler {
         },
         [&](const ExpLoop &e) -> Values { return LowerLoop(e, ctx); },
         [&](const ExpIf &e) -> Values {
+          // TODO(StableHLO rewrite, Phase 4): still scf.if (banned by XLA);
+          // needs stablehlo.if. The condition is a 0-d i1 tensor now (scalars
+          // are 0-d tensors), so it's unwrapped here for scf.if's bare i1.
+          mlir::Value cond = mlir::tensor::ExtractOp::create(
+              builder, LowerSubExp(e.cond, ctx), mlir::ValueRange{});
           return mlir::scf::IfOp::create(
                      builder,
-                     LowerSubExp(e.cond, ctx),
+                     cond,
                      [&](mlir::OpBuilder &b, mlir::Location loc) {
                        mlir::OpBuilder::InsertionGuard guard(builder);
                        builder.setInsertionPointToEnd(b.getInsertionBlock());
@@ -364,83 +362,29 @@ struct FutharkCompiler {
         [&](const ExpWithAcc &e) { return LowerWithAcc(e, ctx); });
   }
 
-  // A Futhark loop carries a set of parameters from one iteration to
-  // the next, which become the iteration arguments of the scf.for.
-  Values LowerLoop(const ExpLoop &loop, Ctx &ctx) {
-    // TODO while loops, which need an scf.while with the continuation
-    // condition -- itself a loop parameter -- read in the "before" region.
-    auto *forLoop = std::get_if<ForLoop>(&loop.form.v);
-    if (!forLoop)
-      Undefined();
+  // No StableHLO/XLA equivalent for an arbitrary-trip-count loop (for or
+  // while) -- per the brief, both become Undefined() for now.
+  Values LowerLoop(const ExpLoop &, Ctx &) { Undefined("loop"); }
 
-    mlir::SmallVector<mlir::Type> mergeTypes;
-    Values inits;
-    for (const auto &[param, init] : loop.merge) {
-      auto ty = LowerTy(param.dec.v);
-      mergeTypes.push_back(ty);
-      inits.push_back(castToType(LowerSubExp(init, ctx), ty));
-    }
-
-    auto lb = mlir::arith::ConstantIndexOp::create(builder, 0);
-    auto ub = mlir::arith::IndexCastOp::create(
-        builder, builder.getIndexType(), LowerSubExp(forLoop->bound, ctx));
-    auto step = mlir::arith::ConstantIndexOp::create(builder, 1);
-    auto counterTy = builder.getIntegerType(GetWidth(forLoop->t));
-
-    auto forOp = mlir::scf::ForOp::create(
-        builder,
-        builder.getLoc(),
-        lb,
-        ub,
-        step,
-        inits,
-        [&](mlir::OpBuilder &b,
-            mlir::Location bodyLoc,
-            mlir::Value iv,
-            mlir::ValueRange iterArgs) {
-          mlir::OpBuilder::InsertionGuard guard(builder);
-          builder.setInsertionPoint(b.getInsertionBlock(),
-                                    b.getInsertionPoint());
-
-          Ctx local = ctx;
-          // scf.for counts in `index`, but the body sees the Futhark loop
-          // counter at its own integer type.
-          local.subexps.insert(forLoop->i.name,
-                               mlir::arith::IndexCastOp::create(
-                                   builder, bodyLoc, counterTy, iv));
-          for (auto [param, arg] : llvm::zip_equal(loop.merge, iterArgs))
-            local.subexps.insert(param.first.name, arg);
-
-          // The body's results feed back into the merge parameters, so they
-          // must have exactly the parameters' types.
-          Values results;
-          for (auto [v, ty] :
-               llvm::zip_equal(LowerBody(*loop.body, local), mergeTypes))
-            results.push_back(castToType(v, ty));
-          mlir::scf::YieldOp::create(builder, bodyLoc, results);
-        });
-
-    return forOp.getResults();
-  }
-
-  // Casts the type of `value` to `type` if they are compatible
-  // (e.g., a tensor's static dimension is cast to a dynamic one
-  // or a 0-D tensor is cast to a scalar).
+  // Reconciles `value`'s type with `type` when they're nominally different
+  // but describe the same value (e.g. a Futhark `:>` size coercion). Scalars
+  // are always 0-d tensors now, so there's no bare-scalar case to extract
+  // into; the only remaining case is a static-shape reshape with the same
+  // element count.
   mlir::Value castToType(mlir::Value value, mlir::Type type) {
-    if (value.getType() == type) {
+    if (value.getType() == type)
       return value;
-    }
-    if (mlir::tensor::CastOp::areCastCompatible(value.getType(), type)) {
-      return mlir::tensor::CastOp::create(builder, type, value);
-    }
-    if (mlir::isa<mlir::RankedTensorType>(value.getType()) &&
-        getRankedType(value.getType()).getRank() == 0 && type.isIntOrFloat()) {
-      return mlir::tensor::ExtractOp::create(builder, value, {});
+    auto vTy = mlir::dyn_cast<mlir::RankedTensorType>(value.getType());
+    auto tTy = mlir::dyn_cast<mlir::RankedTensorType>(type);
+    if (vTy && tTy && vTy.hasStaticShape() && tTy.hasStaticShape() &&
+        vTy.getElementType() == tTy.getElementType() &&
+        vTy.getNumElements() == tTy.getNumElements()) {
+      return mlir::stablehlo::ReshapeOp::create(builder, tTy, value);
     }
     llvm::errs() << "error: tried to cast\n\n"
                  << value << "\n\nto type\n"
                  << type << "\n";
-    Undefined();
+    Undefined("castToType: incompatible types");
   }
 
   Values LowerMatMul(mlir::ValueRange args, mlir::TypeRange retTypes,
@@ -951,10 +895,14 @@ struct FutharkCompiler {
       throw std::runtime_error(
           "argsort: shape of input tensor must be static.");
 
+    auto i64Scalar = mlir::RankedTensorType::get({}, builder.getI64Type());
     mlir::Value indices = createIota(
-        mlir::tensor::DimOp::create(builder, inputs, 0).getResult(),
-        mlir::arith::ConstantOp::create(builder, builder.getI64IntegerAttr(0)),
-        mlir::arith::ConstantOp::create(builder, builder.getI64IntegerAttr(1)),
+        mlir::stablehlo::ConstantOp::create(
+            builder, mlir::DenseElementsAttr::get(
+                         i64Scalar, builder.getI64IntegerAttr(0))),
+        mlir::stablehlo::ConstantOp::create(
+            builder, mlir::DenseElementsAttr::get(
+                         i64Scalar, builder.getI64IntegerAttr(1))),
         builder.getI64Type(),
         inputsTy.getShape()[0]);
 
@@ -1011,47 +959,43 @@ struct FutharkCompiler {
     if (mlir::matchPattern(x, mlir::m_ConstantInt(&v))) {
       return v.getSExtValue();
     }
+    // Scalars are 0-d tensors now, so a constant scalar may also show up as
+    // a single-element stablehlo.constant rather than a bare arith.constant.
+    mlir::DenseIntElementsAttr attr;
+    if (mlir::matchPattern(x, mlir::m_Constant(&attr)) &&
+        attr.getNumElements() == 1) {
+      return *attr.getValues<int64_t>().begin();
+    }
     Undefined();
   }
 
-  // Builds a 1-D iota tensor where result[i] = x + i*s.
-  mlir::Value createIota(mlir::Value n, mlir::Value x, mlir::Value s,
-                         mlir::Type elementTy, int64_t dimTy) {
+  // Builds a 1-D StableHLO iota tensor where result[i] = x + i*s. `x`/`s` are
+  // 0-d tensors (scalars are 0-d tensors now); only static lengths are
+  // supported.
+  mlir::Value createIota(mlir::Value x, mlir::Value s, mlir::Type elementTy,
+                         int64_t dimTy) {
+    if (mlir::ShapedType::isDynamic(dimTy))
+      Undefined("iota: dynamic size");
     auto returnTy = mlir::RankedTensorType::get({dimTy}, elementTy);
-    auto output = mlir::tensor::EmptyOp::create(
-        builder,
-        returnTy,
-        mlir::ShapedType::isDynamic(dimTy) ? mlir::ValueRange{n}
-                                           : mlir::ValueRange{});
-    auto op = mlir::linalg::GenericOp::create(
-        builder,
-        {returnTy},
-        {},
-        {output},
-        {mlir::AffineMap::getMultiDimIdentityMap(1, &context)},
-        {mlir::utils::IteratorType::parallel},
-        [&](mlir::OpBuilder &b, mlir::Location loc, mlir::ValueRange args) {
-          mlir::OpBuilder::InsertionGuard guard(builder);
-          builder.setInsertionPointToEnd(b.getInsertionBlock());
-
-          auto i = mlir::arith::IndexCastOp::create(
-              builder,
-              loc,
-              elementTy,
-              mlir::linalg::IndexOp::create(builder, loc, 0));
-
-          auto offset = mlir::arith::MulIOp::create(builder, loc, i, s);
-          auto result = mlir::arith::AddIOp::create(builder, loc, x, offset);
-
-          mlir::linalg::YieldOp::create(builder, loc, {result});
-        });
-
-    return op.getResult(0);
+    mlir::Value base = mlir::stablehlo::IotaOp::create(
+        builder, returnTy, builder.getI64IntegerAttr(0));
+    auto bx = mlir::stablehlo::BroadcastInDimOp::create(
+        builder, returnTy, x, mlir::SmallVector<int64_t>{});
+    auto bs = mlir::stablehlo::BroadcastInDimOp::create(
+        builder, returnTy, s, mlir::SmallVector<int64_t>{});
+    auto scaled = mlir::stablehlo::MulOp::create(builder, base, bs);
+    return mlir::stablehlo::AddOp::create(builder, scaled, bx);
   }
 
   // `arr[i, j]` reads a single element, but a slice among the indices makes the
   // result an array: `arr[i, a :+ n * s]` becomes a tensor.extract_slice whose
   // fixed dimensions are rank-reduced away.
+  // TODO(StableHLO rewrite): the general slice path below still emits
+  // tensor.extract_slice, which XLA rejects (tensor.* is banned). Not
+  // exercised by any currently-passing test (affine reads inside SegMap
+  // bodies take a separate fast path and never reach this function); needs a
+  // stablehlo.slice (static bounds) / stablehlo.dynamic_slice (dynamic start,
+  // static size) rewrite before anything that indexes with a slice can work.
   mlir::Value LowerIndex(const BasicOpIndex &index, Ctx &ctx) {
     auto tensor = LowerSubExp(index.vName.name, ctx);
 
@@ -1062,11 +1006,16 @@ struct FutharkCompiler {
       std::vector<mlir::Value> indices;
       for (const auto &dim : index.slice.dims) {
         auto i = LowerSubExp(std::get<DimFix<SubExp>>(dim.v).i, ctx);
+        auto bareI = mlir::tensor::ExtractOp::create(builder, i,
+                                                      mlir::ValueRange{});
         indices.push_back(mlir::arith::IndexCastOp::create(
-            builder, builder.getIndexType(), i));
+            builder, builder.getIndexType(), bareI));
       }
-      return mlir::tensor::ExtractOp::create(builder, tensor, indices)
-          .getResult();
+      auto elem = mlir::tensor::ExtractOp::create(builder, tensor, indices)
+                      .getResult();
+      // Scalars are 0-d tensors now.
+      return mlir::tensor::FromElementsOp::create(
+          builder, mlir::RankedTensorType::get({}, elem.getType()), elem);
     }
 
     // Constants stay attributes so that they remain visible in the shape of
@@ -1074,8 +1023,11 @@ struct FutharkCompiler {
     auto toIndex = [&](const SubExp &e) -> mlir::OpFoldResult {
       if (auto *c = std::get_if<ConstantSubExp>(&e.v))
         return builder.getIndexAttr(c->GetIntValue());
-      return mlir::OpFoldResult(mlir::arith::IndexCastOp::create(
-          builder, builder.getIndexType(), LowerSubExp(e, ctx)));
+      auto bare = mlir::tensor::ExtractOp::create(builder, LowerSubExp(e, ctx),
+                                                   mlir::ValueRange{});
+      return mlir::OpFoldResult(
+          mlir::arith::IndexCastOp::create(builder, builder.getIndexType(),
+                                           bare));
     };
 
     mlir::SmallVector<mlir::OpFoldResult> offsets, sizes, strides;
@@ -1118,12 +1070,10 @@ struct FutharkCompiler {
           return LowerBinOp(val.op, op0, op1, ctx);
         },
         [&](const BasicOpIota &val) -> mlir::Value {
-          mlir::Value n = mlir::arith::IndexCastOp::create(
-              builder, builder.getIndexType(), LowerSubExp(val.n, ctx));
           mlir::Value x = LowerSubExp(val.x, ctx);
           mlir::Value s = LowerSubExp(val.s, ctx);
-          auto elementTy = LowerTy(Type::CreatePrim(PrimType::Int(val.t)));
-          return createIota(n, x, s, elementTy, toShapeType(val.n));
+          auto elementTy = LowerPrimTypeInt(PrimTypeInt{val.t});
+          return createIota(x, s, elementTy, toShapeType(val.n));
         },
         [&](const BasicOpConcat &val) -> mlir::Value {
           std::vector<mlir::Value> operands;
@@ -1144,65 +1094,41 @@ struct FutharkCompiler {
           auto convOp = val.op;
           return match(
               convOp,
-              [&](const ConvOpZExt &zext) -> mlir::Value {
-                return mlir::arith::ExtUIOp::create(
-                    builder,
-                    LowerTy(Type::CreatePrim(PrimType::Int(zext.to))),
-                    op0);
+              // TODO: unverified against stablehlo.convert's exact
+              // int-widening semantics for signless integer types; flagged
+              // Undefined() rather than risk silently-wrong rounding/sign.
+              [](const ConvOpZExt &) -> mlir::Value {
+                Undefined("ConvOp: ZExt");
               },
-
               [&](const ConvOpSExt &sext) -> mlir::Value {
-                return mlir::arith::ExtSIOp::create(
+                return mlir::stablehlo::ConvertOp::create(
                     builder,
                     LowerTy(Type::CreatePrim(PrimType::Int(sext.to))),
                     op0);
               },
               [&](const ConvOpSIToFP &sitofp) -> mlir::Value {
-                return mlir::arith::SIToFPOp::create(
-                    builder, GetFloatType(builder, GetWidth(sitofp.to)), op0);
+                auto ty = mlir::RankedTensorType::get(
+                    {}, GetFloatType(builder, GetWidth(sitofp.to)));
+                return mlir::stablehlo::ConvertOp::create(builder, ty, op0);
               },
-              [](const auto &) -> mlir::Value { Undefined(); });
+              [](const auto &) -> mlir::Value { Undefined("convOp"); });
         },
         [&](const BasicOpReshape &val) -> mlir::Value {
           auto op0 = LowerSubExp(val.op0, ctx);
           auto sourceTy = getRankedType(op0.getType());
 
           // `remainder` is the whole shape the reshape produces; the splice
-          // fields only say which dimensions were rewritten to get there. A
-          // splice may either merge dimensions or split them, so the direction
-          // comes from comparing the two ranks.
+          // fields only say which dimensions were rewritten to get there.
           auto resultTy = mlir::RankedTensorType::get(
               toShapeType(val.remainder.dims), sourceTy.getElementType());
           if (sourceTy == resultTy)
             return op0;
-
-          auto reassociation =
-              mlir::getReassociationIndicesForReshape(sourceTy, resultTy);
-          if (reassociation) {
-            if (resultTy.getRank() < sourceTy.getRank())
-              return mlir::tensor::CollapseShapeOp::create(
-                  builder, resultTy, op0, *reassociation);
-            return mlir::tensor::ExpandShapeOp::create(
-                builder, resultTy, op0, *reassociation);
-          }
-
-          // No single collapse/expand expresses this reshape (e.g. a dynamic
-          // dim flattened to/from static dims). Fall back to tensor.reshape,
-          // which takes the target extents as a shape operand.
-          Values dims;
-          for (int64_t d : resultTy.getShape()) {
-            if (mlir::ShapedType::isDynamic(d))
-              Undefined();
-            dims.push_back(mlir::arith::ConstantOp::create(
-                               builder, builder.getI64IntegerAttr(d))
-                               .getResult());
-          }
-          auto shapeTy = mlir::RankedTensorType::get(
-              {static_cast<int64_t>(dims.size())}, builder.getI64Type());
-          auto shape = mlir::tensor::FromElementsOp::create(builder, shapeTy,
-                                                            dims);
-          return mlir::tensor::ReshapeOp::create(builder, resultTy, op0, shape)
-              .getResult();
+          if (!sourceTy.hasStaticShape() || !resultTy.hasStaticShape())
+            Undefined("reshape: dynamic shape");
+          // stablehlo.reshape is a flat reinterpretation for any two static
+          // shapes with the same element count -- no collapse/expand
+          // distinction needed, unlike tensor.{collapse,expand}_shape.
+          return mlir::stablehlo::ReshapeOp::create(builder, resultTy, op0);
         },
         [&](const BasicOpRearrange &val) -> mlir::Value {
           auto op = LowerSubExp(val.arr.name, ctx);
@@ -1212,63 +1138,39 @@ struct FutharkCompiler {
           if (val.perm.size() != tensorTy.getShape().size())
             Undefined();
 
-          // linalg.transpose puts input dimension perm[i] in result
-          // dimension i, which is a reversal only when perm is one.
+          // stablehlo.transpose puts input dimension perm[i] in result
+          // dimension i, matching linalg.transpose's convention.
           std::vector<int64_t> dims;
           for (int64_t p : val.perm)
             dims.push_back(tensorTy.getShape()[p]);
 
           auto transposedTy =
               mlir::RankedTensorType::get(dims, tensorTy.getElementType());
-          auto destination =
-              mlir::tensor::EmptyOp::create(builder, transposedTy, {});
-          auto transpose = mlir::linalg::TransposeOp::create(
-              builder, op, destination, val.perm);
-          mlir::Value result = *transpose.result_begin();
-          return result;
+          mlir::SmallVector<int64_t> perm(val.perm.begin(), val.perm.end());
+          return mlir::stablehlo::TransposeOp::create(builder, transposedTy,
+                                                       op, perm);
         },
         [&](const BasicOpReplicate &val) -> mlir::Value {
           auto op = LowerSubExp(val.val, ctx);
-          auto elementTy = op.getType();
-
+          // Scalars are 0-d tensors now, so `op` is always a RankedTensorType
+          // (0-d for a scalar replicate, N-d for an array replicate) -- one
+          // path handles both.
+          auto tensorTy = getRankedType(op.getType());
+          if (!tensorTy.hasStaticShape())
+            Undefined("replicate: dynamic element shape");
           std::vector<int64_t> before = toShapeType(val.shape.dims);
-          Values dynamicSizes;
-          for (auto [d, dimTy] : llvm::zip_equal(val.shape.dims, before))
-            if (mlir::ShapedType::isDynamic(dimTy))
-              dynamicSizes.push_back(mlir::arith::IndexCastOp::create(
-                  builder, builder.getIndexType(), LowerSubExp(d, ctx)));
-
-          std::vector<int64_t> original;
-          auto t = op.getType();
-          if (auto tensorTy = llvm::dyn_cast<mlir::RankedTensorType>(t)) {
-            auto dims = tensorTy.getShape();
-            for (auto [i, d] : llvm::enumerate(dims))
-              if (mlir::ShapedType::isDynamic(d))
-                dynamicSizes.push_back(
-                    mlir::tensor::DimOp::create(builder, op, i).getResult());
-            before.insert(before.end(), dims.begin(), dims.end());
-            original.insert(original.end(), dims.begin(), dims.end());
-            elementTy = tensorTy.getElementType();
-          }
-
-          else {
-            auto rankedType = mlir::RankedTensorType::get({}, elementTy);
-            op = mlir::tensor::FromElementsOp::create(builder, rankedType, op);
-          }
-
-          auto transposedTy = mlir::RankedTensorType::get(before, elementTy);
-          auto destination = mlir::tensor::EmptyOp::create(
-              builder, transposedTy, dynamicSizes);
-
-          std::vector<int64_t> addedDims;
-          for (int64_t i = 0; i < std::ssize(before) - std::ssize(original);
-               i++) {
-            addedDims.push_back(i);
-          }
-
-          auto broadcasted = mlir::linalg::BroadcastOp::create(
-              builder, op, destination, addedDims);
-          return *broadcasted.getResult().begin();
+          if (llvm::any_of(before, mlir::ShapedType::isDynamic))
+            Undefined("replicate: dynamic shape");
+          auto original = tensorTy.getShape();
+          before.insert(before.end(), original.begin(), original.end());
+          auto resultTy =
+              mlir::RankedTensorType::get(before, tensorTy.getElementType());
+          mlir::SmallVector<int64_t> broadcastDims;
+          int64_t rankDiff = (int64_t)before.size() - (int64_t)original.size();
+          for (int64_t i = 0; i < (int64_t)original.size(); ++i)
+            broadcastDims.push_back(rankDiff + i);
+          return mlir::stablehlo::BroadcastInDimOp::create(
+              builder, resultTy, op, broadcastDims);
         },
         [&](const BasicOpScratch &val) -> mlir::Value {
           auto baseTy = LowerPrimType(val.type);
@@ -1289,32 +1191,32 @@ struct FutharkCompiler {
         [&](const BasicOpCmpOp &val) -> mlir::Value {
           auto lhs = LowerSubExp(val.op0, ctx);
           auto rhs = LowerSubExp(val.op1, ctx);
-          auto cmpi = [&](mlir::arith::CmpIPredicate p) -> mlir::Value {
-            return mlir::arith::CmpIOp::create(builder, p, lhs, rhs);
+          using CD = mlir::stablehlo::ComparisonDirection;
+          using CT = mlir::stablehlo::ComparisonType;
+          auto cmp = [&](CD dir, CT ty) -> mlir::Value {
+            return mlir::stablehlo::CompareOp::create(builder, lhs, rhs, dir,
+                                                      ty);
           };
-          auto cmpf = [&](mlir::arith::CmpFPredicate p) -> mlir::Value {
-            return mlir::arith::CmpFOp::create(builder, p, lhs, rhs);
-          };
-          using enum mlir::arith::CmpIPredicate;
-          using enum mlir::arith::CmpFPredicate;
           return match(
               val.op,
               [&](const CmpOpEq &eqOp) -> mlir::Value {
                 return match(
                     eqOp.t,
-                    [&](const PrimTypeInt &) { return cmpi(eq); },
+                    [&](const PrimTypeInt &) {
+                      return cmp(CD::EQ, CT::SIGNED);
+                    },
                     [&](const PrimTypeFloat &) -> mlir::Value {
-                      return cmpf(OEQ);
+                      return cmp(CD::EQ, CT::FLOAT);
                     },
                     [&](const PrimTypeBool &) -> mlir::Value { Undefined(); },
                     [&](const PrimTypeUnit &) -> mlir::Value { Undefined(); });
               },
-              [&](const CmpOpUlt &) { return cmpi(ult); },
-              [&](const CmpOpUle &) { return cmpi(ule); },
-              [&](const CmpOpSlt &) { return cmpi(slt); },
-              [&](const CmpOpSle &) { return cmpi(sle); },
-              [&](const CmpOpFlt &) { return cmpf(OLT); },
-              [&](const CmpOpFle &) { return cmpf(OLE); },
+              [&](const CmpOpUlt &) { return cmp(CD::LT, CT::UNSIGNED); },
+              [&](const CmpOpUle &) { return cmp(CD::LE, CT::UNSIGNED); },
+              [&](const CmpOpSlt &) { return cmp(CD::LT, CT::SIGNED); },
+              [&](const CmpOpSle &) { return cmp(CD::LE, CT::SIGNED); },
+              [&](const CmpOpFlt &) { return cmp(CD::LT, CT::FLOAT); },
+              [&](const CmpOpFle &) { return cmp(CD::LE, CT::FLOAT); },
               [&](const CmpOpLLt &) -> mlir::Value { Undefined(); },
               [&](const CmpOpLLe &) -> mlir::Value { Undefined(); });
         },
@@ -1322,34 +1224,18 @@ struct FutharkCompiler {
         [](const BasicOpArrayVal &) -> mlir::Value { Undefined(); },
         [&](const BasicOpUnOp &val) -> mlir::Value {
           auto v = LowerSubExp(val.subExp, ctx);
-          auto ty = v.getType();
+          auto elemTy = getRankedType(v.getType()).getElementType();
           return match(
               val.op.v,
               [&](const UnOpNeg &) -> mlir::Value {
-                // Neg on bool is logical not (xor true); on ints it is 0 - x;
-                // on floats it is negation.
-                if (ty.isInteger(1)) {
-                  auto t = mlir::arith::ConstantOp::create(
-                      builder, builder.getBoolAttr(true));
-                  return mlir::arith::XOrIOp::create(builder,
-                                                     mlir::ValueRange{v, t})
-                      .getResult();
-                }
-                if (llvm::isa<mlir::IntegerType>(ty)) {
-                  auto zero = mlir::arith::ConstantOp::create(
-                      builder, builder.getIntegerAttr(ty, 0));
-                  return mlir::arith::SubIOp::create(builder,
-                                                     mlir::ValueRange{zero, v})
-                      .getResult();
-                }
-                return mlir::arith::NegFOp::create(builder, v).getResult();
+                // Neg on bool is logical not; stablehlo.negate covers both
+                // int (0 - x) and float negation uniformly.
+                if (elemTy.isInteger(1))
+                  return mlir::stablehlo::NotOp::create(builder, v);
+                return mlir::stablehlo::NegOp::create(builder, v);
               },
               [&](const UnOpComplement &) -> mlir::Value {
-                auto ones = mlir::arith::ConstantOp::create(
-                    builder, builder.getIntegerAttr(ty, -1));
-                return mlir::arith::XOrIOp::create(builder,
-                                                   mlir::ValueRange{v, ones})
-                    .getResult();
+                return mlir::stablehlo::NotOp::create(builder, v);
               },
               [](const UnOpAbs &) -> mlir::Value { Undefined(); },
               [](const UnOpFAbs &) -> mlir::Value { Undefined(); },
@@ -1430,90 +1316,136 @@ struct FutharkCompiler {
         pSegMap.lvl, pSegMap.space, pSegMap.body, pSegMap.ret, ctx);
   }
 
+  // Lowers a SegMap to a stablehlo.map. Operands are the kernel's affine
+  // reads plus one full-shape stablehlo.iota per iteration-space dimension;
+  // the region is then made isolated-from-above (stablehlo.map's region
+  // can't capture outer SSA values, per the StableHLO/XLA target model) by
+  // discovering every other outer value it ends up using, broadcasting it to
+  // the full shape, and appending it as an extra operand -- rather than
+  // hand-rolling a Futhark-AST free-variable walker, this reuses MLIR's own
+  // mlir::getUsedValuesDefinedAbove/replaceAllUsesInRegionWith on the
+  // already-lowered region.
   Values LowerSegMap(const SegLevel &lvl, const SegSpace &space,
                      const KernelBody &body, const std::vector<Type> &ret,
                      Ctx &ctx) {
-    // Block-level and in-block kernels describe a nested iteration space that
-    // a flat linalg.generic cannot express.
     RequireThreadLevel(lvl);
 
-    // This lowers a SegMap to a linalg.generic op, whose
-    //   * iteration space corresponds to the SegMap's SegSpace;
-    //   * inputs correspond to "affine reads" in the SegMap body.
-    // An affine read is an array load whose index expression is an affine
-    // function of the iteration space.
-
     IterationSpace iterSpace = LowerSegSpace(space, ctx);
+    auto shapeTy = toShapeType(std::views::values(space.dims));
+    if (llvm::any_of(shapeTy, mlir::ShapedType::isDynamic))
+      Undefined("SegMap: dynamic shape");
 
     std::vector<AffineRead> affine_reads =
         FindSegOpAffineReads(iterSpace, body);
 
-    Values inputs;
+    Values operands;
     for (auto &read : affine_reads)
-      inputs.push_back(ctx.subexps.lookup(read.array.name));
+      operands.push_back(ctx.subexps.lookup(read.array.name));
+    // stablehlo.iota's iota_dimension directly gives the dimension that
+    // varies, so each gtid's iota is already full-shape -- no separate
+    // broadcast needed.
+    for (auto &d : iterSpace) {
+      // d.value is the lowered Futhark size/index value, a 0-d tensor now
+      // (scalars are 0-d tensors) -- the iota needs its bare element type.
+      auto idxElemTy = getRankedType(d.value.getType()).getElementType();
+      auto iotaTy = mlir::RankedTensorType::get(shapeTy, idxElemTy);
+      operands.push_back(mlir::stablehlo::IotaOp::create(
+          builder, iotaTy, builder.getI64IntegerAttr(d.index)));
+    }
 
-    auto shapeTy = toShapeType(std::views::values(space.dims));
     mlir::SmallVector<mlir::Type> returnTypes;
     for (const Type &resultType : ret) {
-      if (auto *acc = GetAccType(resultType)) {
-        assert(acc->ispace.dims.size() == 1);
-        assert(acc->ts.size() == 1);
-        auto updateType = LowerSegOpBaseType(acc->ts[0], ctx);
-        returnTypes.push_back(mlir::RankedTensorType::get(shapeTy, updateType));
-        returnTypes.push_back(mlir::RankedTensorType::get(
-            shapeTy, builder.getI64Type()));
-      } else {
-        returnTypes.push_back(mlir::RankedTensorType::get(
-            shapeTy, LowerSegOpBaseType(resultType, ctx)));
+      if (GetAccType(resultType))
+        Undefined("SegMap: with_acc result");
+      returnTypes.push_back(mlir::RankedTensorType::get(
+          shapeTy, LowerSegOpBaseType(resultType, ctx)));
+    }
+
+    mlir::SmallVector<int64_t> allDims;
+    for (int64_t i = 0; i < (int64_t)shapeTy.size(); ++i)
+      allDims.push_back(i);
+
+    auto op = mlir::stablehlo::MapOp::create(builder, returnTypes, operands,
+                                             allDims);
+
+    mlir::SmallVector<mlir::Type> blockArgTypes;
+    for (mlir::Value v : operands)
+      blockArgTypes.push_back(mlir::RankedTensorType::get(
+          {}, getRankedType(v.getType()).getElementType()));
+    mlir::SmallVector<mlir::Location> locs(blockArgTypes.size(),
+                                           builder.getLoc());
+    {
+      // The guard must be constructed before createBlock, not after: it
+      // saves/restores the insertion point around its scope, and
+      // createBlock itself moves the insertion point into the new block as
+      // a side effect. Guarding only the body-lowering below would save
+      // "already inside blk" and restore right back to that same place,
+      // leaving the builder's insertion point stuck inside the region
+      // afterward instead of back in the enclosing function body.
+      mlir::OpBuilder::InsertionGuard guard(builder);
+      mlir::Block *blk =
+          builder.createBlock(&op.getRegion(), {}, blockArgTypes, locs);
+      builder.setInsertionPointToStart(blk);
+
+      Ctx local = ctx;
+      mlir::ValueRange blockArgs = blk->getArguments();
+      for (auto [read, arg] : llvm::zip_equal(
+               affine_reads, blockArgs.take_front(affine_reads.size())))
+        local.subexps.insert(read.result.name, arg);
+      for (auto [d, arg] : llvm::zip_equal(
+               iterSpace, blockArgs.drop_front(affine_reads.size())))
+        local.subexps.insert(d.id, arg);
+
+      std::unordered_set<std::string> skipLowering;
+      for (auto &read : affine_reads)
+        skipLowering.insert(read.result.name);
+      for (const Stm &stm : body.stms) {
+        assert(stm.pat.elems.size() == 1);
+        if (skipLowering.contains(stm.pat.elems[0].name.name))
+          continue;
+        LowerStm(stm, local);
       }
-    }
-    Values dynamicSizes;
-    for (const auto &d : iterSpace) {
-      if (d.isDynamic)
-        dynamicSizes.push_back(mlir::arith::IndexCastOp::create(
-            builder, builder.getIndexType(), d.value));
-    };
-    Values outputs;
-    for (auto &ty : returnTypes) {
-      outputs.push_back(
-          mlir::tensor::EmptyOp::create(builder, ty, dynamicSizes));
+      Values results;
+      for (auto [result, type] : llvm::zip_equal(body.result, ret)) {
+        if (IsAccType(type))
+          Undefined("SegMap: with_acc result");
+        results.push_back(LowerSubExp(result.result, local));
+      }
+      mlir::stablehlo::ReturnOp::create(builder, results);
     }
 
-    std::vector iterTypes(iterSpace.size(),
-                          mlir::utils::IteratorType::parallel);
+    // mlir::makeRegionIsolatedFromAbove needs an mlir::IRRewriter, whose base
+    // class mlir::RewriterBase has no typeinfo in the prebuilt MLIR libs
+    // (LLVM/MLIR defaults to -fno-rtti; this backend builds with -frtti),
+    // which fails at link time. Doing the same thing with the two plain free
+    // functions it's built from avoids needing a RewriterBase instance.
+    mlir::SetVector<mlir::Value> freeVars;
+    mlir::getUsedValuesDefinedAbove(op.getRegion(), freeVars);
 
-    // Map the iteration space to each input's dimensions.
-    mlir::SmallVector<mlir::AffineMap> indexingMaps;
-    for (const auto &read : affine_reads) {
-      indexingMaps.push_back(read.indexMap);
+    if (!freeVars.empty()) {
+      mlir::Block &entry = op.getRegion().front();
+      mlir::OpBuilder::InsertionGuard guard(builder);
+      builder.setInsertionPoint(op);
+      Values broadcasts;
+      for (mlir::Value fv : freeVars) {
+        auto fvTy = mlir::dyn_cast<mlir::RankedTensorType>(fv.getType());
+        if (!fvTy || fvTy.getRank() != 0)
+          Undefined("SegMap: non-scalar free variable");
+        auto broadcastTy =
+            mlir::RankedTensorType::get(shapeTy, fvTy.getElementType());
+        broadcasts.push_back(mlir::stablehlo::BroadcastInDimOp::create(
+            builder, broadcastTy, fv, mlir::SmallVector<int64_t>{}));
+        mlir::BlockArgument newArg =
+            entry.addArgument(fv.getType(), builder.getLoc());
+        mlir::replaceAllUsesInRegionWith(fv, newArg, op.getRegion());
+      }
+      op->insertOperands(op->getNumOperands(), broadcasts);
     }
 
-    // Map the iteration space to each output's dimensions.
-    auto rank = iterSpace.size();
-    indexingMaps.append(
-        outputs.size(),
-        mlir::AffineMap::getMultiDimIdentityMap(rank, &context));
-
-    auto op = mlir::linalg::GenericOp::create(
-        builder,
-        returnTypes,
-        inputs,
-        outputs,
-        indexingMaps,
-        iterTypes,
-        [&](mlir::OpBuilder &b, mlir::Location loc, mlir::ValueRange args) {
-          mlir::OpBuilder::InsertionGuard guard(builder);
-          builder.setInsertionPointToEnd(b.getInsertionBlock());
-
-          Ctx local = ctx;
-          Values results = LowerSegOpKernelBody(
-              loc, args, affine_reads, iterSpace, body, ret, local);
-
-          assert(results.size() == outputs.size());
-          mlir::linalg::YieldOp::create(builder, loc, results);
-        });
-
-    return op.getResults();
+    // MapOp has a single, non-variadic result, so (unlike GenericOp) it has
+    // no .getResults() convenience accessor -- Operation::getResults() works
+    // regardless.
+    return op->getResults();
   }
 
   // TODO Same limitations as SegMap, probably.
@@ -1556,15 +1488,24 @@ struct FutharkCompiler {
     for (const auto &d : iterSpace) {
       if (d.index == reductionIndex)
         continue;
-      if (d.isDynamic)
+      if (d.isDynamic) {
+        // d.value is a 0-d tensor now; unwrap before arith.index_cast.
+        auto bare = mlir::tensor::ExtractOp::create(builder, d.value,
+                                                    mlir::ValueRange{})
+                        .getResult();
         dynamicSizes.push_back(mlir::arith::IndexCastOp::create(
-            builder, builder.getIndexType(), d.value));
+            builder, builder.getIndexType(), bare));
+      }
     };
     Values outputs;
     for (auto [ty, ne] : llvm::zip_equal(returnTypes, neutral)) {
+      // linalg.fill wants a bare scalar fill value; `ne` is a 0-d tensor.
+      auto bareNe =
+          mlir::tensor::ExtractOp::create(builder, ne, mlir::ValueRange{})
+              .getResult();
       outputs.push_back(mlir::linalg::FillOp::create(
                             builder,
-                            ne,
+                            bareNe,
                             mlir::ValueRange{mlir::tensor::EmptyOp::create(
                                 builder, ty, dynamicSizes)})
                             .result());
@@ -1603,12 +1544,17 @@ struct FutharkCompiler {
           Values returns = LowerSegOpKernelBody(
               loc, args, affine_reads, iterSpace, pSegRed.body, pSegRed.ret, local);
 
-          // Bind accumulators and inputs to reduce op.
+          // Bind accumulators and inputs to reduce op. `accs` are bare
+          // scalars from the linalg.generic body; scalars are 0-d tensors
+          // everywhere else.
           auto accs = args.drop_front(inputs.size());
           assert(pSegBinOp.lambda.params.size() ==
                  accs.size() + returns.size());
           for (auto [param, acc] : llvm::zip(pSegBinOp.lambda.params, accs)) {
-            local.subexps.insert(param.name, acc);
+            auto ty = mlir::RankedTensorType::get({}, acc.getType());
+            local.subexps.insert(
+                param.name,
+                mlir::tensor::FromElementsOp::create(builder, ty, acc));
           }
           for (auto [param, ret] : llvm::zip_equal(
                    llvm::drop_begin(pSegBinOp.lambda.params, accs.size()),
@@ -1617,7 +1563,13 @@ struct FutharkCompiler {
           }
           auto results = LowerBody(pSegBinOp.lambda.body, local);
 
-          mlir::linalg::YieldOp::create(builder, loc, results);
+          // linalg.yield wants bare scalars matching the output tensors'
+          // element types; `results` are 0-d tensors.
+          Values bareResults;
+          for (auto r : results)
+            bareResults.push_back(
+                mlir::tensor::ExtractOp::create(builder, r, mlir::ValueRange{}));
+          mlir::linalg::YieldOp::create(builder, loc, bareResults);
         });
 
     return op.getResults();
@@ -1722,6 +1674,11 @@ struct FutharkCompiler {
         [](const auto &) -> mlir::Type { Undefined(); });
   };
 
+  // Only used by LowerSegRed now (LowerSegMap builds a stablehlo.map with its
+  // own tensor-native binding instead, since its block args are already 0-d
+  // tensors). `blockArgs` here are bare scalars from a linalg.generic body;
+  // scalars are 0-d tensors everywhere else, so each one is wrapped before
+  // entering the shared LowerStm/LowerBinOp pipeline.
   Values LowerSegOpKernelBody(mlir::Location loc,
                               const mlir::ValueRange blockArgs,
                               const std::vector<AffineRead> &affine_reads,
@@ -1729,22 +1686,29 @@ struct FutharkCompiler {
                               const KernelBody &body,
                               const std::vector<Type> &resultTypes,
                               Ctx &ctx) {
+    auto wrap = [&](mlir::Value bare) -> mlir::Value {
+      auto ty = mlir::RankedTensorType::get({}, bare.getType());
+      return mlir::tensor::FromElementsOp::create(builder, ty, bare);
+    };
+
     std::unordered_set<std::string> skipLowering;
     for (auto &read : affine_reads)
       skipLowering.insert(read.result.name);
 
     // Lower the kernel's affine reads by binding them to the inputs.
     for (auto [read, arg] : llvm::zip_equal(affine_reads, blockArgs)) {
-      ctx.subexps.insert(read.result.name, arg);
+      ctx.subexps.insert(read.result.name, wrap(arg));
     }
     // Lower the kernel's gtids by binding them to the iteration indices.
     // TODO only do this if they're actually used
     for (auto d : iterSpace) {
       auto idx = mlir::linalg::IndexOp::create(builder, loc, d.index);
-      auto futharkIndexTy = d.value.getType();
+      // d.value is a 0-d tensor now (scalars are 0-d tensors); arith.index_cast
+      // needs the bare element type.
+      auto futharkIndexTy = getRankedType(d.value.getType()).getElementType();
       auto val =
           mlir::arith::IndexCastOp::create(builder, loc, futharkIndexTy, idx);
-      ctx.subexps.insert(d.id, val);
+      ctx.subexps.insert(d.id, wrap(val));
     }
     // Lower the kernel body, skipping the affine reads.
     for (const Stm &stm : body.stms) {
@@ -1767,8 +1731,13 @@ struct FutharkCompiler {
     return returns;
   }
 
+  // Scalars are 0-d tensors now; getPrimValueAttr stays a bare scalar attr
+  // (also reused by LowerArrayLit to build a full-array DenseElementsAttr).
   mlir::Value LowerPrimValue(PrimValue value, Ctx &ctx) {
-    return mlir::arith::ConstantOp::create(builder, getPrimValueAttr(value));
+    mlir::TypedAttr scalarAttr = getPrimValueAttr(value);
+    auto ty = mlir::RankedTensorType::get({}, scalarAttr.getType());
+    return mlir::stablehlo::ConstantOp::create(
+        builder, mlir::DenseElementsAttr::get(ty, scalarAttr));
   }
 
   mlir::TypedAttr getPrimValueAttr(PrimValue value) {
@@ -1788,174 +1757,65 @@ struct FutharkCompiler {
         [&](const UnitValue &) -> mlir::TypedAttr { Undefined(); });
   }
 
+  // Every operand is a tensor now (0-d for a scalar, N-d for a whole-array
+  // op), so stablehlo's elementwise ops handle both uniformly -- no more
+  // separate scalar (arith) vs. tensor (linalg) code paths.
   mlir::Value LowerBinOp(BinOp binOp, mlir::Value op0, mlir::Value op1,
                          Ctx &ctx) {
-    auto isTensor = llvm::isa<mlir::TensorType>(op0.getType());
-    if (auto *add = std::get_if<BinOpAdd>(&binOp.v)) {
+    namespace hlo = mlir::stablehlo;
+    if (std::get_if<BinOpAdd>(&binOp.v) || std::get_if<BinOpFAdd>(&binOp.v))
+      return hlo::AddOp::create(builder, op0, op1);
+    if (std::get_if<BinOpMul>(&binOp.v) || std::get_if<BinOpFMul>(&binOp.v))
+      return hlo::MulOp::create(builder, op0, op1);
+    if (std::get_if<BinOpSub>(&binOp.v) || std::get_if<BinOpFSub>(&binOp.v))
+      return hlo::SubtractOp::create(builder, op0, op1);
 
-      if (isTensor) {
-        auto emptyTensor = mlir::tensor::EmptyOp::create(
-            builder, op0.getType(), mlir::ValueRange{});
-        return mlir::linalg::AddOp::create(builder, {op0, op1}, {emptyTensor})
-            .getResult(0);
-      }
+    // Futhark's `squot` truncates towards zero, matching stablehlo.divide's
+    // (and C's) integer division. `sdiv`/`sdiv_up` round toward -inf/+inf;
+    // `udiv`/`udiv_up` are the unsigned equivalents -- no direct StableHLO
+    // op, flagged rather than risking wrong rounding.
+    if (std::get_if<BinOpSQuot>(&binOp.v) || std::get_if<BinOpFDiv>(&binOp.v))
+      return hlo::DivOp::create(builder, op0, op1);
+    if (std::get_if<BinOpSDivUp>(&binOp.v) || std::get_if<BinOpSDiv>(&binOp.v) ||
+        std::get_if<BinOpUDiv>(&binOp.v) || std::get_if<BinOpUDivUp>(&binOp.v))
+      Undefined("binop: rounding div");
 
-      return mlir::arith::AddIOp::create(builder, {op0, op1}).getResult();
-    }
-
-    if (auto *mul = std::get_if<BinOpMul>(&binOp.v)) {
-
-      if (isTensor) {
-        auto emptyTensor = mlir::tensor::EmptyOp::create(
-            builder, op0.getType(), mlir::ValueRange{});
-        return mlir::linalg::MulOp::create(builder, {op0, op1}, {emptyTensor})
-            .getResult(0);
-      }
-
-      return mlir::arith::MulIOp::create(builder, {op0, op1}).getResult();
-    }
-
-    if (std::get_if<BinOpSub>(&binOp.v)) {
-      assert(!isTensor);
-
-      return mlir::arith::SubIOp::create(builder, {op0, op1}).getResult();
-    }
-
-    // Futhark's `squot` truncates towards zero, which is what arith.divsi
-    // does; `sdiv`, which rounds towards negative infinity, is a different op.
-    if (std::get_if<BinOpSQuot>(&binOp.v)) {
-      assert(!isTensor);
-
-      return mlir::arith::DivSIOp::create(builder, {op0, op1}).getResult();
-    }
-
-    if (auto *div = std::get_if<BinOpSDivUp>(&binOp.v)) {
-      assert(!isTensor);
-
-      return mlir::arith::CeilDivSIOp::create(builder, {op0, op1}).getResult();
-    }
-
-    // Integer division/remainder. `sdiv` rounds toward negative infinity
-    // (floordivsi); `srem`/`smod` are truncated/floored remainder -- for the
-    // non-negative sizes and indices in this IR they coincide.
-    if (std::get_if<BinOpSDiv>(&binOp.v)) {
-      assert(!isTensor);
-      return mlir::arith::FloorDivSIOp::create(builder, {op0, op1}).getResult();
-    }
-    if (std::get_if<BinOpSRem>(&binOp.v)) {
-      assert(!isTensor);
-      return mlir::arith::RemSIOp::create(builder, {op0, op1}).getResult();
-    }
-    if (std::get_if<BinOpSMod>(&binOp.v)) {
-      assert(!isTensor);
-      return mlir::arith::RemSIOp::create(builder, {op0, op1}).getResult();
-    }
-    if (std::get_if<BinOpUDiv>(&binOp.v)) {
-      assert(!isTensor);
-      return mlir::arith::DivUIOp::create(builder, {op0, op1}).getResult();
-    }
-    if (std::get_if<BinOpUDivUp>(&binOp.v)) {
-      assert(!isTensor);
-      return mlir::arith::CeilDivUIOp::create(builder, {op0, op1}).getResult();
-    }
-    if (std::get_if<BinOpUMod>(&binOp.v)) {
-      assert(!isTensor);
-      return mlir::arith::RemUIOp::create(builder, {op0, op1}).getResult();
-    }
+    // `srem`/`smod` are truncated/floored remainder -- for the non-negative
+    // sizes and indices in this IR they coincide with stablehlo.remainder.
+    if (std::get_if<BinOpSRem>(&binOp.v) || std::get_if<BinOpSMod>(&binOp.v) ||
+        std::get_if<BinOpFMod>(&binOp.v))
+      return hlo::RemOp::create(builder, op0, op1);
+    if (std::get_if<BinOpUMod>(&binOp.v))
+      Undefined("binop: umod");
 
     // Bitwise / logical.
-    if (std::get_if<BinOpAnd>(&binOp.v) || std::get_if<BinOpLogAnd>(&binOp.v)) {
-      assert(!isTensor);
-      return mlir::arith::AndIOp::create(builder, {op0, op1}).getResult();
-    }
-    if (std::get_if<BinOpOr>(&binOp.v) || std::get_if<BinOpLogOr>(&binOp.v)) {
-      assert(!isTensor);
-      return mlir::arith::OrIOp::create(builder, {op0, op1}).getResult();
-    }
-    if (std::get_if<BinOpXor>(&binOp.v)) {
-      assert(!isTensor);
-      return mlir::arith::XOrIOp::create(builder, {op0, op1}).getResult();
-    }
-    if (std::get_if<BinOpShl>(&binOp.v)) {
-      assert(!isTensor);
-      return mlir::arith::ShLIOp::create(builder, {op0, op1}).getResult();
-    }
-    if (std::get_if<BinOpLShr>(&binOp.v)) {
-      assert(!isTensor);
-      return mlir::arith::ShRUIOp::create(builder, {op0, op1}).getResult();
-    }
-    if (std::get_if<BinOpAShr>(&binOp.v)) {
-      assert(!isTensor);
-      return mlir::arith::ShRSIOp::create(builder, {op0, op1}).getResult();
-    }
+    if (std::get_if<BinOpAnd>(&binOp.v) || std::get_if<BinOpLogAnd>(&binOp.v))
+      return hlo::AndOp::create(builder, op0, op1);
+    if (std::get_if<BinOpOr>(&binOp.v) || std::get_if<BinOpLogOr>(&binOp.v))
+      return hlo::OrOp::create(builder, op0, op1);
+    if (std::get_if<BinOpXor>(&binOp.v))
+      return hlo::XorOp::create(builder, op0, op1);
+    if (std::get_if<BinOpShl>(&binOp.v))
+      return hlo::ShiftLeftOp::create(builder, op0, op1);
+    if (std::get_if<BinOpLShr>(&binOp.v))
+      return hlo::ShiftRightLogicalOp::create(builder, op0, op1);
+    if (std::get_if<BinOpAShr>(&binOp.v))
+      return hlo::ShiftRightArithmeticOp::create(builder, op0, op1);
 
-    // Integer min/max.
-    if (std::get_if<BinOpSMin>(&binOp.v)) {
-      assert(!isTensor);
-      return mlir::arith::MinSIOp::create(builder, {op0, op1}).getResult();
-    }
-    if (std::get_if<BinOpSMax>(&binOp.v)) {
-      assert(!isTensor);
-      return mlir::arith::MaxSIOp::create(builder, {op0, op1}).getResult();
-    }
-    if (std::get_if<BinOpUMin>(&binOp.v)) {
-      assert(!isTensor);
-      return mlir::arith::MinUIOp::create(builder, {op0, op1}).getResult();
-    }
-    if (std::get_if<BinOpUMax>(&binOp.v)) {
-      assert(!isTensor);
-      return mlir::arith::MaxUIOp::create(builder, {op0, op1}).getResult();
-    }
+    // Min/max. stablehlo.minimum/maximum have no signedness attribute (unlike
+    // compare), so unsigned min/max isn't representable without a separate
+    // compare+select -- flagged rather than guessed.
+    if (std::get_if<BinOpSMin>(&binOp.v) || std::get_if<BinOpFMin>(&binOp.v))
+      return hlo::MinOp::create(builder, op0, op1);
+    if (std::get_if<BinOpSMax>(&binOp.v) || std::get_if<BinOpFMax>(&binOp.v))
+      return hlo::MaxOp::create(builder, op0, op1);
+    if (std::get_if<BinOpUMin>(&binOp.v) || std::get_if<BinOpUMax>(&binOp.v))
+      Undefined("binop: unsigned min/max");
 
-    // Float min / modulo.
-    if (std::get_if<BinOpFMin>(&binOp.v)) {
-      assert(!isTensor);
-      return mlir::arith::MinNumFOp::create(builder, {op0, op1}).getResult();
-    }
-    if (std::get_if<BinOpFMod>(&binOp.v)) {
-      assert(!isTensor);
-      return mlir::arith::RemFOp::create(builder, {op0, op1}).getResult();
-    }
+    if (std::get_if<BinOpFPow>(&binOp.v))
+      return hlo::PowOp::create(builder, op0, op1);
 
-    if (auto *fadd = std::get_if<BinOpFAdd>(&binOp.v)) {
-      assert(!isTensor);
-
-      return mlir::arith::AddFOp::create(builder, {op0, op1}).getResult();
-    }
-
-    if (auto *fmul = std::get_if<BinOpFMul>(&binOp.v)) {
-      assert(!isTensor);
-
-      return mlir::arith::MulFOp::create(builder, {op0, op1}).getResult();
-    }
-
-    if (auto *fsub = std::get_if<BinOpFSub>(&binOp.v)) {
-      assert(!isTensor);
-
-      return mlir::arith::SubFOp::create(builder, {op0, op1}).getResult();
-    }
-
-    if (auto *fdiv = std::get_if<BinOpFDiv>(&binOp.v)) {
-      assert(!isTensor);
-
-      return mlir::arith::DivFOp::create(builder, {op0, op1}).getResult();
-    }
-
-    // Futhark's `fmax` follows libm in returning the non-NaN operand, which is
-    // arith.maxnumf rather than arith.maximumf.
-    if (auto *fmax = std::get_if<BinOpFMax>(&binOp.v)) {
-      assert(!isTensor);
-
-      return mlir::arith::MaxNumFOp::create(builder, {op0, op1}).getResult();
-    }
-
-    if (auto *fpow = std::get_if<BinOpFPow>(&binOp.v)) {
-      assert(!isTensor);
-
-      return mlir::math::PowFOp::create(builder, op0, op1).getResult();
-    }
-
-    Undefined();
+    Undefined("binop");
   }
 
   mlir::Value LowerArrayLit(BasicOpArrayLit arrayLit, Ctx &ctx) {
@@ -1972,10 +1832,13 @@ struct FutharkCompiler {
     }
 
     if (allConstants) {
-      return mlir::arith::ConstantOp::create(
+      return mlir::stablehlo::ConstantOp::create(
           builder,
           mlir::DenseElementsAttr::get(getRankedType(tensorTy), attrs));
     } else {
+      // TODO(StableHLO rewrite): tensor.from_elements is banned by XLA; a
+      // non-constant array literal needs concatenate of reshaped (0-d -> 1-d)
+      // elements instead. Not exercised by any currently-passing test.
       auto values = mlir::SmallVector<mlir::Value>();
       for (auto subExp : arrayLit.values) {
         values.push_back(LowerSubExp(subExp, ctx));
@@ -2019,13 +1882,19 @@ struct FutharkCompiler {
     return name.substr(0, end);
   }
 
+  // TODO: unverified -- no currently-passing test exercises any intrinsic
+  // (gelu.fut, the one test that would, hits the dynamic-shape Undefined()
+  // gate first). Mapped from the actual stablehlo/chlo op inventory (checked
+  // against the pinned stablehlo revision's StablehloOps.td/ChloOps.td), not
+  // guessed, but not yet run.
   Values LowerIntrinsic(const std::string &fname, mlir::ValueRange args) {
     // `cond_t` is Futhark's branchless select; its suffix is a full type name
     // ("cond_i64", "cond_bool"), not the width suffix IntrinsicBaseName knows.
     if (fname.starts_with("cond_")) {
       if (args.size() != 3)
         Undefined();
-      return {mlir::arith::SelectOp::create(builder, args[0], args[1], args[2])
+      return {mlir::stablehlo::SelectOp::create(builder, args[0], args[1],
+                                                args[2])
                   .getResult()};
     }
 
@@ -2045,85 +1914,76 @@ struct FutharkCompiler {
       return {Op::create(builder, args[0], args[1]).getResult()};
     };
 
-    using namespace mlir::math;
     const auto &n = *base;
-    if (n == "sqrt")
-      return unary.operator()<SqrtOp>();
-    if (n == "rsqrt")
-      return unary.operator()<RsqrtOp>();
-    if (n == "cbrt")
-      return unary.operator()<CbrtOp>();
-    if (n == "exp")
-      return unary.operator()<ExpOp>();
-    if (n == "exp2")
-      return unary.operator()<Exp2Op>();
-    if (n == "expm1")
-      return unary.operator()<ExpM1Op>();
-    if (n == "log")
-      return unary.operator()<LogOp>();
-    if (n == "log2")
-      return unary.operator()<Log2Op>();
-    if (n == "log10")
-      return unary.operator()<Log10Op>();
-    if (n == "log1p")
-      return unary.operator()<Log1pOp>();
-    if (n == "sin")
-      return unary.operator()<SinOp>();
-    if (n == "cos")
-      return unary.operator()<CosOp>();
-    if (n == "tan")
-      return unary.operator()<TanOp>();
-    if (n == "asin")
-      return unary.operator()<AsinOp>();
-    if (n == "acos")
-      return unary.operator()<AcosOp>();
-    if (n == "atan")
-      return unary.operator()<AtanOp>();
-    if (n == "sinh")
-      return unary.operator()<SinhOp>();
-    if (n == "cosh")
-      return unary.operator()<CoshOp>();
-    if (n == "tanh")
-      return unary.operator()<TanhOp>();
-    if (n == "asinh")
-      return unary.operator()<AsinhOp>();
-    if (n == "acosh")
-      return unary.operator()<AcoshOp>();
-    if (n == "atanh")
-      return unary.operator()<AtanhOp>();
-    if (n == "erf")
-      return unary.operator()<ErfOp>();
-    if (n == "erfc")
-      return unary.operator()<ErfcOp>();
-    if (n == "ceil")
-      return unary.operator()<CeilOp>();
-    if (n == "floor")
-      return unary.operator()<FloorOp>();
-    if (n == "trunc")
-      return unary.operator()<TruncOp>();
-    // Futhark's `round` is C's `rint` under the default rounding mode, i.e.
-    // ties go to even.
-    if (n == "round")
-      return unary.operator()<RoundEvenOp>();
-    if (n == "isnan")
-      return unary.operator()<IsNaNOp>();
-    if (n == "isinf")
-      return unary.operator()<IsInfOp>();
-    if (n == "popc")
-      return unary.operator()<CtPopOp>();
-    if (n == "clz")
-      return unary.operator()<CountLeadingZerosOp>();
-    if (n == "ctz")
-      return unary.operator()<CountTrailingZerosOp>();
-    if (n == "atan2")
-      return binary.operator()<Atan2Op>();
-    if (n == "copysign")
-      return binary.operator()<CopySignOp>();
-    if (n == "fma" || n == "mad") {
-      if (args.size() != 3)
-        Undefined();
-      return {FmaOp::create(builder, args[0], args[1], args[2]).getResult()};
+    {
+      using namespace mlir::stablehlo;
+      if (n == "sqrt")
+        return unary.operator()<SqrtOp>();
+      if (n == "rsqrt")
+        return unary.operator()<RsqrtOp>();
+      if (n == "cbrt")
+        return unary.operator()<CbrtOp>();
+      if (n == "exp")
+        return unary.operator()<ExpOp>();
+      if (n == "expm1")
+        return unary.operator()<Expm1Op>();
+      if (n == "log")
+        return unary.operator()<LogOp>();
+      if (n == "log1p")
+        return unary.operator()<Log1pOp>();
+      if (n == "sin")
+        return unary.operator()<SineOp>();
+      if (n == "cos")
+        return unary.operator()<CosineOp>();
+      if (n == "tan")
+        return unary.operator()<TanOp>();
+      if (n == "tanh")
+        return unary.operator()<TanhOp>();
+      if (n == "ceil")
+        return unary.operator()<CeilOp>();
+      if (n == "floor")
+        return unary.operator()<FloorOp>();
+      // Futhark's `round` is C's `rint` under the default rounding mode,
+      // i.e. ties go to even.
+      if (n == "round")
+        return unary.operator()<RoundNearestEvenOp>();
+      if (n == "popc")
+        return unary.operator()<PopulationCountOp>();
+      if (n == "clz")
+        return unary.operator()<ClzOp>();
+      if (n == "atan2")
+        return binary.operator()<Atan2Op>();
     }
+    {
+      using namespace mlir::chlo;
+      if (n == "asin")
+        return unary.operator()<AsinOp>();
+      if (n == "acos")
+        return unary.operator()<AcosOp>();
+      if (n == "atan")
+        return unary.operator()<AtanOp>();
+      if (n == "sinh")
+        return unary.operator()<SinhOp>();
+      if (n == "cosh")
+        return unary.operator()<CoshOp>();
+      if (n == "asinh")
+        return unary.operator()<AsinhOp>();
+      if (n == "acosh")
+        return unary.operator()<AcoshOp>();
+      if (n == "atanh")
+        return unary.operator()<AtanhOp>();
+      if (n == "erf")
+        return unary.operator()<ErfOp>();
+      if (n == "erfc")
+        return unary.operator()<ErfcOp>();
+      if (n == "isinf")
+        return unary.operator()<IsInfOp>();
+    }
+    // No StableHLO/CHLO equivalent found.
+    if (n == "exp2" || n == "log2" || n == "log10" || n == "trunc" ||
+        n == "isnan" || n == "ctz" || n == "copysign" || n == "fma" ||
+        n == "mad")
+      Undefined(std::format("intrinsic: {}", n));
 
     throw std::runtime_error(std::format(
         "'{}' is neither defined in the IR nor a primitive function we lower",
@@ -2145,7 +2005,10 @@ struct FutharkCompiler {
   mlir::Type LowerTy(Type t) {
     auto baseTy = &t.t.v;
     if (auto *val = std::get_if<TypePrim<Shape, NoUniqueness>>(baseTy)) {
-      return LowerPrimType(val->t);
+      // Scalars are 0-d tensors (a hard XLA requirement), unlike an array's
+      // own element type (see LowerTypeArray, which calls LowerPrimType
+      // directly to get the bare element type instead).
+      return mlir::RankedTensorType::get({}, LowerPrimType(val->t));
     }
 
     if (auto *val = std::get_if<TypeArray<Shape, NoUniqueness>>(baseTy)) {

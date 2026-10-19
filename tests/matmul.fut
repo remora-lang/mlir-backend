@@ -11,4 +11,4 @@ def matmul_f32 [n][k][m] (x: [n][k]f32) (y: [k][m]f32): [n][m]f32 =
 -- output {
 --   [[22f32, 28f32], [49f32, 64f32]]
 -- }
-def main x y = matmul_f32 x y
+def main (x: [2][3]f32) (y: [3][2]f32) : [2][2]f32 = matmul_f32 x y

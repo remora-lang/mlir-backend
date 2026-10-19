@@ -243,3 +243,4 @@ third-party/stablehlo-src
 third-party/mlir-src
 
 build.log
+tests.log

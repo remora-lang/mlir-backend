@@ -23,6 +23,7 @@ set(LIBS
   MLIRSupport
   MLIRTensorDialect
   MLIRVectorDialect
+  MLIRTransformUtils
 
   StablehloOps
   ChloOps

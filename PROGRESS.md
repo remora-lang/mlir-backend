@@ -216,19 +216,238 @@ useful to confirm the harness itself runs end-to-end without crashing.
    `scf`/`index`/`vector` registered since segmap/segred/matmul/if still use
    them).
 
-## Phase 1 — segmap (not started)
+## Phase 1 — segmap (done, unbuilt/unverified)
 
-Load-bearing: builds the scalar-op library (decision 1) and a new
-`FindSegOpFreeVars` helper (`stablehlo.map`'s region is isolated-from-above,
-unlike today's `linalg.generic` — free variables must be `broadcast_in_dim`'d
-to full shape and passed as extra operands; thread indices become
-`stablehlo.iota` operands). Also folds in: entry→`@main` rename + multi-entry
-hard error + drop `futhark.size_args`; while/for loop →
-`Undefined("loop")` (delete the `scf.for` machinery outright — brief wants
-all loops undefined); new standalone `tests/loop_undefined.fut` and
-`tests/if_basic.fut`-style coverage gaps noted in later phases.
-Tests: `map.fut`, `map2-5.fut`, `iota.fut`, `gelu.fut`; `map_dynamic.fut`/
-`iota_dynamic.fut` expected to cleanly `Undefined()` (dynamic sizes).
+**Important correction to the original plan, found by actually reading the
+test files (not just the secondhand research summary)**: of the originally
+assumed "Phase 1 passing set" (map.fut, map2-5.fut, iota.fut, gelu.fut), only
+**`map.fut` and `iota.fut` are genuinely static**. `map2/4/5.fut` use
+`iota n` where `n` is a runtime parameter (dynamic size), `map3.fut`/
+`gelu.fut` take array parameters with no literal size (also dynamic in
+Futhark's GPU IR — any array parameter without a literal size gets an
+implicit runtime size variable). XLA requires fully static shapes
+end-to-end, and dynamic paths are `Undefined()` per the brief — so these
+will **also** hit `Undefined()`, same as `map_dynamic.fut`/`iota_dynamic.fut`,
+just not named "_dynamic". This is expected per the brief's own carve-out,
+not a bug — but it means almost every test with a non-literal-sized array
+parameter is currently out of reach until something (a later phase, not yet
+planned) lets the backend specialize for a concrete size at compile time.
+Added an explicit, named gate for this in `LowerFunction` (see below) so it
+fails loud and early rather than relying on it to surface accidentally deep
+inside some construct's lowering.
+
+### What changed in `compiler.hpp`
+- **`LowerFunction`**: added an explicit static-shape check (`Undefined(
+  "dynamic-shaped function parameter/result")`) right after computing
+  `inputTypes`/`retTypes`, for every function (not just entry) — the
+  deliberate, early, named gate described above. Entry function renamed to
+  `@main` regardless of Futhark source name; >1 entry point is a hard
+  `throw` (ambiguous, not untranslatable, so not `Undefined()`). Dropped the
+  whole `futhark.size_args` attribute block.
+- **`LowerTy`**: wraps the `TypePrim` branch in a 0-d `RankedTensorType`
+  (scalars are 0-d tensors). `LowerPrimType`/`LowerPrimTypeInt/Float/Bool`
+  themselves are **unchanged** (still return bare types) — they're also used
+  as array *element* types via `LowerTypeArray`/`LowerSegOpBaseType`, which
+  must stay bare. Only `LowerTy`'s own scalar branch wraps.
+- **`castToType`**: simplified to `stablehlo.reshape`-or-`Undefined()`; the
+  old bare-scalar-extraction branch is gone (there's no bare-scalar
+  destination type left anywhere).
+- **Scalar op library**, all rewritten to stablehlo/chlo, operating
+  uniformly on tensors (0-d or N-d) instead of split arith-scalar/
+  linalg-tensor paths: `LowerPrimValue`/`getPrimValueAttr` (stablehlo.constant
+  on a 0-d tensor; `getPrimValueAttr` itself stays a bare scalar attr, also
+  reused by `LowerArrayLit`), `LowerBinOp` (full rewrite — `UDiv`/`UDivUp`/
+  `SDiv`/`SDivUp`/`UMod`/unsigned min/max flagged `Undefined()` rather than
+  guessed), `BasicOpCmpOp` (→ `stablehlo.compare`), `BasicOpUnOp` (→
+  `stablehlo.negate`/`not`), `BasicOpConvOp` (ZExt flagged `Undefined()`,
+  SExt/SIToFP → `stablehlo.convert`), `LowerIntrinsic` (mapped against the
+  actual stablehlo/chlo op inventory checked at the pinned revision — sqrt,
+  exp, log, trig, tanh, ceil/floor/round, popcount/clz, atan2 from core;
+  asin/acos/atan/sinh/cosh/*h/erf/erfc/isinf from chlo; exp2/log2/log10/trunc/
+  isnan/ctz/copysign/fma flagged `Undefined()`, no equivalent found).
+  **None of this is exercised by a currently-passing test** (gelu.fut, the
+  one that would, hits the dynamic-shape gate first) — unverified, flagged
+  in-code.
+- **Banned-dialect cleanups** found while auditing every `BasicOp` variant
+  for the scalar-type ripple (not originally scoped for Phase 1, but left
+  unfixed they'd silently emit `tensor.*`/`linalg.*` for any test that hit
+  them): `BasicOpReshape` → `stablehlo.reshape` (collapses the old collapse/
+  expand/fallback-shape-tensor code into one case), `BasicOpRearrange` →
+  `stablehlo.transpose`, `BasicOpReplicate` → `stablehlo.broadcast_in_dim`
+  (also simplified: scalars being 0-d tensors means the old "is it a bare
+  scalar or a tensor" branch collapses into one path). `BasicOpIndex`/
+  `LowerIndex`'s single-element fast path now wraps its result in a 0-d
+  tensor instead of returning bare; **the general slice path still emits
+  `tensor.extract_slice`** (flagged TODO — needs `stablehlo.slice`/
+  `dynamic_slice`, not exercised by any passing test, since affine reads
+  inside SegMap bodies take a separate fast path that never reaches it).
+  `createIota` (backing `BasicOpIota` — exercised by `iota.fut`) rewritten
+  to `stablehlo.iota`+`broadcast_in_dim`+`multiply`+`add`, dynamic-length
+  `Undefined()`. `BasicOpConcat`/`BasicOpScratch`/`LowerArrayLit`'s
+  non-constant branch **still emit tensor.* ops** — left as-is, flagged,
+  not reachable by `map.fut`/`iota.fut`.
+- **`LowerSegMap`** (the actual load-bearing Phase 1 piece): rewritten to
+  `stablehlo.map`. Operands = affine-read arrays + one full-shape
+  `stablehlo.iota` per iteration-space dimension. The region is lowered
+  first using the ordinary `ctx`-copy (so it can reference outer SSA values
+  freely, same as today), **then** made isolated-from-above by calling
+  MLIR's own `mlir::makeRegionIsolatedFromAbove` on the finished region —
+  this is a real, built-in MLIR utility (`mlir/Transforms/RegionUtils.h`,
+  confirmed at the pinned LLVM revision) that finds every outer-defined SSA
+  value a region uses, appends a matching block argument, and rewires
+  internal uses — avoiding a hand-written Futhark-AST free-variable walker
+  entirely. Each discovered free variable is then `broadcast_in_dim`'d to
+  the full shape and appended as a real operand (`Operation::insertOperands`
+  — `stablehlo.map`'s `inputs` is one simple variadic group, no segment-size
+  bookkeeping needed). Non-scalar free variables and dynamic shapes are
+  `Undefined()`. New includes: `mlir/IR/PatternMatch.h` (for `IRRewriter`),
+  `mlir/Transforms/RegionUtils.h`; new CMake lib `MLIRTransformUtils` (was
+  already linked transitively, now explicit).
+- **`LowerSegOpKernelBody`**: now only called by `LowerSegRed` (the new
+  `LowerSegMap` has its own tensor-native binding instead, since its block
+  args are already 0-d tensors). Fixed to wrap its bare-scalar
+  `linalg.generic` block args and gtid values into 0-d tensors before
+  binding, since the shared `LowerStm`/`LowerBinOp` pipeline they feed now
+  uniformly expects tensors.
+- **`LowerSegRed`** (unchanged structure — still `linalg.generic`, its real
+  `stablehlo.reduce` rewrite is Phase 2): three small adaptations so it
+  still compiles/works under the new global scalar convention: unwrap
+  `neutral` before `linalg.fill` (needs a bare scalar), wrap `acc` block
+  args before binding into the combining lambda's scope, unwrap the
+  lambda's `results` before `linalg.yield`.
+- **`ExpIf`**: unwraps its now-0-d-tensor condition back to a bare `i1`
+  before `scf.if` (structure otherwise unchanged — the real `stablehlo.if`
+  rewrite is Phase 4).
+- **`LowerLoop`**: reduced to one line, `Undefined("loop")` — the entire
+  `scf.for` construction deleted outright (brief: all loops, for and while,
+  are `Undefined()`, not just while).
+- **`getConstantInt`**: now also matches a single-element
+  `DenseIntElementsAttr` (a 0-d-tensor constant), not just a bare
+  `arith.constant` int, since blackbox "scalar size parameter" arguments
+  (e.g. `LowerRaggedDot`'s ragged-dim index) are 0-d tensors now too.
+  `LowerArgSort`'s `createIota` call site updated to pass `stablehlo.constant`
+  0-d tensors instead of bare `arith.constant`s.
+- **Dialect registration deliberately left unchanged** (still registers
+  `linalg`/`tensor`/`scf`/`index`/`vector`/`math`) — contrary to the
+  original plan's "trim to func/stablehlo/chlo in Phase 1," this turned out
+  to be premature: `LowerSegRed`/`LowerMatMul`/`ExpIf`/the blackbox
+  functions all still genuinely need these dialects until Phases 2/3/4
+  retarget them. Trimming now would just break everything *they* still use.
+- New test: `tests/loop_undefined.fut`, using the `-- undefined` marker
+  convention from `run_tests.py`'s Phase 0 rewrite.
+
+### Not yet done / known gaps going into Phase 2+
+- `BasicOpIndex`'s general slice path, `BasicOpConcat`, `BasicOpScratch`,
+  `LowerArrayLit`'s non-constant branch still emit banned `tensor.*` ops.
+  None are reachable by `map.fut`/`iota.fut`; will need fixing whenever a
+  test actually exercises them.
+- `LowerIntrinsic`/`BasicOpConvOp`'s ZExt/`LowerBinOp`'s unsigned-div/mod/
+  min/max are `Undefined()` rather than guessed — genuinely unverified
+  stablehlo semantics, not exercised by any current test either.
+- The realistic Phase-1-passing set is just `map.fut` + `iota.fut`. Every
+  other array-parameterized test in the whole suite will hit the new
+  dynamic-shape gate in `LowerFunction` until some later mechanism lets the
+  backend specialize per concrete input size — **this isn't scoped in any
+  current phase of the plan and is a real open question worth raising with
+  the user if/when it becomes blocking** (most interesting Futhark programs
+  take array arguments, so this is a significant practical limitation, not
+  just an edge case).
+
+### Verification — first real test run done
+Build succeeded after two rounds of compile/link fixes:
+- Two missing-`.getResult()` bugs (passing an un-dereferenced `OpTy` where
+  `ValueRange` was expected needs two implicit conversions, which C++
+  disallows) and `MapOp` needing `->getResults()` not `.getResults()`
+  (single, non-variadic result, no plural accessor generated).
+- `mlir::makeRegionIsolatedFromAbove`/`mlir::IRRewriter` linked `undefined
+  symbol: typeinfo for mlir::RewriterBase` — the prebuilt MLIR libs are
+  `-fno-rtti` (LLVM's default) while this backend builds `-frtti`, so
+  `RewriterBase`'s vtable/typeinfo doesn't exist in the prebuilt archive.
+  Fixed by dropping `IRRewriter`/`makeRegionIsolatedFromAbove` and doing the
+  same thing with the two plain free functions it's built from
+  (`getUsedValuesDefinedAbove` + `replaceAllUsesInRegionWith` +
+  `Block::addArgument`), which need no `RewriterBase` instance at all.
+
+**First `run-tests` run: 11 passed, 32 failed.** Confirmed exactly as
+predicted above — the overwhelming majority of failures are the expected
+`Undefined(): dynamic-shaped function parameter/result` for every
+array-parameterized test (reduce*.fut, scan0.fut, argmax.fut, matmul.fut,
+hist*.fut, map2-5.fut, gelu.fut, map_dynamic.fut, etc.) — not bugs, working
+as designed. A few others are pre-existing/unrelated to this rewrite, not
+chased: `ragged_dot_mode*.fut`/`irreg_matmul.fut` compile fine but fail at
+*execution* with `UNIMPLEMENTED: HLO opcode 'ragged-dot' is not supported by
+XLA:CPU ThunkEmitter` — an XLA:CPU platform limitation, unrelated to our
+lowering (ragged_dot itself isn't touched by this phase). `scatter.fut`
+hits the already-documented Phase 0 `with_acc` regression.
+`moe_black_box_t1.fut` hits the already-documented Phase 0 `SegHist`
+regression. `moe_black_box.fut` hits a *new*, correctly-firing safety check:
+`Undefined(): SegMap: non-scalar free variable` — its kernel captures a
+whole array (not a scalar) from outer scope, which `LowerSegMap` correctly
+refuses to broadcast rather than emit something wrong.
+
+**One real bug found and fixed**: `map.fut` (the actual target test) failed
+with `'stablehlo.iota' op result #0 must be statically shaped tensor of
+...  but got 'tensor<4xtensor<i64>>'` — a tensor-of-tensor. Root cause:
+`Dim::value` (the lowered Futhark size/index value) is a 0-d tensor now
+(scalars are 0-d tensors), but `LowerSegMap`'s per-dimension iota
+construction and `LowerSegOpKernelBody`'s gtid `arith.index_cast` were both
+still using `d.value.getType()` directly as a *bare* element type. Fixed
+both (and a third, currently-unreachable occurrence in `LowerSegRed`'s
+dynamic-size branch, for consistency) to extract the bare element type via
+`getRankedType(d.value.getType()).getElementType()` first.
+
+**Confirmed fixed and verified**: `map.fut` and `iota.fut` both pass
+(12 passed / 31 failed overall, up from 11/32 — exactly the one expected
+fix, no other regressions). Phase 1's actual goal is achieved.
+
+Root cause of the `map.fut` failure (second round): `'stablehlo.return' op
+must be the last operation in the parent block`. The `OpBuilder::
+InsertionGuard` in `LowerSegMap` was constructed *after* `builder.
+createBlock(...)`, not before. `createBlock` moves the builder's insertion
+point into the new block as a side effect; a guard constructed afterward
+saves "already inside the new block" and restores to that same place at
+scope-exit, instead of back to the enclosing function body. So after
+`LowerSegMap` returned, the builder's insertion point was left stuck inside
+the `stablehlo.map`'s region, right after its `stablehlo.return` -- and
+whatever got lowered next (the function's own `return`) landed there too,
+after the terminator. Fixed by constructing the guard before `createBlock`,
+matching the established pattern elsewhere in the file (e.g. the old
+`LowerSegHist`'s block-building code, pre-Phase-0-stub).
+
+### Test-suite fix: static-size annotations on existing tests (not a backend bug)
+Investigated why `reduce.fut`/`reduce2.fut`/`reduce3.fut`/`scan0.fut`/
+`matmul.fut`/`argmax.fut` all hit the dynamic-shape gate. Root cause,
+confirmed by comparing against `dot_general.fut` (which already passes):
+`dot_general.fut`'s `main` explicitly annotates concrete sizes
+(`x: [2][3]f32`, `y: [3][2]f32`); the others left `main`'s parameters
+unannotated (`xs: []i32`, `main x y = ...`), so Futhark infers size-
+polymorphic (dynamic) types even though every test's actual input is a
+fixed-size literal. Not a backend limitation at all -- just a test-fixture
+annotation gap, left over from when the old IREE-based backend supported
+dynamic shapes and nobody needed to pin sizes.
+
+Fixed by adding explicit sized annotations to `main` (matching
+`dot_general.fut`'s existing convention), so each compiles to fully static
+shapes:
+- `tests/matmul.fut`: `main (x: [2][3]f32) (y: [3][2]f32) : [2][2]f32`
+- `tests/reduce.fut`: `main (xs: [4]i32): i32`
+- `tests/reduce2.fut`: `main (xss: [2][3]i32): [2]i32`
+- `tests/reduce3.fut`: `main (xs: [4]i64)`
+- `tests/scan0.fut`: `main (xs: [4]i32): [4]i32`
+
+**`tests/argmax.fut` deliberately left unannotated** -- it has two
+`-- input` cases with *different* array lengths (7 and 4), so no single
+static size annotation can satisfy both; and its reduce operator is
+non-commutative, which Phase 2 is going to gate to
+`Undefined("segred: non-commutative")` regardless of shape. Not worth
+fixing until/unless Phase 8 actually solves non-commutative reduce.
+
+**Not yet rebuilt/retested** after this test-file change (paused here per
+request). Next step when resuming: rebuild + rerun, then these five tests
+should newly reach (not necessarily pass) Phase 2's `LowerSegRed`/Phase 3's
+`LowerMatMul` logic instead of bailing out at the dynamic-shape gate --
+i.e. Phase 2 (segred) now has real tests to verify against once it's
+implemented.
 
 ## Phase 2 — segred (not started)
 `LowerSegRed` → `LowerSegMap` (per-element part) + `stablehlo.reduce` over the
@@ -297,3 +516,19 @@ writing the corresponding code.
   sandboxed Bash tool) — **user needs to run `nix develop -c build` (or just
   `build` inside `nix develop`) themselves and report back what breaks**.
   run_tests.py rewrite not started. No Phase 1+ work started.
+- 2026-10-18: Phase 0 finished (`run_tests.py` rewritten; user confirmed
+  Phase 0's tests fail as expected, with `@entry_main`/no-`@main` errors).
+  Phase 1 (segmap) implemented and verified: `map.fut`/`iota.fut` pass
+  (12 passed / 31 failed overall). Found along the way that most of the
+  originally-assumed Phase-1 test set is actually dynamically-shaped
+  (Futhark infers a runtime size whenever an array parameter isn't
+  explicitly annotated), which this backend can't support -- not a bug,
+  matches the brief's "dynamic -> Undefined() for now" rule, just broader
+  than expected. Traced several of those back to a missing test-fixture
+  convention (not a backend issue) and annotated `matmul.fut`/
+  `reduce.fut`/`reduce2.fut`/`reduce3.fut`/`scan0.fut` with explicit sizes
+  so they'll reach Phase 2/3's actual logic once implemented.
+  `argmax.fut` deliberately left unannotated (two different input lengths
+  across its test cases, plus a non-commutative operator Phase 2 gates to
+  `Undefined()` regardless). **Paused here, per request, before rebuilding
+  against the just-edited test files or starting Phase 2.**
