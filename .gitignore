@@ -237,6 +237,10 @@ build-iree-api/*
 
 tests/*
 !tests/*.fut
+!tests/static_shapes/
+!tests/static_shapes/*.fut
+!tests/dynamic_shapes/
+!tests/dynamic_shapes/*.fut
 
 # Links to source code set up by nix flake.
 third-party/stablehlo-src
