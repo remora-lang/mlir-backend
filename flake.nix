@@ -124,11 +124,13 @@
 
       # Validates the `-- input`/`-- output` blocks against Futhark's own
       # reference backend (independent of the MLIR/XLA pipeline). Defaults to
-      # every test if no files are given.
+      # every test if no files are given; `futhark test` recurses into
+      # directories on its own, so `futhark-test tests/static_shapes` runs
+      # just that subset.
       futhark-test = pkgs.writeShellScriptBin "futhark-test" ''
         set -euo pipefail
         if [ "$#" -eq 0 ]; then
-          set -- tests/*.fut
+          set -- tests
         fi
         exec futhark test --backend=c "$@"
       '';

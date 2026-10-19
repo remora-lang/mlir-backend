@@ -31,6 +31,7 @@ failure -- it means the program isn't handled -- not silently skipped.
 
 import glob
 import math
+import os
 import re
 import subprocess
 import sys
@@ -40,7 +41,13 @@ import jax
 
 import example_run as er
 
-TESTS_GLOB = "tests/*.fut"
+# Tests live under tests/static_shapes/ and tests/dynamic_shapes/ (the
+# latter can never pass under this backend -- XLA requires static shapes --
+# so it's kept separate rather than mixed in with the suite that's actually
+# expected to make progress). The glob is recursive so the no-args default
+# still covers both; pass a directory (e.g. `run-tests tests/static_shapes`)
+# to run just one in isolation.
+TESTS_GLOB = "tests/**/*.fut"
 
 _COLOR = sys.stdout.isatty()
 
@@ -266,7 +273,13 @@ def _run_file(path):
 
 def main():
     jax.config.update("jax_enable_x64", True)  # keep f64/i64 inputs as-is
-    files = sys.argv[1:] or sorted(glob.glob(TESTS_GLOB))
+    args = sys.argv[1:] or sorted(glob.glob(TESTS_GLOB, recursive=True))
+    files = []
+    for a in args:
+        if os.path.isdir(a):
+            files.extend(sorted(glob.glob(os.path.join(a, "*.fut"))))
+        else:
+            files.append(a)
     passed = failed = 0
     for path in files:
         for case_name, ok, msg in _run_file(path):

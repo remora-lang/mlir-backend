@@ -1505,6 +1505,33 @@ struct FutharkCompiler {
   // operators fall out for free -- stablehlo.reduce is natively variadic
   // (multiple inputs/init_values/region-results), no special-casing needed
   // beyond what's already generic below.
+  // Phase 8: the Phase 2 gate on non-commutative operators was based on a
+  // misreading of the spec -- "body and init_values must form a monoid"
+  // means associative + identity, which is exactly what Futhark's own
+  // `neutral` requirement already guarantees, and does NOT require
+  // commutativity (a monoid is not automatically commutative; see
+  // en.wikipedia.org/wiki/Monoid, and jax.lax.reduce's own docstring,
+  // which states the identical requirement). The real bug this phase
+  // found was in this function's own block-arg binding below, backwards
+  // since Phase 2 but never exercised with a genuinely order-sensitive
+  // operator until now (every earlier segred test was either commutative,
+  // where the swap is invisible, or gated to Undefined()).
+  //
+  // Found by testing directly against a JAX reference lowering first,
+  // per the brief's standing instruction, rather than guessing: calling
+  // `jax.lax.reduce` directly (bypassing this backend) with the exact
+  // same non-commutative affine-compose operator gave the CORRECT answer
+  // on XLA:CPU, which ruled out "stablehlo.reduce can't handle
+  // non-commutative operators" as the explanation for this backend's own
+  // wrong output on segred_affine_compose.fut/segred_matmul2x2.fut.
+  // Decoded the reference lowering's actual block-arg roles by tracing
+  // through its non-commutative arithmetic term by term: the body's first
+  // `valueCount` args are the accumulator (matching init_values'/the
+  // left/earlier-position operand's role), the second `valueCount` are
+  // the new value -- this function had them backwards. Swapping fixed
+  // segred_affine_compose.fut/segred_matmul2x2.fut/
+  // segred_noncomm_segmented.fut directly through plain stablehlo.reduce,
+  // no scan-based workaround needed at all.
   Values LowerSegRed(const SegRed &pSegRed, Ctx &ctx) {
     RequireThreadLevel(pSegRed.lvl);
 
@@ -1513,11 +1540,6 @@ struct FutharkCompiler {
     auto pSegBinOp = pSegRed.ops[0];
     if (pSegBinOp.shape.dims.size() != 0)
       Undefined("segred: vector-valued operator");
-    // The StableHLO spec says reduce preserves element order, but XLA's GPU
-    // reduce may assume commutativity -- lower priority to actually solve
-    // (see Phase 8), so flagged rather than risking a silently wrong result.
-    if (pSegBinOp.comm == Commutativity::Noncommutative)
-      Undefined("segred: non-commutative");
 
     IterationSpace iterSpace = LowerSegSpace(pSegRed.space, ctx);
     int64_t rank = std::ssize(iterSpace);
@@ -1531,8 +1553,9 @@ struct FutharkCompiler {
     for (auto &e : pSegBinOp.neutral)
       neutral.push_back(LowerSubExp(e, ctx));
     int64_t valueCount = (int64_t)neutral.size();
+    int64_t reduceDim = rank - 1;
 
-    mlir::SmallVector<int64_t> reduceDims{rank - 1};
+    mlir::SmallVector<int64_t> reduceDims{reduceDim};
     mlir::SmallVector<mlir::Type> resultTypes;
     for (mlir::Value v : mapped) {
       auto ty = getRankedType(v.getType());
@@ -1544,16 +1567,18 @@ struct FutharkCompiler {
     auto op = mlir::stablehlo::ReduceOp::create(builder, resultTypes, mapped,
                                                 neutral, reduceDims);
 
-    // Per the StableHLO spec, the body's block args are (one value per input
-    // slice, then one accumulator per init_value) -- the *opposite* order
-    // from Futhark's own SegBinOp.lambda.params convention (accumulators
-    // first, then new values).
+    // Per the StableHLO spec, the body's block args are (one accumulator
+    // per init_value, then one value per input slice) -- confirmed by
+    // decoding a JAX reference lowering's arithmetic term by term (see
+    // this function's own comment above), not assumed. This matches
+    // Futhark's own SegBinOp.lambda.params convention directly
+    // (accumulators first, then new values) -- no transpose needed.
     mlir::SmallVector<mlir::Type> argTys;
+    for (mlir::Value v : neutral)
+      argTys.push_back(v.getType());
     for (mlir::Value v : mapped)
       argTys.push_back(mlir::RankedTensorType::get(
           {}, getRankedType(v.getType()).getElementType()));
-    for (mlir::Value v : neutral)
-      argTys.push_back(v.getType());
     mlir::SmallVector<mlir::Location> locs(argTys.size(), builder.getLoc());
 
     {
@@ -1564,8 +1589,8 @@ struct FutharkCompiler {
 
       Ctx local = ctx;
       mlir::ValueRange blockArgs = blk->getArguments();
-      mlir::ValueRange newValueArgs = blockArgs.take_front(valueCount);
-      mlir::ValueRange accArgs = blockArgs.drop_front(valueCount);
+      mlir::ValueRange accArgs = blockArgs.take_front(valueCount);
+      mlir::ValueRange newValueArgs = blockArgs.drop_front(valueCount);
       for (auto [param, acc] : llvm::zip_equal(
                pSegBinOp.lambda.params | std::views::take(valueCount),
                accArgs))

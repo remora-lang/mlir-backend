@@ -903,11 +903,129 @@ op shape exactly (`reshape`+`concatenate` into `tensor<4x2xi64>`,
 the end of Phase 6 -- the 4 new tests passing, the 3 pre-existing dynamic-
 shape hist tests unaffected either way).
 
-## Phase 8 (lower priority) — non-commutative segred/segscan, solved (not started)
-If XLA's GPU reduce actually assumes commutativity incorrectly (a hypothesis
-to test empirically, not an established fact), lower non-commutative segred
-through the scan path (take the last/first carry) instead of
-`stablehlo.reduce`. Re-enable `argmax.fut` as this phase's exit criteria.
+## Phase 8 (lower priority) — non-commutative segred, solved (done, verified)
+
+**First pass drew the wrong conclusion from the spec, corrected by the
+user**: initial reading of `stablehlo.reduce`'s spec text ("`body` and
+`init_values` must form a monoid to guarantee the operation produces the
+same results... on all implementations") was taken to mean commutativity
+was required, and an initial empirical test (compiling
+`segred_affine_compose.fut`/`segred_matmul2x2.fut`/
+`segred_noncomm_segmented.fut` with the non-commutative gate temporarily
+disabled, running on XLA:CPU, getting numerically wrong results on all
+three) seemed to confirm that reading. The user pushed back directly:
+Futhark's own requirement for `reduce`/`scan` -- an associative operator
+plus a `neutral` identity element -- already forms a monoid in the
+mathematically correct sense (a monoid requires only associativity and an
+identity element; it is **not** automatically commutative, see
+en.wikipedia.org/wiki/Monoid), so the spec's monoid requirement doesn't
+actually demand anything beyond what Futhark already guarantees. That was
+right, and the "monoid ⇒ commutative" reading in the first pass was a
+real misunderstanding, not the spec's actual requirement.
+
+**Re-investigated and found the real bug**: confirmed `jax.lax.reduce`'s
+own docstring states the identical requirement ("`init_values` must be an
+identity of computation, and `computation` must be associative" -- no
+mention of commutativity), and called `jax.lax.reduce` *directly*
+(bypassing this backend entirely) with the exact same non-commutative
+affine-compose operator and inputs that this backend got wrong -- it gave
+the *correct* answer on XLA:CPU. That ruled out "stablehlo.reduce can't
+handle non-commutative operators" and pointed at this backend's own
+lowering instead. Got a JAX reference lowering for that call
+(`jax.jit(f).lower(...).as_text()`) and decoded its generated reducer
+body's block-arg roles by tracing the non-commutative arithmetic term by
+term (multiplication alone is ambiguous since it's commutative; the
+addition term `a1*b2+b1` pins down which block arg is which): the body's
+first `valueCount` args are the accumulator, the second `valueCount` are
+the new value. `LowerSegRed`'s own reducer body had this backwards --
+present since Phase 2, invisible until now because every prior segred
+test was either commutative (where the swap is undetectable: a
+commutative op gives the same answer either way) or gated to
+`Undefined()`.
+
+**Fix**: swapped `LowerSegRed`'s `take_front`/`drop_front` assignment so
+`accArgs` (bound to Futhark's accumulator params) comes from the block's
+first `valueCount` arguments and `newValueArgs` from the second, matching
+the decoded convention; no other change needed. `stablehlo.reduce` itself
+needed no workaround and no commutativity gate at all -- the
+non-commutative gate is removed entirely, and `LowerSegRed` now uses a
+single unconditional `stablehlo.reduce` path for every operator,
+commutative or not. (A scan-based detour was tried first, modeled on
+Phases 5/6's already-verified order-preserving scan machinery -- it also
+produced correct results, but only because it replaced the buggy reducer
+code with separately-correct code, not because `stablehlo.reduce` was
+actually unusable here. Reverted it once the real bug was found and
+fixed directly, since the plain `stablehlo.reduce` path is simpler and
+avoids the scan detour's extra ops.)
+
+Re-verified `segred_affine_compose.fut`/`segred_matmul2x2.fut`/
+`segred_noncomm_segmented.fut` directly against Futhark's reference
+output after the fix -- all three now match through plain
+`stablehlo.reduce`, no scan involved. Converted all three from
+`-- undefined` to real `-- input`/`-- output` assertions.
+
+**Open question, not re-derived further**: `LowerSegScanReduceWindow`'s
+existing block-arg binding (new-value-first, accumulator-second) is the
+*opposite* convention from what was just confirmed for plain `reduce`,
+yet it's independently verified correct (`scan_noncomm.fut` passes). The
+`reduce_window` spec text explicitly defines its body semantics by
+deferring to plain `reduce`'s, which would suggest the same convention
+should apply -- but empirical testing (`jax.lax.reduce_window` with the
+same non-commutative operator, checked the same term-by-term way) shows
+its generated body also uses accumulator-first. Both conventions are now
+confirmed correct by direct testing for their respective ops; the
+apparent inconsistency with naive reasoning about why they'd differ was
+not run down further, since both are independently verified rather than
+inferred from each other.
+
+**`argmax.fut` can't actually be re-enabled, for an unrelated, pre-existing
+reason**: it declares `xs: []f32` (dynamic size), so it hits the
+"dynamic-shaped function parameter" `Undefined()` gate before
+`LowerSegRed` ever runs at all -- the same permanent-failure bucket as
+`map_dynamic.fut`/the original `hist1d.fut` (static shapes are a hard
+requirement of targeting XLA, not a Phase 8 gap). It stays `FAIL` in
+`run-tests` and is not expected to ever pass under this backend. Added
+`tests/argmax_static.fut` instead (same pattern as Phase 7's
+`hist_static.fut`) to actually exercise the fix: reuses `argmax.fut`'s own
+first case, plus a new second case with an actual tie at the maximum
+value (`argmax.fut`'s own two cases have no tie, so they'd have passed
+even under a wrong commutativity assumption) -- confirmed against
+Futhark's reference interpreter that the *later* occurrence wins a tie
+(the lambda's `else` branch takes the new value on `x == y`), the opposite
+of a naive "first occurrence wins" guess, so this case genuinely
+stress-tests order preservation rather than coincidentally passing either
+way.
+
+**A deeper pre-existing issue surfaced, not introduced**: getting past the
+non-commutative gate lets `moe_black_box.fut`/`moe_black_box_t1.fut`
+(which call `argmax` internally) proceed further into the pipeline, where
+they now hit a different, unrelated `Undefined("SegMap: non-scalar free
+variable")` instead of the old non-commutative gate. Both files were
+already `FAIL` before this change (and have their own pre-existing issues
+-- `Unused name "is_stable"`, a `Hole of type: [n]i64` -- flagged, not
+fixed) and remain `FAIL` after it; this is a different proximate cause for
+an already-failing test, not a regression.
+
+**Verified**: 30 passed / 26 failed overall (up from 28/26 at the end of
+Phase 7 -- `argmax_static.fut`'s 2 new cases passing; the 3 converted
+Phase 2 tests already counted as passing before, as expected-`Undefined()`,
+now passing as real numeric assertions instead).
+
+## Out-of-plan note — Phase 2's "StableHLO spec says reduce preserves
+order" claim, corrected twice
+Phase 2's original comment claiming "the StableHLO spec says reduce
+preserves element order" was wrong -- the spec says reduction order is
+implementation-defined. The first attempt at correcting it (earlier in
+this same phase) overcorrected into an equally wrong claim that the
+spec's monoid requirement demands commutativity. Both are corrected now:
+the spec requires only a (not-necessarily-commutative) monoid --
+associativity plus an identity element, exactly what Futhark's own
+`neutral` already guarantees -- which is why Phase 8's actual fix needed
+no workaround for `stablehlo.reduce` itself, only a block-arg binding
+fix in this backend's own code. Left both the original wrong claim and
+the first, overcorrected one as a historical record with this note,
+rather than silently rewritten, consistent with how Phase 5's
+`chlo.scan` research mistake was handled.
 
 ## Verification (every phase)
 `nix develop` → rebuild → `run-tests` → `futhark-test` (unchanged sanity
