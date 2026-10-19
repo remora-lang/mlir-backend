@@ -1,9 +1,9 @@
 -- Affine-map composition (associative, non-commutative) scanned instead of
--- reduced. Lowered via chlo.scan, which legalizes to a genuine sequential
--- stablehlo.while loop -- verified (by hand-testing this exact case
--- against jaxlib before wiring it into the backend) to preserve
--- combination order correctly, unlike stablehlo.reduce_window, which
--- silently computed the wrong answer for this same operator (see
+-- reduced. Lowered via the Phase 6 parallel-prefix algorithm
+-- (jax.lax.associative_scan's slice/pad/concatenate recursion, ported
+-- directly from its Python source) -- verified to preserve combination
+-- order correctly, unlike stablehlo.reduce_window, which silently
+-- computed the wrong answer for this same operator (see
 -- segred_affine_compose.fut for the reduce, not scan, version -- that one
 -- still hits Undefined() for the unrelated, real reason that segred's
 -- commutativity gate is accurate).

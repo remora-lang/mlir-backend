@@ -1694,13 +1694,9 @@ struct FutharkCompiler {
     // operator. stablehlo.reduce_window (used below for the scalar case)
     // does NOT: a non-commutative test case (affine-map composition,
     // scanned) silently produced a numerically *wrong* result (not a
-    // crash) on XLA:CPU. chlo.scan (used below for the tuple case) DOES
-    // preserve order -- it legalizes to a genuine sequential
-    // stablehlo.while loop (checked the actual legalization pass source,
-    // not just the chlo.scan op's own doc comment, which is stale and
-    // claims no decomposition exists at all) -- confirmed by hand-testing
-    // the exact failing case from the reduce_window attempt directly
-    // against jaxlib and getting the correct answer.
+    // crash) on XLA:CPU. The tuple-case path below (originally chlo.scan,
+    // now the Phase 6 parallel-prefix algorithm -- see ScanRec) DOES
+    // preserve order -- verified against this exact failing case.
     //
     // SegBinOp.comm can't be used to pick a cheaper path when safe:
     // checked empirically that Futhark's own GPU IR dump never prints the
@@ -1714,16 +1710,16 @@ struct FutharkCompiler {
     // faster, and the only case actually verified safe so far -- scalar
     // non-commutative-but-associative operators are a narrower residual
     // risk left unaddressed, no obvious Futhark scalar primitive produces
-    // one). Tuple operators go through chlo.scan instead (sequential, but
-    // verified correct for both commutative and non-commutative cases,
-    // including ones reduce_window gets wrong) -- replacing the earlier,
-    // more conservative "defer all tuples to Phase 6" gate. Making the
-    // tuple case parallel too remains Phase 6's job.
+    // one). Tuple operators go through the parallel-prefix algorithm
+    // (also O(log n) parallel steps, same as the scalar path, unlike the
+    // sequential chlo.scan-based implementation it replaced) -- verified
+    // correct for both commutative and non-commutative tuple operators,
+    // including ones reduce_window gets wrong.
     Values scanned = valueCount == 1
                          ? LowerSegScanReduceWindow(mapped, neutral, scanDim,
                                                      segBinOp, ctx)
-                         : LowerSegScanChlo(mapped, neutral, scanDim, segBinOp,
-                                           ctx);
+                         : LowerSegScanParallelPrefix(mapped, neutral, scanDim,
+                                                       segBinOp, ctx);
 
     return LowerElementwiseLambda(pSegScan.post_op.lambda, scanned, ctx);
   }
@@ -1801,74 +1797,214 @@ struct FutharkCompiler {
     return Values(op->getResults().begin(), op->getResults().end());
   }
 
-  // Tuple-operator associative scan via chlo.scan, which legalizes to a
-  // sequential stablehlo.while loop -- verified (by hand-testing against
-  // jaxlib) to preserve combination order correctly for non-commutative
-  // operators, unlike reduce_window above.
-  Values LowerSegScanChlo(Values mapped, Values neutral, int64_t scanDim,
-                          const SegBinOp &segBinOp, Ctx &ctx) {
-    int64_t valueCount = (int64_t)neutral.size();
+  // A scalar 0-d constant of value zero for an arbitrary element type --
+  // used by the parallel-prefix scan's interleave step below, which pads
+  // with zero and recombines via add/or rather than the user's own
+  // operator (see Interleave's comment for why that's still correct).
+  mlir::Value ZeroScalar(mlir::Type elemTy) {
+    auto ty = mlir::RankedTensorType::get({}, elemTy);
+    return mlir::stablehlo::ConstantOp::create(
+        builder, mlir::DenseElementsAttr::get(ty, builder.getZeroAttr(elemTy)));
+  }
 
-    // chlo.scan has two separate variadic result groups (outputs, carries),
-    // so they must be passed as two separate TypeRanges, not one combined
-    // list -- a single flat resultTypes list matched a different generated
-    // overload that doesn't set up the result-segment split correctly,
-    // leaving op.getOutputs() returning the wrong thing (caught by actually
-    // running this, not just by it compiling). Carries have the same (0-d)
-    // type as the inits, outputs the same (full-shape) type as the mapped
-    // inputs.
-    mlir::SmallVector<mlir::Type> outputTypes;
-    for (mlir::Value v : mapped)
-      outputTypes.push_back(v.getType());
-    mlir::SmallVector<mlir::Type> carryTypes;
-    for (mlir::Value v : neutral)
-      carryTypes.push_back(v.getType());
+  // stablehlo.slice along a single dimension, Python-slice style (start
+  // inclusive, limit exclusive), identity on every other dimension.
+  Values SliceDim(Values xs, int64_t start, int64_t limit, int64_t stride,
+                  int64_t dim) {
+    Values result;
+    for (mlir::Value v : xs) {
+      auto ty = getRankedType(v.getType());
+      int64_t rank = ty.getRank();
+      mlir::SmallVector<int64_t> starts(rank, 0);
+      mlir::SmallVector<int64_t> limits(ty.getShape().begin(),
+                                        ty.getShape().end());
+      mlir::SmallVector<int64_t> strides(rank, 1);
+      starts[dim] = start;
+      limits[dim] = limit;
+      strides[dim] = stride;
+      result.push_back(
+          mlir::stablehlo::SliceOp::create(builder, v, starts, limits, strides));
+    }
+    return result;
+  }
 
-    auto op = mlir::chlo::ScanOp::create(
-        builder, outputTypes, carryTypes, mapped, neutral,
-        builder.getI64IntegerAttr(scanDim), /*scan_dim_size=*/nullptr,
-        /*is_reverse=*/builder.getBoolAttr(false),
-        /*is_associative=*/builder.getBoolAttr(true));
+  Values ConcatDim(Values a, Values b, int64_t dim) {
+    Values result;
+    for (auto [av, bv] : llvm::zip_equal(a, b))
+      result.push_back(mlir::stablehlo::ConcatenateOp::create(
+          builder, mlir::ValueRange{av, bv}, (uint64_t)dim));
+    return result;
+  }
 
-    // Per chlo.scan's own getAsmBlockArgumentNames (checked the ODS, not
-    // guessed), the body's block args are (one value per input, then one
-    // per carry) -- same order convention as stablehlo.reduce/
-    // reduce_window above.
+  // Interleaves two sequences of equal length, or where `a` is exactly one
+  // longer than `b`, along `dim` -- jax.lax.associative_scan's own
+  // `_interleave` helper (checked its source directly, not derived from
+  // the algorithm description alone). Each is zero-padded at alternating
+  // positions (interior padding of 1 guarantees the two padded arrays
+  // never have a real value at the same position) and recombined with
+  // add (or, for bool, logical or) -- NOT the user's own scan operator,
+  // which plays no role here: the padding trick is a pure interleave, not
+  // a combination of real values.
+  Values Interleave(Values a, Values b, int64_t dim) {
+    int64_t aLen = getRankedType(a[0].getType()).getShape()[dim];
+    int64_t bLen = getRankedType(b[0].getType()).getShape()[dim];
+    int64_t aHigh = (aLen == bLen) ? 1 : 0;
+    int64_t bHigh = (aLen == bLen) ? 0 : 1;
+
+    Values result;
+    for (auto [av, bv] : llvm::zip_equal(a, b)) {
+      auto rankedTy = getRankedType(av.getType());
+      int64_t rank = rankedTy.getRank();
+      mlir::Type elemTy = rankedTy.getElementType();
+      mlir::Value zero = ZeroScalar(elemTy);
+
+      mlir::SmallVector<int64_t> aLow(rank, 0), aHighV(rank, 0),
+          aInterior(rank, 0);
+      aHighV[dim] = aHigh;
+      aInterior[dim] = 1;
+      mlir::Value aPadded =
+          mlir::stablehlo::PadOp::create(builder, av, zero, aLow, aHighV, aInterior);
+
+      mlir::SmallVector<int64_t> bLow(rank, 0), bHighV(rank, 0),
+          bInterior(rank, 0);
+      bLow[dim] = 1;
+      bHighV[dim] = bHigh;
+      bInterior[dim] = 1;
+      mlir::Value bPadded =
+          mlir::stablehlo::PadOp::create(builder, bv, zero, bLow, bHighV, bInterior);
+
+      mlir::Value combined = elemTy.isInteger(1)
+          ? mlir::Value(mlir::stablehlo::OrOp::create(builder, aPadded, bPadded))
+          : mlir::Value(mlir::stablehlo::AddOp::create(builder, aPadded, bPadded));
+      result.push_back(combined);
+    }
+    return result;
+  }
+
+  // Applies the scan operator elementwise to two full-shape tuples of
+  // arrays -- the parallel-prefix algorithm's "combine" step, distinct
+  // from LowerElementwiseLambda's single-input form. One stablehlo.map
+  // per output value, same free-var-broadcast fixup as LowerSegMap/
+  // LowerElementwiseLambda (stablehlo.map is isolated-from-above).
+  // Operand order matches Futhark's own SegBinOp.lambda.params convention
+  // directly (accumulator_params... bound to `a`, new_value_params...
+  // bound to `b`) -- no transpose needed here, unlike the reduce_window/
+  // chlo.scan paths above, since this is a plain stablehlo.map with no
+  // StableHLO-mandated block-arg order to work around.
+  Values Combine(Values a, Values b, const SegBinOp &segBinOp, Ctx &ctx) {
+    Values inputs(a.begin(), a.end());
+    inputs.insert(inputs.end(), b.begin(), b.end());
+
+    auto shapeTy = getRankedType(a[0].getType()).getShape();
+    mlir::SmallVector<int64_t> allDims;
+    for (int64_t i = 0; i < (int64_t)shapeTy.size(); ++i)
+      allDims.push_back(i);
+
     mlir::SmallVector<mlir::Type> argTys;
-    for (mlir::Value v : mapped)
+    for (mlir::Value v : inputs)
       argTys.push_back(mlir::RankedTensorType::get(
           {}, getRankedType(v.getType()).getElementType()));
-    for (mlir::Value v : neutral)
-      argTys.push_back(v.getType());
     mlir::SmallVector<mlir::Location> locs(argTys.size(), builder.getLoc());
 
-    {
-      mlir::OpBuilder::InsertionGuard guard(builder);
-      mlir::Block *blk = builder.createBlock(&op.getBody(), {}, argTys, locs);
-      builder.setInsertionPointToStart(blk);
+    Values finalResults;
+    for (size_t j = 0; j < segBinOp.lambda.ret.size(); ++j) {
+      auto resultTy = mlir::RankedTensorType::get(
+          shapeTy, LowerSegOpBaseType(segBinOp.lambda.ret[j], ctx));
+      auto op = mlir::stablehlo::MapOp::create(
+          builder, mlir::TypeRange{resultTy}, inputs, allDims);
 
-      Ctx local = ctx;
-      mlir::ValueRange blockArgs = blk->getArguments();
-      mlir::ValueRange newValueArgs = blockArgs.take_front(valueCount);
-      mlir::ValueRange carryArgs = blockArgs.drop_front(valueCount);
-      for (auto [param, acc] : llvm::zip_equal(
-               segBinOp.lambda.params | std::views::take(valueCount),
-               carryArgs))
-        local.subexps.insert(param.name, acc);
-      for (auto [param, nv] : llvm::zip_equal(
-               segBinOp.lambda.params | std::views::drop(valueCount),
-               newValueArgs))
-        local.subexps.insert(param.name, nv);
+      {
+        mlir::OpBuilder::InsertionGuard guard(builder);
+        mlir::Block *blk =
+            builder.createBlock(&op.getRegion(), {}, argTys, locs);
+        builder.setInsertionPointToStart(blk);
 
-      // Inclusive scan: the new combined value is both this position's
-      // output and the carry fed into the next step.
-      Values combined = LowerBody(segBinOp.lambda.body, local);
-      Values returned(combined.begin(), combined.end());
-      returned.insert(returned.end(), combined.begin(), combined.end());
-      mlir::stablehlo::ReturnOp::create(builder, returned);
+        Ctx local = ctx;
+        for (auto [param, arg] :
+             llvm::zip_equal(segBinOp.lambda.params, blk->getArguments()))
+          local.subexps.insert(param.name, arg);
+        Values results = LowerBody(segBinOp.lambda.body, local);
+        mlir::stablehlo::ReturnOp::create(builder,
+                                          mlir::ValueRange{results[j]});
+      }
+
+      mlir::SetVector<mlir::Value> freeVars;
+      mlir::getUsedValuesDefinedAbove(op.getRegion(), freeVars);
+      if (!freeVars.empty()) {
+        mlir::Block &entry = op.getRegion().front();
+        mlir::OpBuilder::InsertionGuard guard(builder);
+        builder.setInsertionPoint(op);
+        Values broadcasts;
+        for (mlir::Value fv : freeVars) {
+          auto fvTy = mlir::dyn_cast<mlir::RankedTensorType>(fv.getType());
+          if (!fvTy || fvTy.getRank() != 0)
+            Undefined("segscan parallel prefix: non-scalar free variable");
+          auto broadcastTy =
+              mlir::RankedTensorType::get(shapeTy, fvTy.getElementType());
+          broadcasts.push_back(mlir::stablehlo::BroadcastInDimOp::create(
+              builder, broadcastTy, fv, mlir::SmallVector<int64_t>{}));
+          mlir::BlockArgument newArg =
+              entry.addArgument(fv.getType(), builder.getLoc());
+          mlir::replaceAllUsesInRegionWith(fv, newArg, op.getRegion());
+        }
+        op->insertOperands(op->getNumOperands(), broadcasts);
+      }
+
+      finalResults.push_back(op->getResult(0));
     }
+    return finalResults;
+  }
 
-    return Values(op.getOutputs().begin(), op.getOutputs().end());
+  // Tuple-operator associative scan via jax.lax.associative_scan's own
+  // recursive Blelloch-style algorithm (ported from its Python source
+  // directly, not re-derived from the algorithm's prose description --
+  // confirmed the resulting op sequence against
+  // jax.jit(lambda a, b: lax.associative_scan(compose, (a, b)))
+  // .lower(...).as_text() for a tuple operator first). O(log n) sequential
+  // steps instead of chlo.scan's O(n) stablehlo.while loop -- a pure
+  // performance upgrade over the earlier chlo.scan-based implementation,
+  // which this one replaces outright (not kept behind a flag -- per
+  // CLAUDE.md, changing the code directly beats threading a flag through
+  // for a case with no actual need to pick between the two at runtime).
+  // All shapes are static here (per the scalars-as-0-d-tensor decision and
+  // Undefined() on dynamic sizes), so the recursion unrolls entirely at
+  // compile time -- exactly like JAX's own trace-time unrolling.
+  Values ScanRec(Values elems, int64_t dim, const SegBinOp &segBinOp,
+                 Ctx &ctx) {
+    int64_t n = getRankedType(elems[0].getType()).getShape()[dim];
+    if (n < 2)
+      return elems;
+
+    Values reduced =
+        Combine(SliceDim(elems, 0, n - 1, 2, dim),
+                SliceDim(elems, 1, n, 2, dim), segBinOp, ctx);
+    Values oddElems = ScanRec(reduced, dim, segBinOp, ctx);
+
+    Values evenElems;
+    int64_t pairCount = n / 2;
+    if (n % 2 == 0) {
+      evenElems = Combine(SliceDim(oddElems, 0, pairCount - 1, 1, dim),
+                          SliceDim(elems, 2, n, 2, dim), segBinOp, ctx);
+    } else {
+      evenElems =
+          Combine(oddElems, SliceDim(elems, 2, n, 2, dim), segBinOp, ctx);
+    }
+    evenElems = ConcatDim(SliceDim(elems, 0, 1, 1, dim), evenElems, dim);
+
+    return Interleave(evenElems, oddElems, dim);
+  }
+
+  Values LowerSegScanParallelPrefix(Values mapped, Values neutral,
+                                    int64_t scanDim, const SegBinOp &segBinOp,
+                                    Ctx &ctx) {
+    (void)neutral; // Unlike reduce_window/chlo.scan, this algorithm has no
+                   // separate init-value operand: Futhark's own scan
+                   // semantics make the first element its own scan result
+                   // (see ScanRec's base case and even-element handling),
+                   // matching jax.lax.associative_scan's documented
+                   // behavior exactly, so neutral is unused here by
+                   // design, not an oversight.
+    return ScanRec(mapped, scanDim, segBinOp, ctx);
   }
 
   void RequireThreadLevel(const SegLevel &lvl) {

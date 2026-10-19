@@ -705,21 +705,83 @@ prior run, since both tests were already counted as "passing" before --
 first as expected-`Undefined()`, now as real numeric passes -- but the
 qualitative correctness is new).
 
-## Phase 6 — segscan, parallel prefix (not started; scope revised)
-Originally scoped as the only way to correctly handle tuple-valued scans
-(back when Phase 5's `chlo.scan` path was believed to be a dead end). Now
-that Phase 5 handles tuple operators correctly via `chlo.scan`, this phase
-is a **performance upgrade, not a correctness fix**: `chlo.scan` lowers to
-a sequential `stablehlo.while` loop (O(n) sequential steps), whereas
-`jax.lax.associative_scan`'s `slice`/`pad`/`concatenate`-based algorithm
-parallelizes to O(log n) steps. Whether this is worth doing depends on
-whether scan performance actually matters for target workloads -- not yet
-decided. If pursued: `jax.lax.associative_scan`'s algorithm via
-`stablehlo.slice`/`pad`/`concatenate` + Phase 1's elementwise library,
-selectable via a flag alongside the existing `chlo.scan` path, with the
-Phase 5 tuple-scan tests run against both and cross-checked numerically.
-Get the JAX reference lowering for a tuple-valued `associative_scan` first
-and use it as the concrete target shape, same as always.
+**Superseded by Phase 6**: `LowerSegScanChlo` (and `mlir::chlo::ScanOp`
+usage for scan entirely) was deleted in Phase 6 below, replaced outright
+by a parallel-prefix implementation. This section is kept as-is as the
+historical record of how the tuple case was first solved and verified
+correct -- that verification is what justified trusting the replacement.
+
+## Phase 6 — segscan, parallel prefix (done, verified)
+
+**Scope revised from the original plan**: originally this phase existed
+because Phase 5's `chlo.scan` path was believed (wrongly, see Phase 5's
+research-mistake note) to be a dead end, making parallel prefix the *only*
+way to correctly handle tuple-valued scans. Since Phase 5 ended up solving
+tuple operators correctly via `chlo.scan` after all, this phase is a
+**performance upgrade, not a correctness fix**: `chlo.scan` legalizes to a
+sequential `stablehlo.while` loop (O(n) sequential steps), whereas
+`jax.lax.associative_scan`'s algorithm parallelizes to O(log n) steps, the
+same asymptotic shape as the scalar `reduce_window` path already has.
+
+**No flag**: the original plan called for a compiler-level flag selecting
+`chlo.scan` vs. parallel-prefix, so both could be cross-checked. Skipped
+that in favor of just replacing `LowerSegScanChlo` outright with the new
+`LowerSegScanParallelPrefix`/`ScanRec`, consistent with this project's
+existing precedent (Phase 3 made the same call for `dot_general` precision
+rather than threading a flag for it) and CLAUDE.md's "don't use feature
+flags... when you can just change the code" guidance -- there's no actual
+runtime need to pick between the two, so a flag would be pure unused
+surface area. `LowerSegScanChlo` and the `mlir::chlo::ScanOp`-for-scan
+code path are deleted entirely, not kept dead/unreachable.
+
+**Implementation**: ported `jax.lax.associative_scan`'s recursive
+algorithm directly from its Python source
+(`jax._src.lax.control_flow.loops.associative_scan`'s nested `_scan`/
+`combine`/`_interleave`, read via `inspect.getsource` rather than
+re-derived from the paper/docstring alone) into a new recursive
+`ScanRec(elems, dim, segBinOp, ctx)`:
+- Base case `n < 2`: return as-is.
+- Combine adjacent pairs (`SliceDim` stride-2 even/odd slices + `Combine`,
+  a new helper applying `segBinOp.lambda` elementwise via one
+  `stablehlo.map` per output value over two full-shape operand tuples --
+  distinct from `LowerElementwiseLambda`'s single-input form. Operand
+  order matches Futhark's own `SegBinOp.lambda.params` convention
+  directly here, with no transpose needed, unlike the reduce_window/
+  chlo.scan paths -- `Combine` is a plain `stablehlo.map`, not a
+  StableHLO op with its own fixed block-arg order to work around).
+- Recurse on the half-sized combined sequence (`oddElems`).
+- Reconstruct the even-indexed results from `oddElems` and the original
+  elements (`Combine` again, parity-dependent slicing exactly mirroring
+  the Python source), prepend the original first element (`ConcatDim`).
+- Interleave `evenElems`/`oddElems` back together (`Interleave`, mirroring
+  `_interleave`): zero-pads each at alternating positions via
+  `stablehlo.pad` (interior padding of 1 guarantees disjoint support) and
+  recombines with `stablehlo.add` (or `stablehlo.or` for bool) -- not the
+  user's own scan operator, which plays no role in this step since the
+  two padded arrays never have a real value at the same position.
+
+All shapes are static (per the scalars-as-0-d-tensor decision and
+`Undefined()` on dynamic sizes), so the recursion fully unrolls at compile
+time, the same way JAX's own Python-level recursion unrolls at trace time.
+
+**Verified against the actual JAX reference lowering, not just the
+algorithm description**, per the brief's standing instruction: ran
+`jax.jit(lambda a, b: lax.associative_scan(compose, (a, b))).lower(...)
+.as_text()` for a tuple operator on a 5-element input first, and confirmed
+the op sequence this produces (slice/multiply/add pairs recursing down to
+a 1-element base case, then pad/add interleaves back up) is structurally
+the same recursive slice-combine-interleave shape `ScanRec` emits (checked
+`compile tests/scan_tuple.fut`'s output directly: same `stablehlo.slice`
+pairs into `stablehlo.map` combine, same `stablehlo.pad`+`stablehlo.add`
+interleave pattern, down to matching tensor shapes at each recursion
+level).
+
+**Verified correctness**: `tests/scan_tuple.fut` and `tests/scan_noncomm.fut`
+(the latter specifically the non-commutative case) both still pass with
+correct numeric output after switching from `chlo.scan` to
+`LowerSegScanParallelPrefix` -- same 24 passed / 26 failed overall as
+Phase 5 ended with (no count change, since nothing changed about which
+tests pass -- only how the passing ones are now lowered).
 
 ## Phase 7 (lower priority) — SegHist (not started)
 `stablehlo.scatter` (`unique_indices=false`, `indices_are_sorted=false`);
