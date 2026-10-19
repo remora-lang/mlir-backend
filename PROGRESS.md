@@ -783,11 +783,125 @@ correct numeric output after switching from `chlo.scan` to
 Phase 5 ended with (no count change, since nothing changed about which
 tests pass -- only how the passing ones are now lowered).
 
-## Phase 7 (lower priority) — SegHist (not started)
-`stablehlo.scatter` (`unique_indices=false`, `indices_are_sorted=false`);
-segmented hist prepends segment-`iota` to the index vector. Single-scalar-
-operator only; tuple operator → `Undefined("SegHist: tuple operator")` (defer
-solving, per the brief). New tests: out-of-bounds indices, tuple-operator case.
+## Out-of-plan fix — dot_general precision via a real compile-time flag
+Not one of the numbered phases; done between Phase 6 and Phase 7 at the
+user's request. The user pointed out that Phase 3's original design --
+emit `DEFAULT` unconditionally from the backend and rely on
+`example_run.py`'s `set_precision` regex rewrite of the already-compiled
+MLIR text to set `precision = [P, P]` ad hoc -- was a real hack ("We
+rewrote the MLIR source as a hack"), unlike the Phase 6 chlo.scan-vs-
+parallel-prefix case where a flag genuinely wasn't needed. Fixed by
+threading an actual compile-time `--precision default|high|highest` flag
+through:
+- `mlir-backend.cpp`: parses `--precision` (via the generated
+  `mlir::stablehlo::symbolizePrecision`, not a hand-written string table),
+  sets it on the new `FutharkCompiler::precision` field.
+- `compiler.hpp`: new `PrecisionConfig()` helper builds the
+  `precision_config` array attr from that field (or returns a null/omitted
+  attr for `DEFAULT`, printing identically to the old unconditional-DEFAULT
+  behavior); both `LowerMatMul` and `LowerDotGeneral` now pass it to
+  `DotGeneralOp::create` instead of a hardcoded `{}`.
+- `flake.nix`: `compile`'s `.fut` branch was silently dropping every arg
+  after the filename (`exec ... mlir-backend "$ir"`, no `"$@"`) -- fixed to
+  forward them (`shift; exec ... mlir-backend "$ir" "$@"`), so
+  `compile x.fut --precision highest` actually reaches the binary.
+- `example_run.py`: deleted `set_precision` and the `--precision`/
+  precision-dependent `--tol`-default machinery entirely, since the thing
+  it existed to work around is gone; `--tol` is now a flat default (2e-3).
+
+Verified end-to-end: `./build/mlir-backend/mlir-backend tests/matmul.fut_gpu
+--precision highest` emits `precision = [HIGHEST, HIGHEST]` on the
+`dot_general`; omitting the flag (or `--precision default`) emits no
+`precision` attribute at all, byte-identical to the pre-fix output. Full
+`run-tests` rerun afterward: unchanged 24 passed / 26 failed (nothing
+depends on precision numerically in the existing suite, as expected).
+
+## Phase 7 (lower priority) — SegHist (done, verified)
+`LowerSegHist` lowers via `stablehlo.scatter`, reusing the existing
+`LowerSegMap(lvl, space, body, ret, ctx)` overload for the per-element part
+(same pattern `LowerSegRed`/`LowerSegScan` already use): the kernel body's
+results are `[index_component_0, ..., index_component_{R-1}, value]` where
+`R = histOp.shape.dims.size()` (the destination array's rank) -- confirmed
+against the actual GPU IR dump for `hist1d.fut` (1 index component) and
+`hist2d.fut` (2 components), not assumed. The `R` separate `[n]`-shaped
+index-component arrays are reshaped to `[n, 1]` and `stablehlo.concatenate`d
+into one `[n, R]` indices tensor (`R > 1` needs the concatenate; `R == 1`
+skips it).
+
+**Validated against a JAX reference lowering first**, per the brief's
+standing instruction:
+`jax.jit(lambda idx, vals: jnp.zeros((4,), jnp.int32).at[idx].add(vals))
+.lower(...).as_text()` for the 1-D case, confirming
+`inserted_window_dims = scatter_dims_to_operand_dims = [0..R-1]`,
+`index_vector_dim = 1` (always `1`, regardless of `R` -- a fixed property
+of the indices tensor always being rank-2 `[n, R]`, not something that
+scales with `R`; this was the one place a first draft got it wrong,
+writing `indexVectorDim = R` before checking the dump), no
+`update_window_dims` at all (a pure scalar scatter, no window), and
+`unique_indices = false` / `indices_are_sorted = false`. The destination
+array itself is not constructed by `LowerSegHist` -- Futhark materializes
+it as its own, separately-lowered zero-fill statement before the `seghist`
+runs (confirmed via the GPU IR dump), so it's just looked up from `ctx`
+via `HistOp.dest[0]`.
+
+**Block-argument order needed no transpose, unlike reduce_window/
+chlo.scan**: the StableHLO spec's own calling convention,
+`update_computation(results[result_index], updates_converted)`, binds
+"old/accumulated value" first and "new value" second -- exactly Futhark's
+own `HistOp.lambda.params` convention (accumulator first, new value
+second). Confirmed via the JAX dump's generated block (`add(%arg2, %arg3)`
+where `%arg2` comes from the zero-initialized `inputs` and `%arg3` from
+`updates`), not assumed from the reduce/reduce_window precedent (which
+goes the other way).
+
+**Out-of-bounds semantics verified from two independent sources, not
+assumed to coincide**: the StableHLO spec's `scatter` section states
+indices that are out of bounds leave `results` unchanged ("Otherwise
+`updated_results = results`"); Futhark's own reference interpreter was run
+directly on a small out-of-bounds case (`is = [0, 5, 1, -1]`, 4-bin
+destination) and gives `[10, 2, 0, 0]` -- both index `5` (too large) and
+`-1` (negative) silently dropped, matching the spec exactly. This became
+`tests/hist_oob.fut`.
+
+**Gating, following the brief's explicit "defer solving" instruction for
+SegHist's tuple case** (unlike Phase 6's SegScan, no parallel-prefix-style
+workaround was in scope here): `pSegHist.ops.size() != 1` →
+`Undefined("SegHist: multiple operators")`; `histOp.opShape` non-empty
+(a per-element width for a vector-valued operator, distinct from the
+tuple check) → `Undefined("SegHist: vector-valued operator")`;
+`histOp.neutral.size() != 1` → `Undefined("SegHist: tuple operator")`.
+Confirmed via the GPU IR dump of a hand-written tuple-operator
+`reduce_by_index` call that a tuple operator shows up as one `HistOp` with
+`neutral`/`dest` each having 2 entries (not two separate `HistOp`s), which
+is exactly what the `neutral.size()` gate checks.
+
+**A pre-existing limitation surfaced, not introduced here**: the original
+`hist1d.fut`/`hist2d.fut`/`hist3d.fut` (left over from before this
+backend's StableHLO rewrite) declare dynamically-sized parameters
+(`[n]i64`/`[n]i32`), so they hit the "dynamic-shaped function parameter"
+`Undefined()` gate before `LowerSegHist` ever runs at all -- the same
+permanent-failure bucket as `map2.fut`/`map_dynamic.fut`/
+`iota_dynamic.fut` (static shapes are a hard requirement of targeting
+XLA, not a Phase 7 gap). They stay `FAIL` in `run-tests` and are not
+expected to ever pass under this backend. To actually exercise and verify
+`LowerSegHist`, added statically-shaped equivalents instead:
+`tests/hist_static.fut` (1-D, same data as `hist1d.fut`),
+`tests/hist2d_static.fut` (2-D, exercises the multi-index
+reshape+concatenate path, same data as `hist2d.fut`), `tests/hist_oob.fut`
+(out-of-bounds, new coverage), and `tests/hist_tuple.fut` (tuple operator,
+expected `Undefined()`).
+
+**Verified**: `tests/hist_static.fut`, `tests/hist2d_static.fut`, and
+`tests/hist_oob.fut` all pass with correct numeric output (cross-checked
+against Futhark's own reference interpreter for the exact same inputs,
+not just "the backend didn't crash"); `tests/hist_tuple.fut` correctly
+hits `Undefined(): SegHist: tuple operator`. Inspected the compiled
+`hist2d_static.fut` output directly and confirmed it matches the expected
+op shape exactly (`reshape`+`concatenate` into `tensor<4x2xi64>`,
+`inserted_window_dims = [0, 1]`, `scatter_dims_to_operand_dims = [0, 1]`,
+`index_vector_dim = 1`). 28 passed / 26 failed overall (up from 24/26 at
+the end of Phase 6 -- the 4 new tests passing, the 3 pre-existing dynamic-
+shape hist tests unaffected either way).
 
 ## Phase 8 (lower priority) — non-commutative segred/segscan, solved (not started)
 If XLA's GPU reduce actually assumes commutativity incorrectly (a hypothesis

@@ -1582,11 +1582,114 @@ struct FutharkCompiler {
     return op->getResults();
   }
 
-  // TODO(StableHLO rewrite, Phase 7): was IREE's iree_linalg_ext.scatter.
-  // Needs a stablehlo.scatter-based lowering (see prompt.md's SegHist
-  // mapping): operand = dest, scatter_indices = indices, updates = values,
-  // update_computation = the HistOp's combining lambda.
-  Values LowerSegHist(const SegHist &, Ctx &) { Undefined("SegHist"); }
+  // SegHist (Futhark's `hist`/`reduce_by_index`) via stablehlo.scatter.
+  // Validated against a JAX reference lowering first (jax.jit(lambda idx,
+  // vals: jnp.zeros((4,), jnp.int32).at[idx].add(vals)).lower(...)
+  // .as_text()): a pure scalar scatter (no update window at all) uses
+  // inserted_window_dims = scatter_dims_to_operand_dims = [0..R-1] (R =
+  // destination rank), index_vector_dim = 1 (the indices tensor is always
+  // rank-2 [n, R], regardless of R), unique_indices = false,
+  // indices_are_sorted = false. Per the spec's `scatter` semantics
+  // ("Otherwise updated_results = results"), out-of-bounds scatter indices
+  // are silently dropped -- matching Futhark's own hist semantics, not
+  // guessed.
+  Values LowerSegHist(const SegHist &pSegHist, Ctx &ctx) {
+    RequireThreadLevel(pSegHist.lvl);
+
+    if (pSegHist.ops.size() != 1)
+      Undefined("SegHist: multiple operators");
+    const HistOp &histOp = pSegHist.ops[0];
+    // opShape (a per-element width for a vector-valued operator, distinct
+    // from neutral.size()'s tuple-operator check below) and tuple
+    // operators are both deferred -- same "defer solving" scope the brief
+    // gives this phase.
+    if (!histOp.opShape.empty())
+      Undefined("SegHist: vector-valued operator");
+    if (histOp.neutral.size() != 1)
+      Undefined("SegHist: tuple operator");
+
+    IterationSpace iterSpace = LowerSegSpace(pSegHist.space, ctx);
+    if (std::ssize(iterSpace) != 1)
+      Undefined("SegHist: multi-dimensional iteration space");
+
+    // One full-[n] array per KernelResult, same helper LowerSegRed/
+    // LowerSegScan reuse for their own per-element part: the first
+    // histOp.shape.dims.size() results are the index components (one per
+    // destination dimension), the last one is the value being scattered in
+    // (neutral.size() == 1, checked above).
+    Values mapped = LowerSegMap(pSegHist.lvl, pSegHist.space, pSegHist.body,
+                                pSegHist.ret, ctx);
+
+    int64_t indexRank = (int64_t)histOp.shape.dims.size();
+    if (indexRank == 0)
+      Undefined("SegHist: rank 0");
+    if ((int64_t)mapped.size() != indexRank + 1)
+      Undefined("SegHist: unexpected kernel body result count");
+
+    Values indexComponents(mapped.begin(), mapped.begin() + indexRank);
+    mlir::Value updateValue = mapped[indexRank];
+    int64_t n = getRankedType(updateValue.getType()).getShape()[0];
+    mlir::Type idxElemTy =
+        getRankedType(indexComponents[0].getType()).getElementType();
+
+    // Stack the per-dimension index components into one [n, R] indices
+    // tensor -- scatter wants a single tensor with index_vector_dim
+    // selecting the per-update index vector, not R separate 1-D arrays.
+    Values reshaped;
+    for (mlir::Value idx : indexComponents)
+      reshaped.push_back(mlir::stablehlo::ReshapeOp::create(
+          builder, mlir::RankedTensorType::get({n, 1}, idxElemTy), idx));
+    mlir::Value scatterIndices =
+        indexRank == 1
+            ? reshaped[0]
+            : mlir::stablehlo::ConcatenateOp::create(
+                  builder, mlir::ValueRange(reshaped), (uint64_t)1);
+
+    // The destination array is a separate, already-lowered statement
+    // (Futhark materializes it as its own `replicate`/zero-fill before the
+    // seghist runs) -- not something this function constructs itself.
+    mlir::Value dest = ctx.subexps.lookup(histOp.dest[0].name);
+
+    mlir::SmallVector<int64_t> insertedWindowDims, scatterDimsToOperandDims;
+    for (int64_t i = 0; i < indexRank; ++i) {
+      insertedWindowDims.push_back(i);
+      scatterDimsToOperandDims.push_back(i);
+    }
+    auto scatterDims = mlir::stablehlo::ScatterDimensionNumbersAttr::get(
+        &context, /*updateWindowDims=*/{}, insertedWindowDims,
+        /*inputBatchingDims=*/{}, /*scatterIndicesBatchingDims=*/{},
+        scatterDimsToOperandDims, /*indexVectorDim=*/1);
+
+    auto op = mlir::stablehlo::ScatterOp::create(
+        builder, mlir::TypeRange{dest.getType()}, mlir::ValueRange{dest},
+        scatterIndices, mlir::ValueRange{updateValue}, scatterDims,
+        /*indices_are_sorted=*/false, /*unique_indices=*/false);
+
+    mlir::Type elemTy = getRankedType(dest.getType()).getElementType();
+    mlir::SmallVector<mlir::Type> argTys = {
+        mlir::RankedTensorType::get({}, elemTy),
+        mlir::RankedTensorType::get({}, elemTy)};
+    mlir::SmallVector<mlir::Location> locs(2, builder.getLoc());
+    {
+      mlir::OpBuilder::InsertionGuard guard(builder);
+      mlir::Block *blk = builder.createBlock(&op.getUpdateComputation(), {},
+                                             argTys, locs);
+      builder.setInsertionPointToStart(blk);
+
+      // Per the spec, update_computation(results[result_index],
+      // updates_converted) -- old/accumulated value first, new value
+      // second -- exactly Futhark's own HistOp.lambda.params convention
+      // (accumulator first, new value second), so no transpose is needed
+      // here, unlike the reduce_window/chlo.scan paths.
+      Ctx local = ctx;
+      local.subexps.insert(histOp.lambda.params[0].name, blk->getArgument(0));
+      local.subexps.insert(histOp.lambda.params[1].name, blk->getArgument(1));
+      Values results = LowerBody(histOp.lambda.body, local);
+      mlir::stablehlo::ReturnOp::create(builder, mlir::ValueRange{results[0]});
+    }
+
+    return Values(op->getResults().begin(), op->getResults().end());
+  }
 
   // TODO(StableHLO rewrite, Phase 5/6): was IREE's iree_linalg_ext.scan (with
   // a vector<Nxi64>-lane packing trick for tuple carries, worked around an
