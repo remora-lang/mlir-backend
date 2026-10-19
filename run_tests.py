@@ -212,7 +212,8 @@ def _is_undefined_test(path):
 def _compile(path):
     """Compile `path` via the `compile` Nix wrapper, returning the emitted
     StableHLO module text, or raising Unsupported on failure."""
-    proc = subprocess.run(["compile", path], capture_output=True, text=True)
+    proc = subprocess.run(["compile", path, "--ragged-dot-cpu-fallback"],
+                          capture_output=True, text=True)
     if proc.returncode != 0:
         tail = proc.stderr.strip().splitlines()[-5:]
         raise Unsupported("compile failed:\n    " + "\n    ".join(tail))

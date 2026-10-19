@@ -1,6 +1,7 @@
 #pragma once
 // Represents the state of a Futhark function
 #include "blackbox.hpp"
+#include "cpu_dev_fallbacks.hpp"
 #include "debug.hpp"
 #include "ir/core.hpp"
 #include "ir/segop.hpp"
@@ -93,6 +94,23 @@ struct AffineRead {
   mlir::AffineMap indexMap;
 };
 
+// A gather: an index read (`arr[i0, i1, ...]`) where at least one `i_k` is
+// not an iteration-space id directly, but the bound result of an earlier
+// AffineRead in the same kernel body (e.g. `tokens[perm[gtid], gtid2]`,
+// where `perm[gtid]` is itself a plain AffineRead). `AffineRead`'s
+// `mlir::AffineMap` can't represent this (the index isn't a static affine
+// function of the iteration ids), so it gets its own, simpler
+// representation: one name per index dimension, each either an iteration
+// id or an earlier AffineRead's result -- both are already bound inside
+// the stablehlo.map region's block args by the time a gather is lowered,
+// so no new kind of block-arg binding is needed for the *index* side, only
+// for the array being gathered from (see LowerSegMap).
+struct GatherRead {
+  VName result;
+  VName array;
+  std::vector<VName> indexNames;
+};
+
 inline int64_t toShapeType(SubExp dim) {
   return match(
       dim,
@@ -151,6 +169,16 @@ struct FutharkCompiler {
     auto attr = hlo::PrecisionAttr::get(&context, precision);
     return builder.getArrayAttr({attr, attr});
   }
+
+  // Set from the command line (mlir-backend's --ragged-dot-cpu-fallback
+  // flag) before lowering starts. Default false (the real, performance-
+  // relevant chlo.RaggedDotOp path, used by LowerRaggedDot below); only
+  // run_tests.py's test runner ever sets this true, since chlo.RaggedDotOp
+  // has no XLA:CPU ThunkEmitter implementation for the shapes this
+  // backend needs it for, and test execution only ever happens on CPU in
+  // this environment. See cpu_dev_fallbacks.hpp -- never let this
+  // influence anything beyond LowerRaggedDot's one dispatch point.
+  bool raggedDotCpuFallback = false;
 
   FutharkCompiler(Prog &prog, mlir::MLIRContext &context,
                   mlir::ImplicitLocOpBuilder &builder)
@@ -452,11 +480,184 @@ struct FutharkCompiler {
     return {value, index};
   }
 
-  // TODO(StableHLO rewrite): with_acc scattering used to go through IREE's
-  // iree_linalg_ext.scatter (both the array/row-scatter and scalar paths).
-  // That dialect is gone now; this needs a stablehlo.scatter-based lowering,
-  // landing alongside SegHist's (see LowerSegHist below).
-  Values LowerWithAcc(const ExpWithAcc &, Ctx &) { Undefined("with_acc"); }
+  // with_acc-based scatter (Futhark's `scatter`/`reduce_by_index`-via-acc
+  // sugar) via stablehlo.scatter, reusing LowerSegHist's dimension-numbers
+  // convention generalized with update_window_dims for a whole-row/window
+  // update (LowerSegHist's own scatter is the windowRank==0 special case
+  // of the same formula). Handles exactly the shape this backend has a
+  // concrete need for: a single accumulator, no combining lambda (a plain
+  // overwrite -- Futhark's own `pWithAccOp()` is absent for this,
+  // confirmed against the GPU IR), one index per update, and an update
+  // value that is either a scalar or a full window/row of the
+  // destination's trailing dimensions.
+  //
+  // The index and value must each be, inside the inner segmap, a
+  // *trivial* identity read (an unmodified array lookup spanning the
+  // whole iteration space) -- not a genuinely per-element *computed*
+  // value. stablehlo.map's region can't produce an array-valued result
+  // per grid point (LowerSegOpBaseType's array branch is already
+  // Undefined()), and LowerSegMap itself refuses any acc-typed result, so
+  // there is no existing machinery to lower a real per-element computation
+  // here; this only works because the identity-read case needs none --
+  // the "updates" tensor scatter wants is just the already-lowered source
+  // array, unchanged. A genuinely computed with_acc value is a separate,
+  // unimplemented capability (array-valued SegMap results), gated below
+  // rather than guessed at.
+  Values LowerWithAcc(const ExpWithAcc &e, Ctx &ctx) {
+    if (e.inputs.size() != 1)
+      Undefined("with_acc: multiple inputs");
+    const WithAccInput &input = e.inputs[0];
+    if (input.op.has_value())
+      Undefined("with_acc: combining lambda");
+    if (input.arrays.size() != 1)
+      Undefined("with_acc: multiple accumulator arrays");
+    if (input.ispace.dims.size() != 1)
+      Undefined("with_acc: ispace rank != 1");
+
+    mlir::Value dest = ctx.subexps.lookup(input.arrays[0].name);
+
+    // The with_acc lambda's body is just `let {acc_result} = segmap(...)
+    // {...} in {acc_result}` for every case this backend has seen.
+    const SegMap *pSegMap = nullptr;
+    for (const Stm &stm : e.lambda->body.stms) {
+      auto *hostOp = std::get_if<ExpHostOp>(&stm.exp.v);
+      if (!hostOp)
+        continue;
+      auto *segOpPtr = std::get_if<std::shared_ptr<SegOp>>(&hostOp->op.v);
+      if (!segOpPtr)
+        continue;
+      auto *segMap = std::get_if<SegMap>(&(*segOpPtr)->v);
+      if (!segMap)
+        continue;
+      if (pSegMap)
+        Undefined("with_acc: multiple segmaps");
+      pSegMap = segMap;
+    }
+    if (!pSegMap)
+      Undefined("with_acc: no segmap found");
+    RequireThreadLevel(pSegMap->lvl);
+
+    IterationSpace iterSpace = LowerSegSpace(pSegMap->space, ctx);
+    if (iterSpace.size() != 1)
+      Undefined("with_acc: segmap rank != 1");
+
+    const BasicOpUpdateAcc *pUpdate = nullptr;
+    for (const Stm &stm : pSegMap->body.stms) {
+      auto *basicOp = std::get_if<ExpBasicOp>(&stm.exp.v);
+      if (!basicOp)
+        continue;
+      auto *update = std::get_if<BasicOpUpdateAcc>(&basicOp->op.v);
+      if (!update)
+        continue;
+      if (pUpdate)
+        Undefined("with_acc: multiple update_acc calls");
+      pUpdate = update;
+    }
+    if (!pUpdate || pUpdate->indices.size() != 1 ||
+        pUpdate->values.size() != 1)
+      Undefined("with_acc: expected exactly one update_acc(index, value)");
+
+    auto findDefiningExp = [&](const SubExp &sub) -> const Exp * {
+      auto *var = std::get_if<VarSubExp>(&sub.v);
+      if (!var)
+        return nullptr;
+      for (const Stm &stm : pSegMap->body.stms)
+        if (stm.pat.elems.size() == 1 &&
+            stm.pat.elems[0].name.name == var->v.name)
+          return &stm.exp;
+      return nullptr;
+    };
+
+    // Index: must be a plain identity affine read over the whole (1-D)
+    // iteration space -- i.e. the array itself, unchanged.
+    const Exp *idxExp = findDefiningExp(pUpdate->indices[0]);
+    if (!idxExp)
+      Undefined("with_acc: index is not a plain array read");
+    auto idxRead = toAffineRead(VName{}, *idxExp, iterSpace);
+    if (!idxRead || idxRead->indexMap.getNumResults() != 1 ||
+        mlir::cast<mlir::AffineDimExpr>(idxRead->indexMap.getResult(0))
+                .getPosition() != 0)
+      Undefined("with_acc: index is not a plain identity read of the "
+                "whole iteration space");
+    mlir::Value indices = ctx.subexps.lookup(idxRead->array.name);
+    auto indicesTy = getRankedType(indices.getType());
+    if (indicesTy.getRank() != 1)
+      Undefined("with_acc: index array must already match the iteration "
+                "space");
+
+    // Value: must be either the same kind of identity affine read (a
+    // scalar update), or a trivial full-row/window slice (DimFix on the
+    // sole iteration id, DimSlice covering each remaining dimension's
+    // entire extent from 0 with unit stride) -- i.e. the array itself,
+    // unchanged.
+    const Exp *valExp = findDefiningExp(pUpdate->values[0]);
+    auto *valBasicOp = valExp ? std::get_if<ExpBasicOp>(&valExp->v) : nullptr;
+    auto *valIdx =
+        valBasicOp ? std::get_if<BasicOpIndex>(&valBasicOp->op.v) : nullptr;
+    if (!valIdx)
+      Undefined("with_acc: value is not a plain array read");
+    mlir::Value updates = ctx.subexps.lookup(valIdx->vName.name);
+    auto updatesTy = getRankedType(updates.getType());
+    if ((int64_t)valIdx->slice.dims.size() != updatesTy.getRank())
+      Undefined("with_acc: value is not a trivial full-window read");
+    for (int64_t d = 0; d < updatesTy.getRank(); ++d) {
+      const auto &dim = valIdx->slice.dims[d];
+      if (d == 0) {
+        auto *fix = std::get_if<DimFix<SubExp>>(&dim.v);
+        auto *var = fix ? std::get_if<VarSubExp>(&fix->i.v) : nullptr;
+        if (!var || var->v.name != iterSpace[0].id)
+          Undefined("with_acc: value is not a trivial full-window read");
+      } else {
+        auto *slice = std::get_if<DimSlice<SubExp>>(&dim.v);
+        auto *start =
+            slice ? std::get_if<ConstantSubExp>(&slice->start.v) : nullptr;
+        auto *stride =
+            slice ? std::get_if<ConstantSubExp>(&slice->stride.v) : nullptr;
+        if (!start || start->GetIntValue() != 0 || !stride ||
+            stride->GetIntValue() != 1 ||
+            toShapeType(slice->length) != updatesTy.getShape()[d])
+          Undefined("with_acc: value is not a trivial full-window read");
+      }
+    }
+
+    int64_t windowRank = updatesTy.getRank() - 1;
+    mlir::SmallVector<int64_t> updateWindowDims;
+    for (int64_t i = 0; i < windowRank; ++i)
+      updateWindowDims.push_back(1 + i);
+
+    mlir::Value scatterIndices = hlo::ReshapeOp::create(
+        builder,
+        mlir::RankedTensorType::get({indicesTy.getShape()[0], 1},
+                                    indicesTy.getElementType()),
+        indices);
+
+    auto scatterDims = hlo::ScatterDimensionNumbersAttr::get(
+        &context, updateWindowDims, /*insertedWindowDims=*/{0},
+        /*operandBatchingDims=*/{}, /*scatterIndicesBatchingDims=*/{},
+        /*scatterDimsToOperandDims=*/{0}, /*indexVectorDim=*/1);
+
+    auto op = hlo::ScatterOp::create(
+        builder, mlir::TypeRange{dest.getType()}, mlir::ValueRange{dest},
+        scatterIndices, mlir::ValueRange{updates}, scatterDims,
+        /*indices_are_sorted=*/false, /*unique_indices=*/false);
+
+    mlir::Type elemTy = getRankedType(dest.getType()).getElementType();
+    mlir::SmallVector<mlir::Type> argTys = {
+        mlir::RankedTensorType::get({}, elemTy),
+        mlir::RankedTensorType::get({}, elemTy)};
+    mlir::SmallVector<mlir::Location> locs(2, builder.getLoc());
+    {
+      mlir::OpBuilder::InsertionGuard guard(builder);
+      mlir::Block *blk = builder.createBlock(&op.getUpdateComputation(), {},
+                                             argTys, locs);
+      builder.setInsertionPointToStart(blk);
+      // Plain overwrite -- no combining lambda (input.op is nullopt), so
+      // just return the new value, discarding the old one.
+      hlo::ReturnOp::create(builder, mlir::ValueRange{blk->getArgument(1)});
+    }
+
+    return Values(op->getResults().begin(), op->getResults().end());
+  }
 
   Values LowerDotGeneral(mlir::ValueRange args, mlir::TypeRange retTypes,
                          Ctx &ctx) {
@@ -625,6 +826,25 @@ struct FutharkCompiler {
           !llvm::is_contained(rhsContractingDimensions, d.index()) &&
           !llvm::is_contained(rhsGroupDimensions, d.index()))
         resultShape.push_back(rhsShape[d.index()]);
+
+    // See cpu_dev_fallbacks.hpp: GPU/TPU performance drives this path, so
+    // it stays chlo.RaggedDotOp unconditionally by default. The dense-
+    // decomposition fallback is a separate, explicitly opt-in accommodation
+    // for CPU dev testing only (XLA:CPU's ThunkEmitter doesn't implement
+    // the `ragged-dot` HLO opcode this lowers to), never the default. Only
+    // take it for shapes it actually supports -- shapes like mode 3's
+    // (ragged dim == batch dim) already execute fine on XLA:CPU via
+    // chlo.RaggedDotOp directly and must keep using that path unchanged.
+    if (raggedDotCpuFallback &&
+        cpu_dev_fallbacks::IsRaggedDotCpuFallbackSupported(
+            lhs, rhs, lhsBatchingDimensions, lhsContractingDimensions,
+            lhsRaggedDim, rhsGroupDimensions)) {
+      mlir::Value result = cpu_dev_fallbacks::LowerRaggedDotCpuFallback(
+          builder, context, lhs, rhs, groupSizes, lhsBatchingDimensions,
+          lhsContractingDimensions, lhsRaggedDim, rhsGroupDimensions,
+          resultShape);
+      return {result};
+    }
 
     auto op = mlir::chlo::RaggedDotOp::create(
         builder,
@@ -1053,71 +1273,52 @@ struct FutharkCompiler {
   // index) fast path right below *is* exercised -- e.g. unwrapping a
   // segred's rank-1 result down to a scalar after reducing a flat,
   // unsegmented array goes through here -- and is already stablehlo-only.
+  // stablehlo.dynamic_slice handles constant and dynamic start indices
+  // uniformly (its start_indices are themselves 0-d tensors already, no
+  // index-cast/unwrapping needed), for every dimension at once -- a fixed
+  // index is just a 1-sized slice along that dimension. It can't
+  // rank-reduce on its own (every dimension survives in the result, fixed
+  // ones as size-1), so a trailing stablehlo.reshape drops the fixed
+  // dimensions to get the actual (lower-rank) result shape. Only a unit
+  // stride is supported: dynamic_slice has no stride concept at all, and
+  // no currently-reachable use needs one (Futhark's own `a[s:e:k]` syntax
+  // allows non-unit/negative k, but every slice this backend has actually
+  // seen so far -- e.g. moe_black_box.fut's `tokens[i, :]` -- is a plain
+  // unit-stride range).
   mlir::Value LowerIndex(const BasicOpIndex &index, Ctx &ctx) {
     auto tensor = LowerSubExp(index.vName.name, ctx);
+    auto tensorTy = getRankedType(tensor.getType());
 
-    auto isSlice = [](const DimIndex<SubExp> &d) {
-      return std::holds_alternative<DimSlice<SubExp>>(d.v);
-    };
-    if (!llvm::any_of(index.slice.dims, isSlice)) {
-      // stablehlo.dynamic_slice handles constant and dynamic indices
-      // uniformly (its start_indices are themselves 0-d tensors already, no
-      // unwrapping needed), then stablehlo.reshape drops the resulting
-      // all-ones shape down to a 0-d scalar.
-      Values startIndices;
-      for (const auto &dim : index.slice.dims)
-        startIndices.push_back(
-            LowerSubExp(std::get<DimFix<SubExp>>(dim.v).i, ctx));
-      auto tensorTy = getRankedType(tensor.getType());
-      mlir::SmallVector<int64_t> sliceSizes(tensorTy.getRank(), 1);
-      auto sliceTy =
-          mlir::RankedTensorType::get(sliceSizes, tensorTy.getElementType());
-      auto slice = hlo::DynamicSliceOp::create(
-          builder, sliceTy, tensor, startIndices, sliceSizes);
-      return hlo::ReshapeOp::create(
-          builder,
-          mlir::RankedTensorType::get({}, tensorTy.getElementType()),
-          slice);
-    }
-
-    // Constants stay attributes so that they remain visible in the shape of
-    // the extracted slice.
-    auto toIndex = [&](const SubExp &e) -> mlir::OpFoldResult {
-      if (auto *c = std::get_if<ConstantSubExp>(&e.v))
-        return builder.getIndexAttr(c->GetIntValue());
-      auto bare = mlir::tensor::ExtractOp::create(
-          builder, LowerSubExp(e, ctx), mlir::ValueRange{});
-      return mlir::OpFoldResult(mlir::arith::IndexCastOp::create(
-          builder, builder.getIndexType(), bare));
-    };
-
-    mlir::SmallVector<mlir::OpFoldResult> offsets, sizes, strides;
+    Values startIndices;
+    mlir::SmallVector<int64_t> sliceSizes;
     std::vector<int64_t> resultShape;
     for (const auto &dim : index.slice.dims) {
       match(
           dim,
           [&](const DimFix<SubExp> &fix) {
-            offsets.push_back(toIndex(fix.i));
-            sizes.push_back(builder.getIndexAttr(1));
-            strides.push_back(builder.getIndexAttr(1));
+            startIndices.push_back(LowerSubExp(fix.i, ctx));
+            sliceSizes.push_back(1);
           },
           [&](const DimSlice<SubExp> &s) {
-            offsets.push_back(toIndex(s.start));
-            sizes.push_back(toIndex(s.length));
-            // tensor.extract_slice cannot step backwards, so a stride we
-            // cannot see to be positive -- a reversal, say -- is out of reach.
             auto *stride = std::get_if<ConstantSubExp>(&s.stride.v);
-            if (!stride || stride->GetIntValue() < 1)
-              Undefined();
-            strides.push_back(builder.getIndexAttr(stride->GetIntValue()));
-            resultShape.push_back(toShapeType(s.length));
+            if (!stride || stride->GetIntValue() != 1)
+              Undefined("index: non-unit slice stride");
+            startIndices.push_back(LowerSubExp(s.start, ctx));
+            int64_t len = toShapeType(s.length);
+            sliceSizes.push_back(len);
+            resultShape.push_back(len);
           });
     }
 
-    auto resultTy = mlir::RankedTensorType::get(
-        resultShape, getRankedType(tensor.getType()).getElementType());
-    return mlir::tensor::ExtractSliceOp::create(
-        builder, resultTy, tensor, offsets, sizes, strides);
+    auto sliceTy =
+        mlir::RankedTensorType::get(sliceSizes, tensorTy.getElementType());
+    auto slice = hlo::DynamicSliceOp::create(builder, sliceTy, tensor,
+                                             startIndices, sliceSizes);
+    if (resultShape.size() == sliceSizes.size())
+      return slice;
+    auto resultTy =
+        mlir::RankedTensorType::get(resultShape, tensorTy.getElementType());
+    return hlo::ReshapeOp::create(builder, resultTy, slice);
   }
 
   mlir::Value LowerBasicOp(const BasicOp &basicOp, Ctx &ctx) {
@@ -1143,9 +1344,8 @@ struct FutharkCompiler {
 
           // `val.total` is the size of the concatenated dimension, which the
           // result type already carries.
-          auto concat =
-              mlir::tensor::ConcatOp::create(builder, val.dim, operands);
-          return concat->getResult(0);
+          return hlo::ConcatenateOp::create(builder, operands,
+                                            (uint64_t)val.dim);
         },
         [&](const BasicOpIndex &val) -> mlir::Value {
           return LowerIndex(val, ctx);
@@ -1233,20 +1433,24 @@ struct FutharkCompiler {
               builder, resultTy, op, broadcastDims);
         },
         [&](const BasicOpScratch &val) -> mlir::Value {
+          // `scratch` promises an uninitialized buffer about to be fully
+          // overwritten; StableHLO has no uninitialized-tensor concept (and
+          // no dynamically-shaped constant), so this backend represents it
+          // as a static, zero-filled stablehlo.constant instead -- behaves
+          // identically to uninitialized memory for any caller that
+          // actually honors the "fully overwritten" contract. Every
+          // currently-reachable use is static (this backend's static-
+          // shapes-only design means a dynamic scratch would already have
+          // tripped the dynamic-shaped function parameter/result gate
+          // further up the call chain).
           auto baseTy = LowerPrimType(val.type);
           auto shapeTy = toShapeType(val.dims);
-          Values dynamicSizes;
-          for (auto [d, t] : llvm::zip_equal(val.dims, shapeTy)) {
-            if (mlir::ShapedType::isDynamic(t)) {
-              auto v = LowerSubExp(d, ctx);
-              dynamicSizes.push_back(mlir::arith::IndexCastOp::create(
-                  builder, builder.getIndexType(), v));
-            }
-          }
-          return mlir::tensor::EmptyOp::create(
+          if (llvm::any_of(shapeTy, mlir::ShapedType::isDynamic))
+            Undefined("scratch: dynamic shape");
+          auto tensorTy = mlir::RankedTensorType::get(shapeTy, baseTy);
+          return hlo::ConstantOp::create(
               builder,
-              mlir::RankedTensorType::get(shapeTy, baseTy),
-              dynamicSizes);
+              mlir::DenseElementsAttr::get(tensorTy, builder.getZeroAttr(baseTy)));
         },
         [&](const BasicOpCmpOp &val) -> mlir::Value {
           auto lhs = LowerSubExp(val.op0, ctx);
@@ -1349,9 +1553,7 @@ struct FutharkCompiler {
             // The body's type is the inner (scalar) type; the gpu op lifts each
             // result into a size-1 array.
             auto lifted = mlir::RankedTensorType::get({1}, LowerTy(ty));
-            results.push_back(mlir::tensor::FromElementsOp::create(
-                                  builder, lifted, mlir::ValueRange{v})
-                                  .getResult());
+            results.push_back(hlo::ReshapeOp::create(builder, lifted, v));
           }
           return results;
         });
@@ -1449,6 +1651,8 @@ struct FutharkCompiler {
 
     std::vector<AffineRead> affine_reads =
         FindSegOpAffineReads(iterSpace, body);
+    std::vector<GatherRead> gather_reads =
+        FindSegOpGatherReads(iterSpace, affine_reads, body);
 
     // stablehlo.map has no per-operand indexing map the way linalg.generic
     // does -- every operand must already be the full iteration-space shape
@@ -1486,6 +1690,98 @@ struct FutharkCompiler {
       operands.push_back(hlo::IotaOp::create(
           builder, iotaTy, builder.getI64IntegerAttr(d.index)));
     }
+
+    // Gather reads: a stablehlo.map region only ever exposes each operand's
+    // *current-position scalar* to its block args (per-element, like every
+    // other operand) -- there's no way to get a whole array inside the
+    // region to dynamic_slice from at a computed index, isolated-from-above
+    // or not. So each gather is instead computed once, as a standalone
+    // stablehlo.gather *outside* the map entirely, producing a full
+    // shapeTy-shaped array; from there it's just another already-
+    // materialized full-shape array, threaded into the map exactly like an
+    // affine-read array (see the operands loop above -- this reuses that
+    // same per-element binding, not a new mechanism).
+    //
+    // Deliberately NOT a general "lower every segmap read via gather"
+    // strategy: checked empirically (compiled a trivial identity gather --
+    // gather-by-iota, equivalent to a plain affine read -- through XLA's
+    // actual optimizer) that XLA does not eliminate a gather even when
+    // it's this trivial; it fuses it into a loop kernel but still performs
+    // a real indexed-memory-access gather at runtime, strictly more
+    // expensive than the broadcast_in_dim the affine-read path already
+    // emits for that case. Reserving stablehlo.gather for genuinely
+    // indirect/dynamic-index reads (the only thing it's needed for) keeps
+    // the common case cheap.
+    //
+    // Scoped to the one shape this backend has a concrete need for: a
+    // single gathered dimension, at iteration dim 0, with the remaining
+    // ("kept") dimensions following it in order -- so the gather's natural
+    // output order (batch dim(s) first, then window/kept dims) already
+    // equals shapeTy directly, with no transpose needed. Bails rather than
+    // guessing at anything more general (multiple gathered dimensions, a
+    // gathered index varying over more than one iteration dim, kept/
+    // gathered dims interleaved differently than shapeTy's own order).
+    std::unordered_map<std::string, mlir::Value> gatherResults;
+    for (auto &g : gather_reads) {
+      if (gatherResults.contains(g.result.name))
+        continue;
+      mlir::Value arr = ctx.subexps.lookup(g.array.name);
+      auto arrTy = getRankedType(arr.getType());
+      int64_t arrRank = arrTy.getRank();
+
+      mlir::SmallVector<int64_t> keptOperandDims;
+      int64_t gatherOperandDim = -1;
+      const AffineRead *gatherSrc = nullptr;
+      for (int64_t d = 0; d < arrRank; ++d) {
+        const std::string &name = g.indexNames[d].name;
+        auto iterIt = std::ranges::find(iterSpace, name, &Dim::id);
+        if (iterIt != iterSpace.end()) {
+          if (iterIt->index != (int64_t)keptOperandDims.size() + 1)
+            Undefined("SegMap: kept dimensions must follow the gathered "
+                      "one in order");
+          keptOperandDims.push_back(d);
+          continue;
+        }
+        auto readIt = std::ranges::find_if(
+            affine_reads,
+            [&](const AffineRead &r) { return r.result.name == name; });
+        if (readIt == affine_reads.end() || gatherOperandDim != -1)
+          Undefined("SegMap: gather with more than one gathered dimension");
+        gatherOperandDim = d;
+        gatherSrc = &*readIt;
+      }
+      if (gatherOperandDim == -1 || gatherSrc->indexMap.getNumResults() != 1 ||
+          mlir::cast<mlir::AffineDimExpr>(gatherSrc->indexMap.getResult(0))
+                  .getPosition() != 0)
+        Undefined("SegMap: gather dimension must be iteration dim 0");
+
+      mlir::Value idxArr = ctx.subexps.lookup(gatherSrc->array.name);
+      int64_t n = shapeTy[0];
+      if (getRankedType(idxArr.getType()).getShape() !=
+          llvm::ArrayRef<int64_t>({n}))
+        Undefined("SegMap: gather index array shape must match the "
+                  "gathered dimension");
+      auto idxElemTy = getRankedType(idxArr.getType()).getElementType();
+      mlir::Value startIndices = hlo::ReshapeOp::create(
+          builder, mlir::RankedTensorType::get({n, 1}, idxElemTy), idxArr);
+
+      mlir::SmallVector<int64_t> offsetDims;
+      mlir::SmallVector<int64_t> sliceSizes(arrRank, 1);
+      for (size_t i = 0; i < keptOperandDims.size(); ++i) {
+        offsetDims.push_back((int64_t)i + 1);
+        sliceSizes[keptOperandDims[i]] = arrTy.getShape()[keptOperandDims[i]];
+      }
+      auto gatherDims = hlo::GatherDimensionNumbersAttr::get(
+          &context, offsetDims, /*collapsedSliceDims=*/{gatherOperandDim},
+          /*operandBatchingDims=*/{}, /*startIndicesBatchingDims=*/{},
+          /*startIndexMap=*/{gatherOperandDim}, /*indexVectorDim=*/1);
+      auto resultTy = mlir::RankedTensorType::get(shapeTy, arrTy.getElementType());
+      gatherResults[g.result.name] = hlo::GatherOp::create(
+          builder, resultTy, arr, startIndices, gatherDims, sliceSizes,
+          /*indicesAreSorted=*/false);
+    }
+    for (auto &g : gather_reads)
+      operands.push_back(gatherResults.at(g.result.name));
 
     mlir::SmallVector<mlir::Type> elemTypes;
     for (const Type &resultType : ret) {
@@ -1536,12 +1832,23 @@ struct FutharkCompiler {
                  affine_reads, blockArgs.take_front(affine_reads.size())))
           local.subexps.insert(read.result.name, arg);
         for (auto [d, arg] : llvm::zip_equal(
-                 iterSpace, blockArgs.drop_front(affine_reads.size())))
+                 iterSpace, blockArgs.drop_front(affine_reads.size())
+                                .take_front(iterSpace.size())))
           local.subexps.insert(d.id, arg);
+        // Gather reads are appended last (see the operands loop above);
+        // each is already a materialized full-shape array by this point,
+        // so its block arg is bound the exact same way an affine-read
+        // array's is -- no per-element gather logic needed inside the
+        // region at all.
+        for (auto [g, arg] : llvm::zip_equal(
+                 gather_reads, blockArgs.take_back(gather_reads.size())))
+          local.subexps.insert(g.result.name, arg);
 
         std::unordered_set<std::string> skipLowering;
         for (auto &read : affine_reads)
           skipLowering.insert(read.result.name);
+        for (auto &g : gather_reads)
+          skipLowering.insert(g.result.name);
         for (const Stm &stm : body.stms) {
           assert(stm.pat.elems.size() == 1);
           if (skipLowering.contains(stm.pat.elems[0].name.name))
@@ -2250,6 +2557,67 @@ struct FutharkCompiler {
     return std::nullopt;
   }
 
+  // A gather: like toAffineRead, but each index dimension may instead be
+  // the bound name of an *already recognized* AffineRead (one level of
+  // indirection -- e.g. `tokens[perm[gtid], gtid2]`, with `perm[gtid]`
+  // itself an AffineRead), not just a bare iteration id. Statements
+  // `toAffineRead` already accepts are skipped here (they're handled by
+  // the plain affine-read path instead); a statement is only a GatherRead
+  // if at least one of its index dims is this indirect case. Deliberately
+  // not recursive -- a dimension naming another GatherRead's result isn't
+  // recognized -- since nothing currently needs more than one level.
+  std::vector<GatherRead>
+  FindSegOpGatherReads(const IterationSpace &iterSpace,
+                       const std::vector<AffineRead> &affineReads,
+                       const KernelBody &body) {
+    std::unordered_set<std::string> iterIds;
+    for (auto &d : iterSpace)
+      iterIds.insert(d.id);
+    std::unordered_set<std::string> affineResults;
+    for (auto &r : affineReads)
+      affineResults.insert(r.result.name);
+
+    std::vector<GatherRead> gathers;
+    for (const auto &stm : body.stms) {
+      if (stm.pat.elems.size() != 1)
+        Undefined();
+      auto vnBound = stm.pat.elems[0].name;
+      if (toAffineRead(vnBound, stm.exp, iterSpace))
+        continue;
+
+      auto *e = std::get_if<ExpBasicOp>(&stm.exp.v);
+      if (!e)
+        continue;
+      auto *idx = std::get_if<BasicOpIndex>(&e->op.v);
+      if (!idx)
+        continue;
+
+      std::vector<VName> indexNames;
+      bool ok = true;
+      bool anyIndirect = false;
+      for (const auto &dim : idx->slice.dims) {
+        auto *fix = std::get_if<DimFix<SubExp>>(&dim.v);
+        auto *var = fix ? std::get_if<VarSubExp>(&fix->i.v) : nullptr;
+        if (!var) {
+          ok = false;
+          break;
+        }
+        if (iterIds.contains(var->v.name)) {
+          indexNames.push_back(var->v);
+        } else if (affineResults.contains(var->v.name)) {
+          indexNames.push_back(var->v);
+          anyIndirect = true;
+        } else {
+          ok = false;
+          break;
+        }
+      }
+      if (ok && anyIndirect)
+        gathers.push_back(GatherRead{vnBound, idx->vName, std::move(indexNames)});
+    }
+    return gathers;
+  }
+
   mlir::Type LowerSegOpBaseType(const Type &pReturnType, Ctx &ctx) {
     return match(
         pReturnType.t,
@@ -2368,14 +2736,17 @@ struct FutharkCompiler {
           builder,
           mlir::DenseElementsAttr::get(getRankedType(tensorTy), attrs));
     } else {
-      // TODO(StableHLO rewrite): tensor.from_elements is banned by XLA; a
-      // non-constant array literal needs concatenate of reshaped (0-d -> 1-d)
-      // elements instead. Not exercised by any currently-passing test.
-      auto values = mlir::SmallVector<mlir::Value>();
+      // A non-constant array literal: concatenate each element, reshaped
+      // from its 0-d scalar type up to a 1-d [1] slice (tensor.from_elements
+      // isn't in XLA's dialect surface).
+      auto elemTy = getRankedType(tensorTy).getElementType();
+      auto sliceTy = mlir::RankedTensorType::get({1}, elemTy);
+      mlir::SmallVector<mlir::Value> slices;
       for (auto subExp : arrayLit.values) {
-        values.push_back(LowerSubExp(subExp, ctx));
+        mlir::Value v = LowerSubExp(subExp, ctx);
+        slices.push_back(hlo::ReshapeOp::create(builder, sliceTy, v));
       }
-      return mlir::tensor::FromElementsOp::create(builder, tensorTy, values);
+      return hlo::ConcatenateOp::create(builder, slices, (uint64_t)0);
     }
   }
 

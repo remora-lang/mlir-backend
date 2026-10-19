@@ -15,10 +15,13 @@ int main(int argc, char *argv[]) {
 
   std::filesystem::path inputPath = base / "tests" / fname;
   mlir::stablehlo::Precision precision = mlir::stablehlo::Precision::DEFAULT;
+  bool raggedDotCpuFallback = false;
 
   std::vector<std::string> args(argv + 1, argv + argc);
   for (size_t i = 0; i < args.size(); ++i) {
-    if (args[i] == "--precision") {
+    if (args[i] == "--ragged-dot-cpu-fallback") {
+      raggedDotCpuFallback = true;
+    } else if (args[i] == "--precision") {
       if (i + 1 >= args.size()) {
         std::cout << "--precision requires an argument (default|high|highest)"
                    << std::endl;
@@ -52,6 +55,7 @@ int main(int argc, char *argv[]) {
   mlir::ImplicitLocOpBuilder builder(mlir::UnknownLoc::get(&ctx), &ctx);
   FutharkCompiler compiler(prog, ctx, builder);
   compiler.precision = precision;
+  compiler.raggedDotCpuFallback = raggedDotCpuFallback;
   for (auto fun : prog.funs) {
     compiler.LowerFunction(fun);
   }

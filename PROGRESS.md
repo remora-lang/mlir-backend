@@ -1099,3 +1099,47 @@ writing the corresponding code.
   phase to scalar operators only, deferring all tuple operators to Phase 6.
   scan0.fut passes; scan_tuple.fut/scan_noncomm.fut (new) both correctly
   hit the same deferral gate. 24 passed / 26 failed overall.
+- 2026-10-19: `tests/static_shapes/moe_black_box.fut` (the dropless-MoE
+  test, the real target of this whole backend rewrite) now passes.
+  Preceded by a cleanup pass (dedup, stale-comment removal, TODOs for
+  backend-specific JAX lowerings) and a pass fixing the remaining live
+  (non-dead) tensor/arith/linalg code to pure StableHLO (`BasicOpScratch`,
+  `LowerIndex`'s slice path, `BasicOpConcat`, `LowerArrayLit`'s
+  non-constant path, `GPUBody`'s scalar lift) -- `LowerRaggedDotNonUniform`
+  stays marked dead code, untouched. Three sequential blockers found and
+  fixed, each hiding the next until the previous was resolved:
+  (1) `LowerSegMap` didn't recognize a gather-by-already-read-index
+  pattern (`tokens[perm[i],:]`) -- fixed by materializing such reads as a
+  standalone `stablehlo.gather` outside the map and threading its result
+  in as a normal full-shape operand (`stablehlo.map`'s block args are
+  always per-element scalars, so the gather can't happen inside the region
+  -- a real design mistake caught via an MLIR verifier error before it
+  reached test output). New `gather1d.fut`/`gather2d.fut`.
+  (2) `LowerWithAcc` was unimplemented -- added via `stablehlo.scatter`,
+  generalizing `LowerSegHist`'s dimension-numbers/update-computation
+  machinery to a nonzero window rank (whole-row writes, not just scalar).
+  New `withacc_row.fut` (also fixed the pre-existing `scatter.fut`).
+  (3) `chlo.ragged_dot` has no XLA:CPU ThunkEmitter for this test's shape
+  (confirmed via the real XLA error, not inferred) -- GPU/TPU performance
+  must drive `LowerRaggedDot`, so it keeps emitting `chlo.RaggedDotOp`
+  unconditionally; CPU-only test execution gets a separate, explicitly
+  opt-in dense-decomposition fallback (new file `cpu_dev_fallbacks.hpp`,
+  mirrored from JAX's own generic `ragged_dot_general_p` lowering rule,
+  checked via `jax.jit(f).lower(...).as_text()`), gated behind
+  `--ragged-dot-cpu-fallback` (only `run_tests.py` passes it) and further
+  gated per-call to only the one shape it actually implements (mode 1, no
+  batch dims) so shapes XLA:CPU already handles directly (mode 3) keep
+  using `chlo.RaggedDotOp` instead of being routed into the fallback
+  unconditionally whenever the flag is set.
+  Narrower than the originally-scoped plan: the fallback does not cover
+  `ragged_dot_mode1_batch.fut` (batch dims) or `ragged_dot_mode2.fut`
+  (ragged contracting dim) -- both still fail on the same XLA:CPU gap,
+  left for a future phase if a test needs them. `moe_black_box_t1.fut`
+  (a single-token specialization, pre-existing, documented in its own
+  file header as a known gap) also still fails, on a different
+  `LowerSegMap` limitation unrelated to this phase's fixes. 38 passed / 21
+  failed overall (up from 30/26 at the start of this phase). `futhark test
+  --backend=c tests` (Futhark's own reference C backend, unrelated to this
+  MLIR backend): 39/54 passed, proportionally unchanged from the earlier
+  36/51 baseline -- the new count comes from this phase's new test files,
+  not any regression in Futhark's own compiler.
