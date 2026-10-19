@@ -2,9 +2,14 @@
 """Compile and run a StableHLO module with the XLA bundled in JAX.
 
 Random inputs are generated from the signature of @main, so any module works.
+dot_general precision is a compile-time backend flag now (`mlir-backend
+--precision default|high|highest`, or `compile x.fut --precision ...`), not
+something this script rewrites after the fact -- pass --tol explicitly if
+the module was compiled with --precision highest and the default tolerance
+is too loose.
 
   python run.py main.mlir
-  python run.py main.mlir --precision default --iters 100 --flops 34359738368 --check
+  python run.py main.mlir --iters 100 --flops 34359738368 --check
 
 Install (CUDA):  pip install "jax[cuda13]"   (or jax[cuda12])
 """
@@ -61,13 +66,6 @@ def random_inputs(sig, seed):
     return out
 
 
-def set_precision(text, p):
-    """Replace/insert `precision = [P, P]` on every (pretty-printed) dot_general."""
-    text = re.sub(r",\s*precision\s*=\s*\[[^\]]*\]", "", text)
-    return re.subn(r"(contracting_dims\s*=\s*\[[^\]]*\]\s*x\s*\[[^\]]*\])",
-                   rf"\1, precision = [{p}, {p}]", text)
-
-
 def stats_ms(ts):
     t = np.asarray(ts) * 1e3
     return dict(min=t.min(), median=np.median(t), mean=t.mean(),
@@ -113,20 +111,14 @@ def main():
     ap.add_argument("--platform", default="gpu", help="gpu (CUDA or ROCm) or cpu (default: gpu)")
     ap.add_argument("--iters", type=int, default=50)
     ap.add_argument("--warmup", type=int, default=3)
-    ap.add_argument("--precision", choices=["default", "high", "highest"],
-                    help="rewrite dot_general precision (default: as written)")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--flops", type=float, help="FLOPs per run, to print GFLOP/s")
     ap.add_argument("--check", action="store_true", help="compare outputs against XLA:CPU")
-    ap.add_argument("--tol", type=float,
-                    help="check tolerance on max|out-ref|/max|ref| "
-                         "(default 1e-5 for --precision highest, else 2e-3)")
+    ap.add_argument("--tol", type=float, default=2e-3,
+                    help="check tolerance on max|out-ref|/max|ref| (default 2e-3)")
     a = ap.parse_args()
 
     text = open(a.module).read()
-    if a.precision:
-        text, n = set_precision(text, a.precision.upper())
-        print(f"precision: {a.precision.upper()} (set on {n} dot_general op{'s' * (n != 1)})")
     sig = main_signature(text)
 
     import jax
@@ -161,14 +153,13 @@ def main():
     if a.check:
         cpu_exe, cpu_dev = compile_on("cpu", text)
         ref = execute(cpu_exe, [jax.device_put(x, cpu_dev) for x in host_in])
-        tol = a.tol if a.tol is not None else (1e-5 if a.precision == "highest" else 2e-3)
         ok = True
         for i, (o, r) in enumerate(zip(outs, ref)):
             o, r = np.asarray(o, np.float64), np.asarray(r, np.float64)
             err = np.abs(o - r).max() / max(np.abs(r).max(), 1e-30)
-            ok &= bool(err <= tol)
-            print(f"check output {i} vs XLA:CPU: max|out-ref|/max|ref| = {err:.3g} (tol {tol:g}) "
-                  f"-> {'OK' if err <= tol else 'MISMATCH'}")
+            ok &= bool(err <= a.tol)
+            print(f"check output {i} vs XLA:CPU: max|out-ref|/max|ref| = {err:.3g} (tol {a.tol:g}) "
+                  f"-> {'OK' if err <= a.tol else 'MISMATCH'}")
         sys.exit(0 if ok else 1)
 
 

@@ -104,9 +104,10 @@
         ${build}/bin/build >&2
         in=''${1:-}
         if [ -n "$in" ] && [ "''${in%.fut}" != "$in" ]; then
+          shift
           ir="''${in%.fut}.fut_gpu"
           ${gpu-ir}/bin/gpu-ir "$in" > "$ir"
-          exec ./build/mlir-backend/mlir-backend "$ir"
+          exec ./build/mlir-backend/mlir-backend "$ir" "$@"
         fi
         exec ./build/mlir-backend/mlir-backend "$@"
       '';

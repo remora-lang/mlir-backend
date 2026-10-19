@@ -135,6 +135,22 @@ struct FutharkCompiler {
 
   mlir::ModuleOp module;
 
+  // Set from the command line (mlir-backend's --precision flag) before
+  // lowering starts; applied uniformly to every dot_general this backend
+  // emits. Replaces the old scheme of relying on example_run.py's
+  // set_precision regex rewrite of the already-compiled text.
+  mlir::stablehlo::Precision precision = mlir::stablehlo::Precision::DEFAULT;
+
+  // DEFAULT prints as no precision_config attribute at all (StableHLO
+  // treats "omitted" and "[DEFAULT, DEFAULT]" identically), matching the
+  // output this backend has always produced for the common case.
+  mlir::ArrayAttr PrecisionConfig() {
+    if (precision == mlir::stablehlo::Precision::DEFAULT)
+      return {};
+    auto attr = mlir::stablehlo::PrecisionAttr::get(&context, precision);
+    return builder.getArrayAttr({attr, attr});
+  }
+
   FutharkCompiler(Prog &prog, mlir::MLIRContext &context,
                   mlir::ImplicitLocOpBuilder &builder)
       : prog(prog), context(context), builder(builder) {
@@ -402,9 +418,8 @@ struct FutharkCompiler {
   // parameters entirely and grab them from the matrix arguments A and B.
   // Contracts A's axis 1 with B's axis 0; no batch dimensions -- same
   // DotDimensionNumbersAttr pattern as the already-working LowerDotGeneral
-  // below. Precision defaults to DEFAULT; example_run.py's existing
-  // --precision/set_precision text rewrite handles ad hoc tuning instead of
-  // threading a compiler-level flag for it.
+  // below. Precision comes from the compiler-level `precision` field (set
+  // via mlir-backend's --precision flag), not a post-hoc text rewrite.
   Values LowerMatMul(mlir::ValueRange args, mlir::TypeRange retTypes,
                      Ctx &ctx) {
     assert(args.size() == 5);
@@ -418,8 +433,8 @@ struct FutharkCompiler {
     auto dotDims = mlir::stablehlo::DotDimensionNumbersAttr::get(
         &context, /*lhsBatchingDimensions=*/{}, /*rhsBatchingDimensions=*/{},
         /*lhsContractingDimensions=*/{1}, /*rhsContractingDimensions=*/{0});
-    auto op = mlir::stablehlo::DotGeneralOp::create(builder, resultTy, x, y,
-                                                     dotDims, {}, {});
+    auto op = mlir::stablehlo::DotGeneralOp::create(
+        builder, resultTy, x, y, dotDims, PrecisionConfig(), {});
     return op->getResults();
   }
 
@@ -442,7 +457,9 @@ struct FutharkCompiler {
     // StableHLO dot_general
     //
     // The following signature is without support for
-    // - precision parameters,
+    // - per-call precision parameters from the Futhark source (the
+    //   compiler-level `precision` field/--precision flag still applies
+    //   uniformly here via PrecisionConfig(), same as LowerMatMul),
     // - support for quantized tensors.
     // This simplifies things somewhat. Refer to the spec for the full version.
     //
@@ -501,7 +518,7 @@ struct FutharkCompiler {
                                                       rhsBatchingDimensions,
                                                       lhsContractingDimensions,
                                                       rhsContractingDimensions),
-        {},
+        PrecisionConfig(),
         {});
 
     return op->getResults();
