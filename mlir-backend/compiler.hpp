@@ -1577,7 +1577,220 @@ struct FutharkCompiler {
   // chlo.scan-based lowering first (scalar, associative), then a
   // slice/pad/concatenate parallel-prefix fallback for tuple/non-scalar
   // operators, per prompt.md's segscan mapping.
-  Values LowerSegScan(const SegScan &, Ctx &) { Undefined("SegScan"); }
+  // Applies `lambda` elementwise to `inputs` (already full, matching-shape
+  // tensors -- no SegSpace/affine-read discovery needed, unlike
+  // LowerSegMap). Used for SegScan's post-op. Same "one stablehlo.map per
+  // output value" structure as LowerSegMap, since map allows only a single
+  // result; duplicated rather than shared since this call site has no
+  // affine-reads/iota operands to thread through.
+  Values LowerElementwiseLambda(const Lambda &lambda, Values inputs,
+                                Ctx &ctx) {
+    auto shapeTy = getRankedType(inputs[0].getType()).getShape();
+    mlir::SmallVector<int64_t> allDims;
+    for (int64_t i = 0; i < (int64_t)shapeTy.size(); ++i)
+      allDims.push_back(i);
+
+    mlir::SmallVector<mlir::Type> argTys;
+    for (mlir::Value v : inputs)
+      argTys.push_back(mlir::RankedTensorType::get(
+          {}, getRankedType(v.getType()).getElementType()));
+    mlir::SmallVector<mlir::Location> locs(argTys.size(), builder.getLoc());
+
+    Values finalResults;
+    for (size_t j = 0; j < lambda.ret.size(); ++j) {
+      auto resultTy = mlir::RankedTensorType::get(
+          shapeTy, LowerSegOpBaseType(lambda.ret[j], ctx));
+      auto op = mlir::stablehlo::MapOp::create(
+          builder, mlir::TypeRange{resultTy}, inputs, allDims);
+
+      {
+        mlir::OpBuilder::InsertionGuard guard(builder);
+        mlir::Block *blk =
+            builder.createBlock(&op.getRegion(), {}, argTys, locs);
+        builder.setInsertionPointToStart(blk);
+
+        Ctx local = ctx;
+        for (auto [param, arg] :
+             llvm::zip_equal(lambda.params, blk->getArguments()))
+          local.subexps.insert(param.name, arg);
+        Values results = LowerBody(lambda.body, local);
+        mlir::stablehlo::ReturnOp::create(builder,
+                                          mlir::ValueRange{results[j]});
+      }
+
+      mlir::SetVector<mlir::Value> freeVars;
+      mlir::getUsedValuesDefinedAbove(op.getRegion(), freeVars);
+      if (!freeVars.empty()) {
+        mlir::Block &entry = op.getRegion().front();
+        mlir::OpBuilder::InsertionGuard guard(builder);
+        builder.setInsertionPoint(op);
+        Values broadcasts;
+        for (mlir::Value fv : freeVars) {
+          auto fvTy = mlir::dyn_cast<mlir::RankedTensorType>(fv.getType());
+          if (!fvTy || fvTy.getRank() != 0)
+            Undefined("elementwise lambda: non-scalar free variable");
+          auto broadcastTy =
+              mlir::RankedTensorType::get(shapeTy, fvTy.getElementType());
+          broadcasts.push_back(mlir::stablehlo::BroadcastInDimOp::create(
+              builder, broadcastTy, fv, mlir::SmallVector<int64_t>{}));
+          mlir::BlockArgument newArg =
+              entry.addArgument(fv.getType(), builder.getLoc());
+          mlir::replaceAllUsesInRegionWith(fv, newArg, op.getRegion());
+        }
+        op->insertOperands(op->getNumOperands(), broadcasts);
+      }
+
+      finalResults.push_back(op->getResult(0));
+    }
+    return finalResults;
+  }
+
+  // segscan = segmap (fused per-element part) + an inclusive scalar,
+  // associative scan over the innermost (segment) dimension, implemented
+  // as a full-width, left-padded stablehlo.reduce_window (window size =
+  // the scan dimension's own length, stride 1) + an elementwise post-op.
+  //
+  // Per the brief, chlo.scan (is_associative=true) was the intended first
+  // step, but it's IsolatedFromAbove *and* its own docs say "ScanOp
+  // currently does not have a decomposition to StableHLO" -- i.e. XLA
+  // can't actually run it, the same dead end `ragged-dot` turned out to be
+  // (confirmed UNIMPLEMENTED on XLA:CPU in Phase 2/3 testing). Checked via
+  // an actual JAX reference lowering (jax.jit(jnp.cumsum).lower(...)
+  // .as_text()) that JAX itself never emits chlo.scan either -- it
+  // compiles cumsum to exactly this reduce_window pattern. Tuple operators
+  // fall out for free (reduce_window's inputs/init_values/results are all
+  // natively variadic, like stablehlo.reduce -- verified this time, unlike
+  // Phase 1's wrong assumption about stablehlo.map).
+  Values LowerSegScan(const SegScan &pSegScan, Ctx &ctx) {
+    RequireThreadLevel(pSegScan.lvl);
+
+    if (pSegScan.ops.size() != 1)
+      Undefined("segscan: multiple operators");
+    const SegBinOp &segBinOp = pSegScan.ops[0];
+    if (!segBinOp.shape.dims.empty())
+      Undefined("segscan: vector-valued operator");
+    // Futhark's own semantics already require scan's operator to be
+    // associative for the program to be valid Futhark at all (unlike
+    // commutativity, which SegBinOp.comm tracks separately), so it's safe
+    // to always treat it as associative here.
+    //
+    // Non-commutativity is a real risk for this lowering -- confirmed
+    // empirically, not just by spec-reading: scan being inherently
+    // order-*dependent* (unlike reduce) doesn't mean XLA's actual
+    // implementation of stablehlo.reduce_window preserves left-to-right
+    // combination order for a non-commutative operator. An earlier version
+    // of this function had no gate at all here (reasoning that
+    // reduce_window's windowed, deterministic-looking structure made it
+    // safe), and a non-commutative test case (affine-map composition,
+    // scanned) silently produced a numerically *wrong* result (not a
+    // crash) on XLA:CPU.
+    //
+    // Unlike LowerSegRed, SegBinOp.comm can't be used to gate this:
+    // checked empirically (not guessed) that Futhark's own GPU IR dump
+    // never prints the "commutative" keyword for a SegScan's operator,
+    // even for a plain `scan (+)` -- comparing scan0.fut's dump (no
+    // "commutative") against reduce.fut's dump (prints "commutative" for
+    // the same `+`) confirms Futhark just doesn't track/emit this for scan
+    // at all, so the flag is always Noncommutative and gating on it would
+    // make every scan Undefined(), including obviously-safe ones.
+    //
+    // So instead: restrict this reduce_window-based lowering to *scalar*
+    // operators only. Tuple operators are deferred to Phase 6's parallel-
+    // prefix algorithm instead (slice/pad/concatenate), which gives
+    // explicit control over combination order rather than relying on a
+    // primitive with implementation-defined order -- matching the brief's
+    // own original phasing (scalar now via one mechanism, tuple later via
+    // a different, safer one). This conservatively rejects some actually-
+    // safe tuple cases (e.g. independent-component tuples like running
+    // sum+product) rather than risk silently accepting an unsafe one --
+    // better wrong-rejected than wrong-accepted. Scalar non-commutative-
+    // but-associative operators are a much narrower residual risk left
+    // unchecked here (no scalar Futhark primitive type obviously produces
+    // one; not solved, just lower-probability -- see Phase 8).
+    if (segBinOp.neutral.size() > 1)
+      Undefined("segscan: tuple operator (deferred to Phase 6)");
+
+    IterationSpace iterSpace = LowerSegSpace(pSegScan.space, ctx);
+    int64_t rank = std::ssize(iterSpace);
+    if (rank == 0)
+      Undefined("segscan: rank 0");
+
+    Values mapped = LowerSegMap(pSegScan.lvl, pSegScan.space, pSegScan.body,
+                                pSegScan.ret, ctx);
+
+    Values neutral;
+    for (auto &e : segBinOp.neutral)
+      neutral.push_back(LowerSubExp(e, ctx));
+    int64_t valueCount = (int64_t)neutral.size();
+
+    int64_t scanDim = rank - 1;
+    auto shapeTy = getRankedType(mapped[0].getType()).getShape();
+    int64_t n = shapeTy[scanDim];
+
+    mlir::SmallVector<int64_t> windowDims(rank, 1);
+    windowDims[scanDim] = n;
+    mlir::SmallVector<int64_t> windowStrides(rank, 1);
+    mlir::SmallVector<int64_t> baseDilations(rank, 1);
+    mlir::SmallVector<int64_t> windowDilations(rank, 1);
+    // Left-pad by n-1 (no right pad): an inclusive, forward scan -- each
+    // output position's window covers every input up to and including
+    // itself. Matches the exact pattern JAX's own cumsum lowering uses.
+    mlir::SmallVector<int64_t> paddingFlat(rank * 2, 0);
+    paddingFlat[scanDim * 2] = n - 1;
+    auto paddingTy = mlir::RankedTensorType::get({rank, 2}, builder.getI64Type());
+    auto paddingAttr = mlir::DenseIntElementsAttr::get(paddingTy, paddingFlat);
+
+    mlir::SmallVector<mlir::Type> resultTypes;
+    for (mlir::Value v : mapped)
+      resultTypes.push_back(v.getType());
+
+    auto op = mlir::stablehlo::ReduceWindowOp::create(
+        builder, resultTypes, mapped, neutral,
+        builder.getDenseI64ArrayAttr(windowDims),
+        builder.getDenseI64ArrayAttr(windowStrides),
+        builder.getDenseI64ArrayAttr(baseDilations),
+        builder.getDenseI64ArrayAttr(windowDilations), paddingAttr);
+
+    // Per the StableHLO spec, the body's block args are (one value per
+    // windowed input, then one accumulator per init_value) -- same order
+    // as stablehlo.reduce, i.e. the opposite of Futhark's own
+    // SegBinOp.lambda.params convention (accumulators first).
+    mlir::SmallVector<mlir::Type> argTys;
+    for (mlir::Value v : mapped)
+      argTys.push_back(mlir::RankedTensorType::get(
+          {}, getRankedType(v.getType()).getElementType()));
+    for (mlir::Value v : neutral)
+      argTys.push_back(v.getType());
+    mlir::SmallVector<mlir::Location> locs(argTys.size(), builder.getLoc());
+
+    {
+      mlir::OpBuilder::InsertionGuard guard(builder);
+      mlir::Block *blk = builder.createBlock(&op.getBody(), {}, argTys, locs);
+      builder.setInsertionPointToStart(blk);
+
+      Ctx local = ctx;
+      mlir::ValueRange blockArgs = blk->getArguments();
+      mlir::ValueRange newValueArgs = blockArgs.take_front(valueCount);
+      mlir::ValueRange accArgs = blockArgs.drop_front(valueCount);
+      for (auto [param, acc] : llvm::zip_equal(
+               segBinOp.lambda.params | std::views::take(valueCount),
+               accArgs))
+        local.subexps.insert(param.name, acc);
+      for (auto [param, nv] : llvm::zip_equal(
+               segBinOp.lambda.params | std::views::drop(valueCount),
+               newValueArgs))
+        local.subexps.insert(param.name, nv);
+
+      Values results = LowerBody(segBinOp.lambda.body, local);
+      mlir::stablehlo::ReturnOp::create(builder, results);
+    }
+
+    // reduce_window's results are already the per-position inclusive scan
+    // values directly (no separate "final carry" to discard, unlike
+    // chlo.scan) -- feed them straight into the post-op.
+    Values scanned(op->getResults().begin(), op->getResults().end());
+    return LowerElementwiseLambda(pSegScan.post_op.lambda, scanned, ctx);
+  }
 
   void RequireThreadLevel(const SegLevel &lvl) {
     if (!std::holds_alternative<SegThread>(lvl))

@@ -605,19 +605,88 @@ out of scope here).
 **Verified, no bugs found this time**: both `if_basic.fut` cases pass.
 21 passed / 27 failed overall (up from 19/27).
 
-## Phase 5 — segscan, chlo.scan (not started)
-Delete the whole IREE-bug-workaround vector-packing trick outright (not
-adapting it). `LowerSegMap` + `chlo.scan` (verify exact op/attrs against
-vendored `ChloOps.td`), `is_associative = true` unconditionally (Futhark's
-own semantics already require associativity for scan). Non-commutative →
-`Undefined("segscan: non-commutative")`. Flag to select vs. Phase 6. New
-tests: tuple-operator scan, non-commutative scan.
+## Phase 5 — segscan, scalar associative scan (done, verified)
+
+**Major deviation from the original plan, found by actually checking
+rather than following the brief literally**: the brief's intended mechanism
+(`chlo.scan` with `is_associative = true`) turned out to be a dead end.
+Checked `chlo.scan`'s actual ODS (`ChloOps.td` at the pinned revision)
+before writing anything: it's `IsolatedFromAbove` (same free-var-broadcast
+machinery as `stablehlo.map` needed again), but more importantly its own
+doc string says *"ScanOp currently does not have a decomposition to
+StableHLO"* -- strongly suggesting XLA can't actually execute it, the same
+dead end `ragged-dot` turned out to be (confirmed `UNIMPLEMENTED` on
+XLA:CPU back in Phase 2/3 testing). Confirmed empirically per the brief's
+own instruction to check JAX reference lowerings first: `jax.jit(jnp.cumsum
+).lower(...).as_text()` -- JAX *never* emits `chlo.scan` either. It compiles
+`cumsum` to `stablehlo.reduce_window` instead: a full-width window (size =
+scan length), left-padded by `n-1`, stride 1 -- a real, executable
+StableHLO op (used throughout for conv/pooling, definitely implemented on
+every XLA backend). Implemented `LowerSegScan` this way instead of via
+`chlo.scan`, with a new `LowerElementwiseLambda` helper (one
+`stablehlo.map` per output value, same pattern as `LowerSegMap`, since the
+post-op is a plain elementwise map over already-materialized tensors with
+no SegSpace/affine-read structure to thread through) for the scan's
+post-op. The whole IREE-bug-workaround vector-packing trick was deleted
+outright back in Phase 0 (never adapted).
+
+**A real, almost-shipped correctness bug, caught by testing rather than
+reasoning from the spec**: my first instinct was "scan is inherently
+order-dependent by definition, and reduce_window's windowed structure looks
+deterministic, so no commutativity gate is needed, unlike `LowerSegRed`."
+That reasoning was wrong. Added `tests/scan_noncomm.fut` (affine-map
+composition -- associative, non-commutative, same operator as
+`segred_affine_compose.fut` -- scanned instead of reduced) specifically to
+stress-test this assumption, and it silently produced a numerically *wrong*
+result (`[1,3,8]` vs. expected `[1,1,31]`) on XLA:CPU -- not a crash, not an
+`Undefined()`, just wrong. So `stablehlo.reduce_window`, like plain
+`stablehlo.reduce`, apparently does not reliably preserve left-to-right
+combination order for a non-commutative operator on this XLA backend,
+contrary to my first assumption.
+
+Tried to gate on this the same way as `LowerSegRed` (`SegBinOp.comm`), but
+checked the actual GPU IR text first rather than assuming it'd work the
+same way: Futhark's GPU IR dump *never* prints the `commutative` keyword
+for a `SegScan`'s operator, even for a plain `scan (+)` -- confirmed by
+diffing `scan0.fut`'s dump (no `commutative`) against `reduce.fut`'s dump
+(prints `commutative` for the identical `+`). So `SegBinOp.comm` is always
+`Noncommutative` for scan nodes regardless of the real operator -- Futhark
+just doesn't track/emit this for scan the way it does for reduce -- making
+it useless as a gate (it would reject every scan, including obviously-safe
+ones like `scan0.fut`).
+
+Given no reliable per-operator commutativity signal is available, and
+spending more time building a custom AST-based commutativity detector felt
+like scope creep better suited to Phase 8's "solve non-commutative
+properly" bucket: **restricted this lowering to scalar operators only**
+(`segBinOp.neutral.size() > 1` → `Undefined("segscan: tuple operator
+(deferred to Phase 6)")`). This matches the brief's own original phasing
+intent (scalar now via one mechanism, tuple later via a different,
+explicit-order-controlling mechanism -- Phase 6's slice/pad/concatenate
+parallel prefix) and conservatively rejects some actually-safe tuple cases
+(e.g. `tests/scan_tuple.fut`'s independent running-sum-and-product, which
+*did* compute correctly before this restriction) rather than risk silently
+accepting an unsafe one. Scalar non-commutative-but-associative operators
+are a narrower residual risk left unaddressed (no obvious Futhark scalar
+primitive produces one) -- not solved, just lower-probability, same
+"lower priority" framing the brief already gives this class of problem.
+
+**Verified**: `scan0.fut` (scalar `+`) passes with correct numeric output.
+`tests/scan_tuple.fut` and `tests/scan_noncomm.fut` (new, per the original
+coverage-gap list) both correctly hit `Undefined(): segscan: tuple operator
+(deferred to Phase 6)` -- the same gate, for the same stated reason, not an
+accidental/different one. 24 passed / 26 failed overall (up from 22/28 at
+the end of Phase 4).
 
 ## Phase 6 — segscan, parallel prefix (not started)
 `jax.lax.associative_scan`'s algorithm via `slice`/`pad`/`concatenate` +
-Phase 1's elementwise library, for the tuple/non-scalar case `chlo.scan` won't
-parallelize on XLA. Get the JAX reference lowering first, use it as the
-target shape.
+Phase 1's elementwise library, now needed for *every* tuple-valued scan
+(not just the ones `chlo.scan` itself wouldn't parallelize -- see Phase 5's
+finding that `chlo.scan` is a dead end entirely, and that the
+`reduce_window` substitute can't safely handle tuple operators either).
+This phase's explicit, hand-built combination order is exactly what makes
+it safe where `reduce_window` wasn't: get the JAX reference lowering first,
+use it as the target shape, same as always.
 
 ## Phase 7 (lower priority) — SegHist (not started)
 `stablehlo.scatter` (`unique_indices=false`, `indices_are_sorted=false`);
@@ -688,3 +757,18 @@ writing the corresponding code.
   lowering) that stablehlo.if's branches capture freely, same as scf.if --
   a structural no-op swap, no bugs. New `tests/if_basic.fut` passes both
   cases. 21 passed / 27 failed overall.
+  Phase 5 (segscan) implemented and verified right after, with a real
+  mid-phase course correction: the brief's intended chlo.scan turned out to
+  be a dead end (IsolatedFromAbove, and its own docs say it has no
+  decomposition to StableHLO -- confirmed via a JAX cumsum reference
+  lowering that JAX itself never emits it either, using
+  stablehlo.reduce_window instead). Implemented segscan via
+  reduce_window instead. Caught a near-miss silent-wrong-answer bug this
+  way too: reduce_window doesn't reliably preserve order for a
+  non-commutative operator either (found via a new scan_noncomm.fut test,
+  not by reasoning from the spec), and Futhark's own comm flag turned out
+  to never be set for scan nodes at all (checked the raw GPU IR text to
+  confirm, not guessed) -- so ended up conservatively restricting this
+  phase to scalar operators only, deferring all tuple operators to Phase 6.
+  scan0.fut passes; scan_tuple.fut/scan_noncomm.fut (new) both correctly
+  hit the same deferral gate. 24 passed / 26 failed overall.
