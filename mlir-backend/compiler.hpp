@@ -387,41 +387,31 @@ struct FutharkCompiler {
     Undefined("castToType: incompatible types");
   }
 
+  // Signature is (d0, d1, d3, A : [d4][d5]t, B : [d5][d6]t) -> [d4][d6]t.
+  // Where d0 d1 d3 are equal to d4 d5 d6 somehow, depending on the order
+  // specified by the user in the Futhark source/IR. So we disregard the size
+  // parameters entirely and grab them from the matrix arguments A and B.
+  // Contracts A's axis 1 with B's axis 0; no batch dimensions -- same
+  // DotDimensionNumbersAttr pattern as the already-working LowerDotGeneral
+  // below. Precision defaults to DEFAULT; example_run.py's existing
+  // --precision/set_precision text rewrite handles ad hoc tuning instead of
+  // threading a compiler-level flag for it.
   Values LowerMatMul(mlir::ValueRange args, mlir::TypeRange retTypes,
                      Ctx &ctx) {
-    // Signature is (d0, d1, d3, A : [d4][d5]t, B : [d5][d6]t) -> [d4][d6]t
-    // Where d0 d1 d3 are equal to d4 d5 d6 somehow, depending on the order
-    // specified by the user in the Futhark source/IR. So we disregard the size
-    // parameters entirely and grab them from the matrix arguments A and B.
     assert(args.size() == 5);
     assert(retTypes.size() == 1);
     auto x = args[3];
     auto y = args[4];
-    auto m = mlir::tensor::DimOp::create(builder, x, 0).getResult();
-    auto n = mlir::tensor::DimOp::create(builder, y, 1).getResult();
+    auto resultTy = getRankedType(retTypes[0]);
+    if (!resultTy.hasStaticShape())
+      Undefined("matmul: dynamic shape");
 
-    // Create the output matrix.
-    auto z_type = getRankedType(retTypes[0]);
-    Values dynamicSizes;
-    for (auto [d, t] :
-         llvm::zip_equal(std::vector<mlir::Value>{m, n}, z_type.getShape())) {
-      if (mlir::ShapedType::isDynamic(t))
-        dynamicSizes.push_back(d);
-    }
-    auto zero = mlir::arith::ConstantOp::create(
-        builder, builder.getZeroAttr(z_type.getElementType()));
-    auto z = mlir::linalg::FillOp::create(
-                 builder,
-                 mlir::ValueRange{zero},
-                 mlir::ValueRange{mlir::tensor::EmptyOp::create(
-                     builder, z_type, dynamicSizes)})
-                 .result();
-
-    return mlir::linalg::MatmulOp::create(builder,
-                                          builder.getLoc(),
-                                          mlir::ValueRange{x, y},
-                                          mlir::ValueRange{z})
-        .getResults();
+    auto dotDims = mlir::stablehlo::DotDimensionNumbersAttr::get(
+        &context, /*lhsBatchingDimensions=*/{}, /*rhsBatchingDimensions=*/{},
+        /*lhsContractingDimensions=*/{1}, /*rhsContractingDimensions=*/{0});
+    auto op = mlir::stablehlo::DotGeneralOp::create(builder, resultTy, x, y,
+                                                     dotDims, {}, {});
+    return op->getResults();
   }
 
   Values LowerUpdateAcc(const BasicOpUpdateAcc &update, Ctx &ctx) {

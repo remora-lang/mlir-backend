@@ -556,12 +556,27 @@ Futhark's own `SegBinOp.lambda.params` convention: StableHLO orders
 this in mind for Phase 5/6's `chlo.scan`, which will have the same
 Futhark-vs-StableHLO param-order mismatch to handle.
 
-## Phase 3 — matmul (not started)
-`LowerMatMul` → `stablehlo.dot_general`, reusing `LowerDotGeneral`'s existing
-`DotDimensionNumbersAttr` pattern (already working StableHLO code today).
-`precision`: default to always emitting `DEFAULT`, rely on `example_run.py`'s
-existing `--precision`/`set_precision` text post-processing instead of a new
-backend flag.
+## Phase 3 — matmul (done, verified)
+
+`LowerMatMul` rewritten to `stablehlo.dot_general`, reusing
+`LowerDotGeneral`'s existing `DotDimensionNumbersAttr` pattern (contracting
+dims `{1}`/`{0}`, no batch dims, matching the signature comment's
+`[d4][d5]t`/`[d5][d6]t` convention). Dropped all the `linalg.fill`/
+`tensor.empty`/`tensor.dim`-based zero-init and dynamic-size scaffolding
+entirely -- unneeded now that `matmul.fut`'s signature is pinned to static
+sizes (Phase 1's `LowerFunction` gate already guarantees this for anything
+that reaches here, so added an explicit `Undefined("matmul: dynamic
+shape")` as a defensive check rather than relying on that alone). No
+surprises/bugs this time -- went in cleanly on the first build. `precision`
+left at StableHLO's default (`DEFAULT`), per the earlier decision to rely on
+`example_run.py`'s `--precision`/`set_precision` text post-processing rather
+than threading a compiler-level flag.
+
+**Verified**: `matmul.fut` passes. `matmul_static_shape.fut` has no checked
+test cases (benchmark-only `-- random input`, unaffected, same as before
+this rewrite). `custom_flattening_matmul.fut`/`irreg_matmul.fut` remain out
+of scope (dynamic-shaped composite tests, unannotated). 19 passed / 27
+failed overall (up from 18/28).
 
 ## Phase 4 — if (not started)
 `ExpIf` → `stablehlo.if`/`stablehlo.return`. **Verify empirically first**
@@ -645,3 +660,6 @@ writing the corresponding code.
   three new non-commutative segred tests per the original coverage-gap
   list. 18 passed / 28 failed overall (up from 15/31 at the start of this
   session). Full details in the Phase 2 section above.
+  Phase 3 (matmul) implemented and verified right after: `matmul.fut`
+  passes, no new bugs found, clean on the first build. 19 passed / 27
+  failed overall.
