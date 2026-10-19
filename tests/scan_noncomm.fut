@@ -1,13 +1,15 @@
 -- Affine-map composition (associative, non-commutative) scanned instead of
--- reduced. Same non-commutative gate as segred_affine_compose.fut and for
--- the same reason -- despite scan being inherently order-dependent by
--- definition, XLA's actual stablehlo.reduce_window implementation does not
--- reliably preserve left-to-right combination order for a non-commutative
--- operator: an earlier version of this backend had no such gate for scan,
--- reasoning that reduce_window's structure made it safe, and this exact
--- test case silently produced a numerically wrong (not crashing) result on
--- XLA:CPU. See Phase 8.
--- undefined
+-- reduced. Lowered via chlo.scan, which legalizes to a genuine sequential
+-- stablehlo.while loop -- verified (by hand-testing this exact case
+-- against jaxlib before wiring it into the backend) to preserve
+-- combination order correctly, unlike stablehlo.reduce_window, which
+-- silently computed the wrong answer for this same operator (see
+-- segred_affine_compose.fut for the reduce, not scan, version -- that one
+-- still hits Undefined() for the unrelated, real reason that segred's
+-- commutativity gate is accurate).
+-- ==
+-- input { [2i32, 3i32, 1i32] [1i32, 0i32, 5i32] }
+-- output { [2i32, 6i32, 6i32] [1i32, 1i32, 31i32] }
 def compose (a1,b1) (a2,b2) : (i32,i32) = (a1*a2, a1*b2+b1)
 
 def main (a: [3]i32) (b: [3]i32) =
