@@ -1,9 +1,10 @@
--- Phase 7: static-shape version of hist2d.fut, exercising LowerSegHist's
--- multi-dimensional index path (stacking 2 separate index-component arrays
--- into one [n, 2] stablehlo.scatter indices tensor via concatenate), which
--- hist_static.fut's 1-D case can't exercise (there, indexRank == 1 skips
--- the concatenate entirely). See hist_static.fut for why the original
--- hist2d.fut (dynamic shape) can't exercise this backend at all.
+-- Phase 7: static-shape version of dynamic_shapes/hist2d.fut, exercising
+-- LowerSegHist's multi-dimensional index path (stacking 2 separate
+-- index-component arrays into one [n, 2] stablehlo.scatter indices tensor
+-- via concatenate), which this directory's hist1d.fut can't exercise
+-- (there, indexRank == 1 skips the concatenate entirely). See hist1d.fut
+-- for why dynamic_shapes/hist2d.fut itself can't exercise this backend at
+-- all.
 -- ==
 -- input {
 --   [0i64, 1i64, 0i64, 1i64]

@@ -1,11 +1,12 @@
--- Phase 8: static-shape version of argmax.fut (NOTE: the operator is not
--- commutative on ties). argmax.fut itself declares `xs: []f32` (dynamic
--- size), so it hits the "dynamic-shaped function parameter" Undefined()
--- gate before LowerSegRed's own lowering ever runs -- a permanent,
--- unrelated limitation of this backend (same bucket as
--- map_dynamic.fut/hist1d.fut), not something Phase 8 fixes. Re-enabling
--- argmax.fut itself is therefore not reachable; this statically-shaped
--- equivalent is what actually exercises Phase 8's fix.
+-- Phase 8: static-shape version of dynamic_shapes/argmax.fut (NOTE: the
+-- operator is not commutative on ties). dynamic_shapes/argmax.fut itself
+-- declares `xs: []f32` (dynamic size), so it hits the "dynamic-shaped
+-- function parameter" Undefined() gate before LowerSegRed's own lowering
+-- ever runs -- a permanent, unrelated limitation of this backend (same
+-- bucket as dynamic_shapes/map.fut/hist1d.fut), not something Phase 8
+-- fixes. Re-enabling dynamic_shapes/argmax.fut itself is therefore not
+-- reachable; this statically-shaped equivalent is what actually exercises
+-- Phase 8's fix.
 --
 -- argmax.fut's own two cases have no tie at the maximum, so they'd pass
 -- even with a (wrong) commutativity assumption; the second case here adds

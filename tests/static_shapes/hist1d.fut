@@ -1,11 +1,11 @@
--- Phase 7: static-shape version of hist1d.fut's scalar scatter-add
--- histogram, lowered via stablehlo.scatter. hist1d.fut itself can never
--- exercise LowerSegHist at all -- it declares [n]i64/[n]i32 parameters
--- (dynamic size), so it hits the "dynamic-shaped function parameter"
--- Undefined() gate (same bucket as map2.fut/map_dynamic.fut/
--- iota_dynamic.fut -- a pre-existing, permanent limitation of this
--- StableHLO/XLA-targeted backend, not something Phase 7 fixes) before
--- SegHist's own lowering ever runs.
+-- Phase 7: static-shape version of dynamic_shapes/hist1d.fut's scalar
+-- scatter-add histogram, lowered via stablehlo.scatter.
+-- dynamic_shapes/hist1d.fut itself can never exercise LowerSegHist at all
+-- -- it declares [n]i64/[n]i32 parameters (dynamic size), so it hits the
+-- "dynamic-shaped function parameter" Undefined() gate (same bucket as
+-- dynamic_shapes/map2.fut/map.fut/iota.fut -- a pre-existing, permanent
+-- limitation of this StableHLO/XLA-targeted backend, not something Phase
+-- 7 fixes) before SegHist's own lowering ever runs.
 -- ==
 -- input {
 --   [0i64, 1i64, 1i64, 3i64, 1i64]

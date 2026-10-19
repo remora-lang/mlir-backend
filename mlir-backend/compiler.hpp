@@ -14,6 +14,7 @@
 #include "llvm/Support/ErrorHandling.h"
 #include <cctype>
 #include <format>
+#include <functional>
 #include <iterator>
 #include <mlir/Dialect/Arith/IR/Arith.h>
 #include <mlir/Dialect/Linalg/IR/Linalg.h>
@@ -182,7 +183,8 @@ struct FutharkCompiler {
     for (const auto &t : fun.retType) {
       retTypes.push_back(LowerTy(t.first.v));
     }
-    // TODO: Maybe this is not a way to go
+    // Unit-typed params carry no runtime data, so they're dropped from
+    // @main's actual signature rather than lowered to some placeholder type.
     auto runtimeParams = fun.params | std::views::filter([](const auto &param) {
                            return !IsUnitType(param.dec.v);
                          });
@@ -354,14 +356,15 @@ struct FutharkCompiler {
         [&](const ExpLoop &e) -> Values { return LowerLoop(e, ctx); },
         [&](const ExpIf &e) -> Values {
           // Confirmed via both the spec (no IsolatedFromAbove trait on
-          // IfOp) and an actual JAX lax.cond reference lowering
-          // (jax.jit(...).lower(...).as_text(), branches reference outer
+          // IfOp) and a JAX lax.cond reference lowering (CPU-only, see
+          // LowerSegRed's comment for the caveat; branches reference outer
           // SSA values directly with zero block arguments) that
           // stablehlo.if's branches, unlike stablehlo.map's region, can
-          // capture freely -- same as today's scf.if, so this is a
-          // structural no-op swap. The condition is already a 0-d i1 tensor
-          // (scalars are 0-d tensors), matching stablehlo.if's `pred`
-          // directly -- no unwrap needed, unlike scf.if's bare i1.
+          // capture freely -- same as the old scf.if this replaced, so
+          // this was a structural no-op swap. The condition is already a
+          // 0-d i1 tensor (scalars are 0-d tensors), matching
+          // stablehlo.if's `pred` directly -- no unwrap needed, unlike the
+          // old scf.if's bare i1.
           mlir::Value cond = LowerSubExp(e.cond, ctx);
           mlir::SmallVector<mlir::Type> resultTypes;
           for (auto &t : e.retType)
@@ -480,14 +483,8 @@ struct FutharkCompiler {
     // ------
     // result: tensor
 
-    auto numNonSizeArgs = 6;
-    assert(args.size() >= numNonSizeArgs);
     assert(retTypes.size() == 1);
-    auto getArg = [&](int i) {
-      // We don't know how many size parameters will be passed,
-      // but they are always preprended, so we index from the back.
-      return args[args.size() - numNonSizeArgs + i];
-    };
+    auto getArg = BackIndexedGetter(args, 6);
     auto lhs = getArg(0);
     auto rhs = getArg(1);
     auto lhsBatchingDimensions = getConstantIntTensor(getArg(2));
@@ -588,14 +585,8 @@ struct FutharkCompiler {
     // ------
     // result: tensor
 
-    auto numNonSizeArgs = 9;
-    assert(args.size() >= numNonSizeArgs);
     assert(retTypes.size() == 1);
-    auto getArg = [&](int i) {
-      // We don't know how many size parameters will be passed,
-      // but they are always preprended, so we index from the back.
-      return args[args.size() - numNonSizeArgs + i];
-    };
+    auto getArg = BackIndexedGetter(args, 9);
     auto lhs = getArg(0);
     auto rhs = getArg(1);
     auto groupSizes = getArg(2);
@@ -653,6 +644,19 @@ struct FutharkCompiler {
     return op->getResults();
   }
 
+  // DEAD CODE, kept intentionally for now (not deleted in the cleanup pass
+  // that otherwise touched this file -- see conversation/commit history):
+  // this is the only call site in the file still emitting real
+  // linalg/arith/tensor ops (predates the StableHLO rewrite; never
+  // migrated), which is also the only reason those dialects are still in
+  // the registration list in the constructor above. Unreachable in
+  // practice: its two call sites (`ragged_matmul_black_box.fut`,
+  // `batched_ragged_matmul_black_box.fut`) both declare dynamic-shaped
+  // entry parameters and hit the "dynamic-shaped function parameter"
+  // Undefined() gate in LowerFunction before this ever runs. TODO: either
+  // delete this function and drop the now-unneeded dialect registrations,
+  // or decide this blackbox is worth reviving for a real (static-shaped)
+  // nonuniform-ragged-dot test and rewrite it in StableHLO.
   Values LowerRaggedDotNonUniform(mlir::ValueRange args,
                                   mlir::TypeRange retTypes, Ctx &ctx) {
     // A nonuniform ragged_dot expressed over the flat segmented representation
@@ -920,14 +924,8 @@ struct FutharkCompiler {
                       Ctx &ctx) {
     // A basic ascending sort.
     // Doesn't implement StableHLO sort faithfully.
-    auto numNonSizeArgs = 2;
-    assert(args.size() >= numNonSizeArgs);
     assert(retTypes.size() == 1);
-    auto getArg = [&](int i) {
-      // We don't know how many size parameters will be passed,
-      // but they are always preprended, so we index from the back.
-      return args[args.size() - numNonSizeArgs + i];
-    };
+    auto getArg = BackIndexedGetter(args, 2);
     auto inputs = getArg(0);
     bool isStable = getConstantInt(getArg(1)) != 0;
 
@@ -983,6 +981,19 @@ struct FutharkCompiler {
     if (auto t = mlir::dyn_cast<mlir::RankedTensorType>(ty))
       return t;
     Undefined();
+  }
+
+  // Several intrinsic-call lowerings (LowerDotGeneral, LowerRaggedDot,
+  // LowerArgSort) have an unknown, variable number of leading Futhark size
+  // arguments before their real (non-size) arguments -- but the real
+  // arguments are always the last `numNonSizeArgs` of the list, so indexing
+  // from the back skips the size prefix without needing to know its length.
+  std::function<mlir::Value(int)> BackIndexedGetter(mlir::ValueRange args,
+                                                     int64_t numNonSizeArgs) {
+    assert(args.size() >= (size_t)numNonSizeArgs);
+    return [args, numNonSizeArgs](int i) {
+      return args[args.size() - numNonSizeArgs + i];
+    };
   }
 
   mlir::SmallVector<int64_t> getConstantIntTensor(const mlir::Value &x) {
@@ -1268,6 +1279,14 @@ struct FutharkCompiler {
               [&](const CmpOpLLt &) -> mlir::Value { Undefined(); },
               [&](const CmpOpLLe &) -> mlir::Value { Undefined(); });
         },
+        // The BasicOp variants below (here and after BasicOpUnOp) are all
+        // unimplemented. Opaque/ArrayVal/FlatIndex/Update/FlatUpdate are
+        // from array-flattening-related constructs this backend doesn't
+        // target (static shapes only, no runtime flattening); Assert has
+        // no StableHLO equivalent (no runtime trap/abort primitive);
+        // Manifest and UpdateAcc are tied to with_acc, deferred alongside
+        // LowerWithAcc/scatter. None of these are exercised by any
+        // currently-passing test.
         [](const BasicOpOpaque &) -> mlir::Value { Undefined(); },
         [](const BasicOpArrayVal &) -> mlir::Value { Undefined(); },
         [&](const BasicOpUnOp &val) -> mlir::Value {
@@ -1338,6 +1357,13 @@ struct FutharkCompiler {
         });
   }
 
+  // SizeOp (ir/gpu.hpp: GetSize/GetSizeMax/CmpSizeLe/CalcNumBlocks) is
+  // Futhark's GPU-backend auto-tuning machinery -- block size/count
+  // knobs for a kernel launch. XLA picks its own launch configuration;
+  // there's no equivalent knob to thread through at the StableHLO level.
+  // TODO: if a program's *semantics* (not just performance) ever turn
+  // out to depend on one of these (unlikely, but unconfirmed), this gate
+  // would need revisiting instead of staying a blanket Undefined().
   mlir::Value LowerSizeOp(const SizeOp &sizeOp, Ctx &ctx) { Undefined(); }
 
   Values LowerSegOp(std::shared_ptr<SegOp> pSegOp, Ctx &ctx) {
@@ -1359,6 +1385,50 @@ struct FutharkCompiler {
   // is not. Neither is
   //    xs[gtid - c],
   // where c is a variable defined outside the kernel body.
+
+  // stablehlo.map's region is isolated-from-above, so every outer SSA
+  // value a map body ends up using
+  // must become an explicit operand instead. Discovers those free
+  // variables, broadcasts scalar ones to the map's full iteration-space
+  // shape and appends them as extra operands; bails on non-scalar ones
+  // (no broadcast shape would be well-defined). Shared by every
+  // stablehlo.map builder in this file (LowerSegMap, LowerElementwiseLambda,
+  // Combine) -- they only differ in the Undefined() message, passed as
+  // `errCtx` so the error still names the right caller.
+  //
+  // Uses the two plain free functions mlir::makeRegionIsolatedFromAbove is
+  // built from (mlir::getUsedValuesDefinedAbove/replaceAllUsesInRegionWith)
+  // rather than that function itself, which needs an mlir::IRRewriter --
+  // its base class mlir::RewriterBase has no typeinfo in the prebuilt MLIR
+  // libs (LLVM/MLIR defaults to -fno-rtti; this backend builds with
+  // -frtti), which fails at link time.
+  void BroadcastFreeVarsIntoMapRegion(hlo::MapOp op,
+                                      llvm::ArrayRef<int64_t> shapeTy,
+                                      llvm::StringRef errCtx) {
+    mlir::SetVector<mlir::Value> freeVars;
+    mlir::getUsedValuesDefinedAbove(op.getRegion(), freeVars);
+    if (freeVars.empty())
+      return;
+
+    mlir::Block &entry = op.getRegion().front();
+    mlir::OpBuilder::InsertionGuard guard(builder);
+    builder.setInsertionPoint(op);
+    Values broadcasts;
+    for (mlir::Value fv : freeVars) {
+      auto fvTy = mlir::dyn_cast<mlir::RankedTensorType>(fv.getType());
+      if (!fvTy || fvTy.getRank() != 0)
+        Undefined(std::string(errCtx) + ": non-scalar free variable");
+      auto broadcastTy =
+          mlir::RankedTensorType::get(shapeTy, fvTy.getElementType());
+      broadcasts.push_back(hlo::BroadcastInDimOp::create(
+          builder, broadcastTy, fv, mlir::SmallVector<int64_t>{}));
+      mlir::BlockArgument newArg =
+          entry.addArgument(fv.getType(), builder.getLoc());
+      mlir::replaceAllUsesInRegionWith(fv, newArg, op.getRegion());
+    }
+    op->insertOperands(op->getNumOperands(), broadcasts);
+  }
+
   Values LowerSegMap(const SegMap &pSegMap, Ctx &ctx) {
     return LowerSegMap(
         pSegMap.lvl, pSegMap.space, pSegMap.body, pSegMap.ret, ctx);
@@ -1366,13 +1436,7 @@ struct FutharkCompiler {
 
   // Lowers a SegMap to a stablehlo.map. Operands are the kernel's affine
   // reads plus one full-shape stablehlo.iota per iteration-space dimension;
-  // the region is then made isolated-from-above (stablehlo.map's region
-  // can't capture outer SSA values, per the StableHLO/XLA target model) by
-  // discovering every other outer value it ends up using, broadcasting it to
-  // the full shape, and appending it as an extra operand -- rather than
-  // hand-rolling a Futhark-AST free-variable walker, this reuses MLIR's own
-  // mlir::getUsedValuesDefinedAbove/replaceAllUsesInRegionWith on the
-  // already-lowered region.
+  // free variables are fixed up via BroadcastFreeVarsIntoMapRegion below.
   Values LowerSegMap(const SegLevel &lvl, const SegSpace &space,
                      const KernelBody &body, const std::vector<Type> &ret,
                      Ctx &ctx) {
@@ -1488,34 +1552,7 @@ struct FutharkCompiler {
         hlo::ReturnOp::create(builder, mlir::ValueRange{result});
       }
 
-      // mlir::makeRegionIsolatedFromAbove needs an mlir::IRRewriter, whose
-      // base class mlir::RewriterBase has no typeinfo in the prebuilt MLIR
-      // libs (LLVM/MLIR defaults to -fno-rtti; this backend builds with
-      // -frtti), which fails at link time. Doing the same thing with the
-      // two plain free functions it's built from avoids needing a
-      // RewriterBase instance.
-      mlir::SetVector<mlir::Value> freeVars;
-      mlir::getUsedValuesDefinedAbove(op.getRegion(), freeVars);
-
-      if (!freeVars.empty()) {
-        mlir::Block &entry = op.getRegion().front();
-        mlir::OpBuilder::InsertionGuard guard(builder);
-        builder.setInsertionPoint(op);
-        Values broadcasts;
-        for (mlir::Value fv : freeVars) {
-          auto fvTy = mlir::dyn_cast<mlir::RankedTensorType>(fv.getType());
-          if (!fvTy || fvTy.getRank() != 0)
-            Undefined("SegMap: non-scalar free variable");
-          auto broadcastTy =
-              mlir::RankedTensorType::get(shapeTy, fvTy.getElementType());
-          broadcasts.push_back(hlo::BroadcastInDimOp::create(
-              builder, broadcastTy, fv, mlir::SmallVector<int64_t>{}));
-          mlir::BlockArgument newArg =
-              entry.addArgument(fv.getType(), builder.getLoc());
-          mlir::replaceAllUsesInRegionWith(fv, newArg, op.getRegion());
-        }
-        op->insertOperands(op->getNumOperands(), broadcasts);
-      }
+      BroadcastFreeVarsIntoMapRegion(op, shapeTy, "SegMap");
 
       finalResults.push_back(op->getResult(0));
     }
@@ -1523,39 +1560,25 @@ struct FutharkCompiler {
     return finalResults;
   }
 
-  // TODO Same limitations as SegMap, probably.
-  // segred = segmap (the fused per-element part, reused as-is) + a
-  // stablehlo.reduce over the innermost (segment) dimension. Tuple
-  // operators fall out for free -- stablehlo.reduce is natively variadic
-  // (multiple inputs/init_values/region-results), no special-casing needed
-  // beyond what's already generic below.
-  // Phase 8: the Phase 2 gate on non-commutative operators was based on a
-  // misreading of the spec -- "body and init_values must form a monoid"
-  // means associative + identity, which is exactly what Futhark's own
-  // `neutral` requirement already guarantees, and does NOT require
-  // commutativity (a monoid is not automatically commutative; see
-  // en.wikipedia.org/wiki/Monoid, and jax.lax.reduce's own docstring,
-  // which states the identical requirement). The real bug this phase
-  // found was in this function's own block-arg binding below, backwards
-  // since Phase 2 but never exercised with a genuinely order-sensitive
-  // operator until now (every earlier segred test was either commutative,
-  // where the swap is invisible, or gated to Undefined()).
+  // segred = segmap (the fused per-element part, reused as-is -- so this
+  // function inherits LowerSegMap's own limitations, e.g. the dynamic-shape
+  // and non-scalar-free-variable gates) + a stablehlo.reduce over the
+  // innermost (segment) dimension. Tuple operators fall out for free --
+  // stablehlo.reduce is natively variadic (multiple inputs/init_values/
+  // region-results), no special-casing needed beyond what's already
+  // generic below.
   //
-  // Found by testing directly against a JAX reference lowering first,
-  // per the brief's standing instruction, rather than guessing: calling
-  // `jax.lax.reduce` directly (bypassing this backend) with the exact
-  // same non-commutative affine-compose operator gave the CORRECT answer
-  // on XLA:CPU, which ruled out "stablehlo.reduce can't handle
-  // non-commutative operators" as the explanation for this backend's own
-  // wrong output on segred_affine_compose.fut/segred_matmul2x2.fut.
-  // Decoded the reference lowering's actual block-arg roles by tracing
-  // through its non-commutative arithmetic term by term: the body's first
-  // `valueCount` args are the accumulator (matching init_values'/the
-  // left/earlier-position operand's role), the second `valueCount` are
-  // the new value -- this function had them backwards. Swapping fixed
-  // segred_affine_compose.fut/segred_matmul2x2.fut/
-  // segred_noncomm_segmented.fut directly through plain stablehlo.reduce,
-  // no scan-based workaround needed at all.
+  // Block-arg binding: accumulator first, new value second, matching
+  // Futhark's own SegBinOp.lambda.params order directly (see the table
+  // below LowerSegScanReduceWindow's declaration for how this compares to
+  // the other reducer-body scaffolds in this file). Getting this backwards
+  // is invisible for a commutative operator and silently wrong for a
+  // non-commutative one -- confirmed the hard way in Phase 8 (see
+  // PROGRESS.md) after the binding sat backwards, undetected, since
+  // Phase 2. stablehlo.reduce itself needs no non-commutative workaround;
+  // the spec's monoid requirement is associativity + identity, not
+  // commutativity, which is exactly what Futhark's own `neutral` already
+  // guarantees.
   Values LowerSegRed(const SegRed &pSegRed, Ctx &ctx) {
     RequireThreadLevel(pSegRed.lvl);
 
@@ -1596,6 +1619,23 @@ struct FutharkCompiler {
     // this function's own comment above), not assumed. This matches
     // Futhark's own SegBinOp.lambda.params convention directly
     // (accumulators first, then new values) -- no transpose needed.
+    //
+    // Reducer-body block-arg conventions across this file, so a future
+    // mismatch like the one above is easier to suspect:
+    //   LowerSegRed                   -- accumulator first, new value second
+    //   LowerSegScanReduceWindow       -- new value first, accumulator second
+    //   LowerSegHist update_computation -- accumulator first, new value second
+    //   Combine (parallel-prefix)      -- no split; a/b are separate operand
+    //                                     lists, zipped 1:1 in declaration order
+    //
+    // TODO: every "confirmed by decoding a JAX reference lowering" claim in
+    // this file (here and in LowerSegScanReduceWindow, LowerSegHist,
+    // LowerSegScanParallelPrefix/ScanRec) was checked against CPU-only
+    // output -- no Metal/GPU plugin is installed in this environment. JAX
+    // registers some lowering rules per-platform, so a convention
+    // confirmed on CPU is not automatically proven for GPU/TPU; re-verify
+    // against those backends before relying on this for anything beyond
+    // CPU execution.
     mlir::SmallVector<mlir::Type> argTys;
     for (mlir::Value v : neutral)
       argTys.push_back(v.getType());
@@ -1628,17 +1668,16 @@ struct FutharkCompiler {
     return op->getResults();
   }
 
-  // SegHist (Futhark's `hist`/`reduce_by_index`) via stablehlo.scatter.
-  // Validated against a JAX reference lowering first (jax.jit(lambda idx,
-  // vals: jnp.zeros((4,), jnp.int32).at[idx].add(vals)).lower(...)
-  // .as_text()): a pure scalar scatter (no update window at all) uses
-  // inserted_window_dims = scatter_dims_to_operand_dims = [0..R-1] (R =
-  // destination rank), index_vector_dim = 1 (the indices tensor is always
-  // rank-2 [n, R], regardless of R), unique_indices = false,
-  // indices_are_sorted = false. Per the spec's `scatter` semantics
-  // ("Otherwise updated_results = results"), out-of-bounds scatter indices
-  // are silently dropped -- matching Futhark's own hist semantics, not
-  // guessed.
+  // SegHist (Futhark's `hist`/`reduce_by_index`) via stablehlo.scatter: a
+  // pure scalar scatter (no update window) uses inserted_window_dims =
+  // scatter_dims_to_operand_dims = [0..R-1] (R = destination rank),
+  // index_vector_dim = 1 (the indices tensor is always rank-2 [n, R]
+  // regardless of R), unique_indices = false, indices_are_sorted = false
+  // -- confirmed against a JAX reference lowering (CPU-only, see
+  // LowerSegRed's comment for the caveat), not guessed. Per the spec's
+  // `scatter` semantics ("Otherwise updated_results = results"),
+  // out-of-bounds scatter indices are silently dropped -- matching
+  // Futhark's own hist semantics.
   Values LowerSegHist(const SegHist &pSegHist, Ctx &ctx) {
     RequireThreadLevel(pSegHist.lvl);
 
@@ -1733,7 +1772,8 @@ struct FutharkCompiler {
       // updates_converted) -- old/accumulated value first, new value
       // second -- exactly Futhark's own HistOp.lambda.params convention
       // (accumulator first, new value second), so no transpose is needed
-      // here, unlike the reduce_window/chlo.scan paths.
+      // here, unlike LowerSegScanReduceWindow's (reverse) convention --
+      // see the table in LowerSegRed's comment.
       Ctx local = ctx;
       local.subexps.insert(histOp.lambda.params[0].name, blk->getArgument(0));
       local.subexps.insert(histOp.lambda.params[1].name, blk->getArgument(1));
@@ -1744,12 +1784,6 @@ struct FutharkCompiler {
     return Values(op->getResults().begin(), op->getResults().end());
   }
 
-  // TODO(StableHLO rewrite, Phase 5/6): was IREE's iree_linalg_ext.scan (with
-  // a vector<Nxi64>-lane packing trick for tuple carries, worked around an
-  // IREE-specific bug -- not relevant to the new backend). Needs a
-  // chlo.scan-based lowering first (scalar, associative), then a
-  // slice/pad/concatenate parallel-prefix fallback for tuple/non-scalar
-  // operators, per prompt.md's segscan mapping.
   // Applies `lambda` elementwise to `inputs` (already full, matching-shape
   // tensors -- no SegSpace/affine-read discovery needed, unlike
   // LowerSegMap). Used for SegScan's post-op. Same "one stablehlo.map per
@@ -1789,27 +1823,7 @@ struct FutharkCompiler {
         hlo::ReturnOp::create(builder, mlir::ValueRange{results[j]});
       }
 
-      mlir::SetVector<mlir::Value> freeVars;
-      mlir::getUsedValuesDefinedAbove(op.getRegion(), freeVars);
-      if (!freeVars.empty()) {
-        mlir::Block &entry = op.getRegion().front();
-        mlir::OpBuilder::InsertionGuard guard(builder);
-        builder.setInsertionPoint(op);
-        Values broadcasts;
-        for (mlir::Value fv : freeVars) {
-          auto fvTy = mlir::dyn_cast<mlir::RankedTensorType>(fv.getType());
-          if (!fvTy || fvTy.getRank() != 0)
-            Undefined("elementwise lambda: non-scalar free variable");
-          auto broadcastTy =
-              mlir::RankedTensorType::get(shapeTy, fvTy.getElementType());
-          broadcasts.push_back(hlo::BroadcastInDimOp::create(
-              builder, broadcastTy, fv, mlir::SmallVector<int64_t>{}));
-          mlir::BlockArgument newArg =
-              entry.addArgument(fv.getType(), builder.getLoc());
-          mlir::replaceAllUsesInRegionWith(fv, newArg, op.getRegion());
-        }
-        op->insertOperands(op->getNumOperands(), broadcasts);
-      }
+      BroadcastFreeVarsIntoMapRegion(op, shapeTy, "elementwise lambda");
 
       finalResults.push_back(op->getResult(0));
     }
@@ -1817,21 +1831,14 @@ struct FutharkCompiler {
   }
 
   // segscan = segmap (fused per-element part) + an inclusive scalar,
-  // associative scan over the innermost (segment) dimension, implemented
-  // as a full-width, left-padded stablehlo.reduce_window (window size =
-  // the scan dimension's own length, stride 1) + an elementwise post-op.
-  //
-  // Per the brief, chlo.scan (is_associative=true) was the intended first
-  // step, but it's IsolatedFromAbove *and* its own docs say "ScanOp
-  // currently does not have a decomposition to StableHLO" -- i.e. XLA
-  // can't actually run it, the same dead end `ragged-dot` turned out to be
-  // (confirmed UNIMPLEMENTED on XLA:CPU in Phase 2/3 testing). Checked via
-  // an actual JAX reference lowering (jax.jit(jnp.cumsum).lower(...)
-  // .as_text()) that JAX itself never emits chlo.scan either -- it
-  // compiles cumsum to exactly this reduce_window pattern. Tuple operators
-  // fall out for free (reduce_window's inputs/init_values/results are all
-  // natively variadic, like stablehlo.reduce -- verified this time, unlike
-  // Phase 1's wrong assumption about stablehlo.map).
+  // associative scan over the innermost (segment) dimension (scalar
+  // operators via stablehlo.reduce_window below, tuple operators via the
+  // parallel-prefix algorithm in ScanRec -- see the dispatch and its
+  // comment further down) + an elementwise post-op. chlo.scan was tried
+  // first and dropped: despite its own doc comment's claim, it does
+  // decompose to StableHLO (a sequential stablehlo.while loop), but that
+  // makes it strictly worse than either path used here, which are both
+  // O(log n) parallel (see PROGRESS.md's Phase 5/6 for the full history).
   Values LowerSegScan(const SegScan &pSegScan, Ctx &ctx) {
     RequireThreadLevel(pSegScan.lvl);
 
@@ -1858,34 +1865,25 @@ struct FutharkCompiler {
     int64_t valueCount = (int64_t)neutral.size();
     int64_t scanDim = rank - 1;
 
-    // Non-commutativity is a real risk here -- confirmed empirically, not
-    // just by spec-reading: scan being inherently order-*dependent* (unlike
-    // reduce) doesn't mean every StableHLO primitive that can express it
-    // preserves left-to-right combination order for a non-commutative
-    // operator. stablehlo.reduce_window (used below for the scalar case)
-    // does NOT: a non-commutative test case (affine-map composition,
-    // scanned) silently produced a numerically *wrong* result (not a
-    // crash) on XLA:CPU. The tuple-case path below (originally chlo.scan,
-    // now the Phase 6 parallel-prefix algorithm -- see ScanRec) DOES
-    // preserve order -- verified against this exact failing case.
+    // stablehlo.reduce_window (scalar path below) does NOT reliably
+    // preserve left-to-right combination order for a non-commutative
+    // operator -- confirmed empirically, not just by spec-reading (see
+    // PROGRESS.md Phase 5). The tuple path (ScanRec's parallel-prefix
+    // algorithm) does preserve order and has no such restriction, but
+    // isn't used for scalars too because the dispatch below is keyed on
+    // tuple-vs-scalar arity, not on correctness.
     //
     // SegBinOp.comm can't be used to pick a cheaper path when safe:
-    // checked empirically that Futhark's own GPU IR dump never prints the
-    // "commutative" keyword for a SegScan's operator at all, even for a
-    // plain `scan (+)` (compared scan0.fut's dump against reduce.fut's,
-    // which does print it for the identical `+`) -- Futhark just doesn't
-    // track/emit this for scan, so the flag is always Noncommutative and
-    // can't distinguish safe from unsafe cases.
+    // Futhark's own GPU IR never prints "commutative" for a SegScan's
+    // operator at all (confirmed by diffing scan0.fut's dump against
+    // reduce.fut's for the identical `+`), so the flag is always
+    // Noncommutative here and can't distinguish safe from unsafe cases.
     //
-    // So: scalar operators go through reduce_window (parallelizable,
-    // faster, and the only case actually verified safe so far -- scalar
-    // non-commutative-but-associative operators are a narrower residual
-    // risk left unaddressed, no obvious Futhark scalar primitive produces
-    // one). Tuple operators go through the parallel-prefix algorithm
-    // (also O(log n) parallel steps, same as the scalar path, unlike the
-    // sequential chlo.scan-based implementation it replaced) -- verified
-    // correct for both commutative and non-commutative tuple operators,
-    // including ones reduce_window gets wrong.
+    // TODO: scalar non-commutative-but-associative operators are therefore
+    // an unaddressed residual risk through reduce_window below -- no
+    // obvious Futhark scalar primitive produces one today, but nothing
+    // currently gates against it either. See also
+    // LowerSegScanReduceWindow's own comment.
     Values scanned =
         valueCount == 1
             ? LowerSegScanReduceWindow(mapped, neutral, scanDim, segBinOp, ctx)
@@ -1899,9 +1897,15 @@ struct FutharkCompiler {
   // stablehlo.reduce_window (window size = the scan dimension's own
   // length, stride 1): an inclusive, forward scan, matching the exact
   // pattern JAX's own jnp.cumsum lowering uses (checked via
-  // jax.jit(jnp.cumsum).lower(...).as_text()). Its results are already the
-  // per-position inclusive scan values directly, no separate carry to
-  // discard.
+  // jax.jit(jnp.cumsum).lower(...).as_text() -- CPU-only, see
+  // LowerSegRed's comment for the caveat on all such checks in this
+  // file). Its results are already the per-position inclusive scan
+  // values directly, no separate carry to discard.
+  //
+  // TODO: unverified for a scalar non-commutative-but-associative
+  // operator (see LowerSegScan's comment) -- reduce_window is only
+  // confirmed order-preserving for the scalar cases tested so far, all
+  // of which happen to be commutative.
   Values LowerSegScanReduceWindow(Values mapped, Values neutral,
                                   int64_t scanDim, const SegBinOp &segBinOp,
                                   Ctx &ctx) {
@@ -1937,9 +1941,15 @@ struct FutharkCompiler {
         paddingAttr);
 
     // Per the StableHLO spec, the body's block args are (one value per
-    // windowed input, then one accumulator per init_value) -- same order
-    // as stablehlo.reduce, i.e. the opposite of Futhark's own
-    // SegBinOp.lambda.params convention (accumulators first).
+    // windowed input, then one accumulator per init_value) -- the
+    // opposite of Futhark's own SegBinOp.lambda.params convention
+    // (accumulators first), and also the opposite of plain
+    // stablehlo.reduce's convention used in LowerSegRed -- these two ops
+    // do NOT share a block-arg order despite both being reduce-shaped; see
+    // the table in LowerSegRed's comment. Confirmed via a JAX reference
+    // lowering for this op specifically (jax.lax.reduce_window with a
+    // non-commutative combiner, decoded term by term), not assumed to
+    // match stablehlo.reduce's convention.
     mlir::SmallVector<mlir::Type> argTys;
     for (mlir::Value v : mapped)
       argTys.push_back(mlir::RankedTensorType::get(
@@ -2064,9 +2074,10 @@ struct FutharkCompiler {
   // LowerElementwiseLambda (stablehlo.map is isolated-from-above).
   // Operand order matches Futhark's own SegBinOp.lambda.params convention
   // directly (accumulator_params... bound to `a`, new_value_params...
-  // bound to `b`) -- no transpose needed here, unlike the reduce_window/
-  // chlo.scan paths above, since this is a plain stablehlo.map with no
-  // StableHLO-mandated block-arg order to work around.
+  // bound to `b`) -- no transpose needed here, unlike
+  // LowerSegScanReduceWindow above (see the table in LowerSegRed's
+  // comment), since this is a plain stablehlo.map with no StableHLO-
+  // mandated block-arg order to work around.
   Values Combine(Values a, Values b, const SegBinOp &segBinOp, Ctx &ctx) {
     Values inputs(a.begin(), a.end());
     inputs.insert(inputs.end(), b.begin(), b.end());
@@ -2103,47 +2114,22 @@ struct FutharkCompiler {
         hlo::ReturnOp::create(builder, mlir::ValueRange{results[j]});
       }
 
-      mlir::SetVector<mlir::Value> freeVars;
-      mlir::getUsedValuesDefinedAbove(op.getRegion(), freeVars);
-      if (!freeVars.empty()) {
-        mlir::Block &entry = op.getRegion().front();
-        mlir::OpBuilder::InsertionGuard guard(builder);
-        builder.setInsertionPoint(op);
-        Values broadcasts;
-        for (mlir::Value fv : freeVars) {
-          auto fvTy = mlir::dyn_cast<mlir::RankedTensorType>(fv.getType());
-          if (!fvTy || fvTy.getRank() != 0)
-            Undefined("segscan parallel prefix: non-scalar free variable");
-          auto broadcastTy =
-              mlir::RankedTensorType::get(shapeTy, fvTy.getElementType());
-          broadcasts.push_back(hlo::BroadcastInDimOp::create(
-              builder, broadcastTy, fv, mlir::SmallVector<int64_t>{}));
-          mlir::BlockArgument newArg =
-              entry.addArgument(fv.getType(), builder.getLoc());
-          mlir::replaceAllUsesInRegionWith(fv, newArg, op.getRegion());
-        }
-        op->insertOperands(op->getNumOperands(), broadcasts);
-      }
+      BroadcastFreeVarsIntoMapRegion(op, shapeTy, "segscan parallel prefix");
 
       finalResults.push_back(op->getResult(0));
     }
     return finalResults;
   }
 
-  // Tuple-operator associative scan via jax.lax.associative_scan's own
-  // recursive Blelloch-style algorithm (ported from its Python source
-  // directly, not re-derived from the algorithm's prose description --
-  // confirmed the resulting op sequence against
-  // jax.jit(lambda a, b: lax.associative_scan(compose, (a, b)))
-  // .lower(...).as_text() for a tuple operator first). O(log n) sequential
-  // steps instead of chlo.scan's O(n) stablehlo.while loop -- a pure
-  // performance upgrade over the earlier chlo.scan-based implementation,
-  // which this one replaces outright (not kept behind a flag -- per
-  // CLAUDE.md, changing the code directly beats threading a flag through
-  // for a case with no actual need to pick between the two at runtime).
-  // All shapes are static here (per the scalars-as-0-d-tensor decision and
-  // Undefined() on dynamic sizes), so the recursion unrolls entirely at
-  // compile time -- exactly like JAX's own trace-time unrolling.
+  // Tuple-operator associative scan: jax.lax.associative_scan's own
+  // recursive Blelloch-style algorithm, ported directly from its Python
+  // source (not re-derived from prose) and cross-checked against its
+  // compiled op sequence (CPU-only, see LowerSegRed's comment for the
+  // caveat). O(log n) parallel steps, replacing the earlier chlo.scan
+  // implementation's O(n) sequential stablehlo.while loop outright. All
+  // shapes are static here (scalars-as-0-d-tensors + Undefined() on
+  // dynamic sizes), so the recursion unrolls entirely at compile time --
+  // exactly like JAX's own trace-time unrolling.
   Values ScanRec(Values elems, int64_t dim, const SegBinOp &segBinOp,
                  Ctx &ctx) {
     int64_t n = getRankedType(elems[0].getType()).getShape()[dim];
@@ -2185,6 +2171,12 @@ struct FutharkCompiler {
     return ScanRec(mapped, scanDim, segBinOp, ctx);
   }
 
+  // TODO: only SegThread (one GPU thread per iteration-space point) is
+  // supported. SegBlock (one GPU block per point, with further intra-block
+  // parallelism) and SegThreadInBlock (the inner level of such a nested
+  // SegOp) are gated here, unanalyzed -- lowering them would mean mapping
+  // Futhark's two-level block/thread nesting onto StableHLO's single flat
+  // iteration space, which hasn't been designed yet.
   void RequireThreadLevel(const SegLevel &lvl) {
     if (!std::holds_alternative<SegThread>(lvl))
       Undefined();
