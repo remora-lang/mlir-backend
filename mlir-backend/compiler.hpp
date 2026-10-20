@@ -650,40 +650,52 @@ struct FutharkCompiler {
       Undefined("with_acc: index array must already match the iteration "
                 "space");
 
-    // Value: must be either the same kind of identity affine read (a
-    // scalar update), or a trivial full-row/window slice (DimFix on the
-    // sole iteration id, DimSlice covering each remaining dimension's
-    // entire extent from 0 with unit stride) -- i.e. the array itself,
-    // unchanged.
-    const Exp *valExp = findDefiningExp(pUpdate->values[0]);
-    auto *valBasicOp = valExp ? std::get_if<ExpBasicOp>(&valExp->v) : nullptr;
-    auto *valIdx =
-        valBasicOp ? std::get_if<BasicOpIndex>(&valBasicOp->op.v) : nullptr;
-    if (!valIdx)
-      Undefined("with_acc: value is not a plain array read");
-    mlir::Value updates = ctx.subexps.lookup(valIdx->vName.name);
-    auto updatesTy = getRankedType(updates.getType());
-    if ((int64_t)valIdx->slice.dims.size() != updatesTy.getRank())
-      Undefined("with_acc: value is not a trivial full-window read");
-    for (int64_t d = 0; d < updatesTy.getRank(); ++d) {
-      const auto &dim = valIdx->slice.dims[d];
-      if (d == 0) {
-        auto *fix = std::get_if<DimFix<SubExp>>(&dim.v);
-        auto *var = fix ? std::get_if<VarSubExp>(&fix->i.v) : nullptr;
-        if (!var || var->v.name != iterSpace[0].id)
-          Undefined("with_acc: value is not a trivial full-window read");
-      } else {
-        auto *slice = std::get_if<DimSlice<SubExp>>(&dim.v);
-        auto *start =
-            slice ? std::get_if<ConstantSubExp>(&slice->start.v) : nullptr;
-        auto *stride =
-            slice ? std::get_if<ConstantSubExp>(&slice->stride.v) : nullptr;
-        if (!start || start->GetIntValue() != 0 || !stride ||
-            stride->GetIntValue() != 1 ||
-            toShapeType(slice->length) != updatesTy.getShape()[d])
-          Undefined("with_acc: value is not a trivial full-window read");
+    // Value: either a literal constant (a uniform scatter-fill, e.g.
+    // `update_acc(acc, {i}, {true})` -- no window, one value per index),
+    // or the same kind of identity affine read (a scalar update), or a
+    // trivial full-row/window slice (DimFix on the sole iteration id,
+    // DimSlice covering each remaining dimension's entire extent from 0
+    // with unit stride) -- i.e. the array itself, unchanged.
+    mlir::Value updates;
+    if (std::holds_alternative<ConstantSubExp>(pUpdate->values[0].v)) {
+      mlir::Value scalar = LowerSubExp(pUpdate->values[0], ctx);
+      mlir::Type elemTy = getRankedType(scalar.getType()).getElementType();
+      updates = hlo::BroadcastInDimOp::create(
+          builder,
+          mlir::RankedTensorType::get({indicesTy.getShape()[0]}, elemTy),
+          scalar, mlir::SmallVector<int64_t>{});
+    } else {
+      const Exp *valExp = findDefiningExp(pUpdate->values[0]);
+      auto *valBasicOp = valExp ? std::get_if<ExpBasicOp>(&valExp->v) : nullptr;
+      auto *valIdx =
+          valBasicOp ? std::get_if<BasicOpIndex>(&valBasicOp->op.v) : nullptr;
+      if (!valIdx)
+        Undefined("with_acc: value is not a plain array read");
+      updates = ctx.subexps.lookup(valIdx->vName.name);
+      auto updatesTy = getRankedType(updates.getType());
+      if ((int64_t)valIdx->slice.dims.size() != updatesTy.getRank())
+        Undefined("with_acc: value is not a trivial full-window read");
+      for (int64_t d = 0; d < updatesTy.getRank(); ++d) {
+        const auto &dim = valIdx->slice.dims[d];
+        if (d == 0) {
+          auto *fix = std::get_if<DimFix<SubExp>>(&dim.v);
+          auto *var = fix ? std::get_if<VarSubExp>(&fix->i.v) : nullptr;
+          if (!var || var->v.name != iterSpace[0].id)
+            Undefined("with_acc: value is not a trivial full-window read");
+        } else {
+          auto *slice = std::get_if<DimSlice<SubExp>>(&dim.v);
+          auto *start =
+              slice ? std::get_if<ConstantSubExp>(&slice->start.v) : nullptr;
+          auto *stride =
+              slice ? std::get_if<ConstantSubExp>(&slice->stride.v) : nullptr;
+          if (!start || start->GetIntValue() != 0 || !stride ||
+              stride->GetIntValue() != 1 ||
+              toShapeType(slice->length) != updatesTy.getShape()[d])
+            Undefined("with_acc: value is not a trivial full-window read");
+        }
       }
     }
+    auto updatesTy = getRankedType(updates.getType());
 
     int64_t windowRank = updatesTy.getRank() - 1;
     mlir::SmallVector<int64_t> updateWindowDims;
