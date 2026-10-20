@@ -502,6 +502,22 @@ struct FutharkCompiler {
         vTy.getNumElements() == tTy.getNumElements()) {
       return hlo::ReshapeOp::create(builder, tTy, value);
     }
+    // `type` is the call site's own declared type, which for a blackbox
+    // (or a function whose result involves a Futhark existential size
+    // our sizeEnv/gather-idiom recognition doesn't need to resolve, e.g.
+    // ragged_dot_nonuniform's `r`) may be less precise -- some dims
+    // dynamic -- than `value`'s own actual, already-static type. Keep
+    // the more precise type rather than forcing a cast that would only
+    // throw the precision away; the caller never needed the dynamic
+    // annotation to be literal, only compatible.
+    if (vTy && tTy && vTy.getElementType() == tTy.getElementType() &&
+        vTy.getRank() == tTy.getRank()) {
+      bool compatible = true;
+      for (auto [vDim, tDim] : llvm::zip_equal(vTy.getShape(), tTy.getShape()))
+        compatible &= mlir::ShapedType::isDynamic(tDim) || vDim == tDim;
+      if (compatible)
+        return value;
+    }
     llvm::errs() << "error: tried to cast\n\n"
                  << value << "\n\nto type\n"
                  << type << "\n";
