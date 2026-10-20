@@ -1640,8 +1640,11 @@ struct FutharkCompiler {
           Values results;
           for (auto [v, ty] : llvm::zip_equal(scalars, g.retType)) {
             // The body's type is the inner (scalar) type; the gpu op lifts each
-            // result into a size-1 array.
-            auto lifted = mlir::RankedTensorType::get({1}, LowerTy(ty));
+            // result into a size-1 array. LowerTy(ty) is itself a 0-d tensor
+            // (scalars are 0-d tensors), so the lifted array's element type
+            // is its element type, not the 0-d tensor type itself.
+            auto lifted = mlir::RankedTensorType::get(
+                {1}, getRankedType(LowerTy(ty)).getElementType());
             results.push_back(hlo::ReshapeOp::create(builder, lifted, v));
           }
           return results;
