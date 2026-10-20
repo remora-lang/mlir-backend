@@ -2849,14 +2849,18 @@ struct FutharkCompiler {
       return hlo::SubtractOp::create(builder, op0, op1);
 
     // Futhark's `squot` truncates towards zero, matching stablehlo.divide's
-    // (and C's) integer division. `sdiv`/`sdiv_up` round toward -inf/+inf;
-    // `udiv`/`udiv_up` are the unsigned equivalents -- no direct StableHLO
-    // op, flagged rather than risking wrong rounding.
-    if (std::get_if<BinOpSQuot>(&binOp.v) || std::get_if<BinOpFDiv>(&binOp.v))
+    // (and C's) integer division. `sdiv`/`udiv` round toward -inf, which
+    // differs from truncation only when the result would be negative --
+    // for the non-negative sizes and indices in this IR (same reasoning
+    // as srem/smod below) they coincide with squot, so these map to the
+    // same op. `sdiv_up`/`udiv_up` round toward +inf (ceiling division,
+    // e.g. "how many blocks of size k cover n elements") -- genuinely
+    // different from truncation whenever the division isn't exact, so
+    // still flagged rather than risking wrong rounding.
+    if (std::get_if<BinOpSQuot>(&binOp.v) || std::get_if<BinOpFDiv>(&binOp.v) ||
+        std::get_if<BinOpSDiv>(&binOp.v) || std::get_if<BinOpUDiv>(&binOp.v))
       return hlo::DivOp::create(builder, op0, op1);
-    if (std::get_if<BinOpSDivUp>(&binOp.v) ||
-        std::get_if<BinOpSDiv>(&binOp.v) || std::get_if<BinOpUDiv>(&binOp.v) ||
-        std::get_if<BinOpUDivUp>(&binOp.v))
+    if (std::get_if<BinOpSDivUp>(&binOp.v) || std::get_if<BinOpUDivUp>(&binOp.v))
       Undefined("binop: rounding div");
 
     // `srem`/`smod` are truncated/floored remainder -- for the non-negative
