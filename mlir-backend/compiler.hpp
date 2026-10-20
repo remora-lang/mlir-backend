@@ -941,19 +941,16 @@ struct FutharkCompiler {
     return op->getResults();
   }
 
-  // DEAD CODE, kept intentionally for now (not deleted in the cleanup pass
-  // that otherwise touched this file -- see conversation/commit history):
-  // this is the only call site in the file still emitting real
-  // linalg/arith/tensor ops (predates the StableHLO rewrite; never
-  // migrated), which is also the only reason those dialects are still in
-  // the registration list in the constructor above. Unreachable in
-  // practice: its two call sites (`ragged_matmul_black_box.fut`,
-  // `batched_ragged_matmul_black_box.fut`) both declare dynamic-shaped
-  // entry parameters and hit the "dynamic-shaped function parameter"
-  // Undefined() gate in LowerFunction before this ever runs. TODO: either
-  // delete this function and drop the now-unneeded dialect registrations,
-  // or decide this blackbox is worth reviving for a real (static-shaped)
-  // nonuniform-ragged-dot test and rewrite it in StableHLO.
+  // Live again as of ragged_matmul_mix.fut (custom-flattening's
+  // #[flatten_to_nonuniform(...)] routed directly at this blackbox):
+  // the static-m branch below is now StableHLO-only, migrated off the
+  // old (pre-rewrite, linalg/arith/tensor) code this previously was.
+  // `ragged_matmul_black_box.fut`/`batched_ragged_matmul_black_box.fut`
+  // still can't reach this (their entry parameters are genuinely
+  // dynamic-shaped, hitting LowerFunction's own gate first), and the
+  // dynamic-m branch further down is still unmigrated/unreachable --
+  // nothing currently exercises it, so it's left exactly as it was
+  // rather than guess-fixed.
   Values LowerRaggedDotNonUniform(mlir::ValueRange args,
                                   mlir::TypeRange retTypes, Ctx &ctx) {
     // A nonuniform ragged_dot expressed over the flat segmented representation
@@ -992,30 +989,19 @@ struct FutharkCompiler {
     auto g = getRankedType(ms.getType()).getShape().back();
 
     // Recover a `replicate`d scalar constant. Futhark's replicate lowers to
-    // linalg.broadcast(from_elements(constant)) (see BasicOpReplicate), so peel
-    // those to reach the scalar; also accept a folded dense constant directly.
+    // hlo::BroadcastInDimOp(hlo::ConstantOp) (see BasicOpReplicate's live,
+    // StableHLO-only lowering), so peel those -- and any `:>` size
+    // coercion's hlo::ReshapeOp -- to reach the underlying scalar
+    // constant, then let getConstantInt's own dense-constant fold handle
+    // the rest.
     auto replicatedInt = [&](mlir::Value v) -> int64_t {
       mlir::Value cur = v;
-      // Peel any shape-only wrappers (a `:>` size coercion in the source lowers
-      // to reshape/cast) to reach the underlying replicate.
       while (auto *op = cur.getDefiningOp()) {
-        if (mlir::isa<mlir::tensor::ReshapeOp,
-                      mlir::tensor::CastOp,
-                      mlir::tensor::ExpandShapeOp,
-                      mlir::tensor::CollapseShapeOp>(op))
+        if (mlir::isa<hlo::ReshapeOp, hlo::BroadcastInDimOp>(op))
           cur = op->getOperand(0);
         else
           break;
       }
-      mlir::DenseIntElementsAttr dense;
-      if (mlir::matchPattern(cur, mlir::m_Constant(&dense)))
-        return dense.getValues<int64_t>()[0];
-      // Futhark's replicate lowers to
-      // linalg.broadcast(from_elements(constant)).
-      if (auto bcast = cur.getDefiningOp<mlir::linalg::BroadcastOp>())
-        cur = bcast.getInput();
-      if (auto fe = cur.getDefiningOp<mlir::tensor::FromElementsOp>())
-        cur = fe.getOperand(0);
       return getConstantInt(cur);
     };
 
@@ -1043,46 +1029,51 @@ struct FutharkCompiler {
       auto rhsTy = mlir::RankedTensorType::get({g, k, n}, elementTy);
       auto bDataTy = getRankedType(bData.getType());
       mlir::Value rhs =
-          bDataTy == rhsTy
-              ? bData
-              : mlir::tensor::ExpandShapeOp::create(
-                    builder,
-                    rhsTy,
-                    bData,
-                    *mlir::getReassociationIndicesForReshape(bDataTy, rhsTy))
-                    .getResult();
-      // lhs [m][k]: expand_shape needs a statically-sized source, so cast the
-      // (possibly dynamic) flat a_data to [m*k] first.
+          bDataTy == rhsTy ? bData
+                           : hlo::ReshapeOp::create(builder, rhsTy, bData)
+                                 .getResult();
+      // lhs [m][k]: a_data must already be statically shaped here -- unlike
+      // the old (pre-StableHLO) tensor::CastOp this replaced, there is no
+      // valid StableHLO way to assert a dynamic shape into a static one, so
+      // a genuinely dynamic a_data is a real Undefined(), not a cast.
+      if (!aDataTy.hasStaticShape())
+        Undefined("ragged_dot_nonuniform: a_data is not statically shaped");
       auto lhsTy = mlir::RankedTensorType::get({m, k}, elementTy);
-      auto flatTy = mlir::RankedTensorType::get({m * k}, elementTy);
-      mlir::Value flat =
-          aDataTy.hasStaticShape()
-              ? aData
-              : mlir::tensor::CastOp::create(builder, flatTy, aData)
-                    .getResult();
-      mlir::SmallVector<mlir::ReassociationIndices> reassoc{{0, 1}};
-      mlir::Value lhs =
-          mlir::tensor::ExpandShapeOp::create(builder, lhsTy, flat, reassoc)
-              .getResult();
+      mlir::Value lhs = hlo::ReshapeOp::create(builder, lhsTy, aData);
       // Mode 1: ragged dim lhs axis 0; contract lhs axis 1 with rhs axis 1;
-      // rhs group dim axis 0; no batching.
+      // rhs group dim axis 0; no batching -- same shape LowerRaggedDot's
+      // own CPU-fallback gate already recognizes, so mirror its dispatch
+      // here too rather than always emitting chlo.RaggedDotOp
+      // unconditionally (see cpu_dev_fallbacks.hpp).
       mlir::SmallVector<int64_t> noBatch{};
-      resultMN = mlir::chlo::RaggedDotOp::create(
-                     builder,
-                     mlir::RankedTensorType::get({m, n}, elementTy),
-                     lhs,
-                     rhs,
-                     ms,
-                     mlir::chlo::RaggedDotDimensionNumbersAttr::get(
-                         &context,
-                         noBatch,
-                         noBatch,
-                         mlir::SmallVector<int64_t>{1},
-                         mlir::SmallVector<int64_t>{1},
-                         mlir::SmallVector<int64_t>{0},
-                         mlir::SmallVector<int64_t>{0}),
-                     {})
-                     ->getResult(0);
+      mlir::SmallVector<int64_t> lhsContracting{1};
+      mlir::SmallVector<int64_t> rhsGroup{0};
+      mlir::SmallVector<int64_t> resultShape{m, n};
+      if (raggedDotCpuFallback &&
+          cpu_dev_fallbacks::IsRaggedDotCpuFallbackSupported(
+              lhs, rhs, noBatch, lhsContracting, /*lhsRaggedDim=*/0,
+              rhsGroup)) {
+        resultMN = cpu_dev_fallbacks::LowerRaggedDotCpuFallback(
+            builder, context, lhs, rhs, ms, noBatch, lhsContracting,
+            /*lhsRaggedDim=*/0, rhsGroup, resultShape);
+      } else {
+        resultMN = mlir::chlo::RaggedDotOp::create(
+                       builder,
+                       mlir::RankedTensorType::get({m, n}, elementTy),
+                       lhs,
+                       rhs,
+                       ms,
+                       mlir::chlo::RaggedDotDimensionNumbersAttr::get(
+                           &context,
+                           noBatch,
+                           noBatch,
+                           lhsContracting,
+                           mlir::SmallVector<int64_t>{1},
+                           mlir::SmallVector<int64_t>{0},
+                           rhsGroup),
+                       {})
+                       ->getResult(0);
+      }
     } else {
       // ---- dynamic m: the dense masked dot_general strategy
       // (gg/ragged_matmul). IREE cannot legalize chlo.ragged_dot's internal
@@ -1185,34 +1176,31 @@ struct FutharkCompiler {
     }
 
     // data: flatten [m][n] -> [m*n].
-    auto dataTy = mlir::RankedTensorType::get(
-        {mlir::ShapedType::isDynamic(m) ? dyn : m * n}, elementTy);
-    mlir::SmallVector<mlir::ReassociationIndices> dataReassoc{{0, 1}};
-    mlir::Value data = mlir::tensor::CollapseShapeOp::create(
-                           builder, dataTy, resultMN, dataReassoc)
-                           .getResult();
+    int64_t mn = mlir::ShapedType::isDynamic(m) ? dyn : m * n;
+    auto dataTy = mlir::RankedTensorType::get({mn}, elementTy);
+    mlir::Value data = hlo::ReshapeOp::create(builder, dataTy, resultMN);
 
-    // r = length of data (= m*n), as i64.
-    auto rIdx = mlir::tensor::DimOp::create(builder, data, 0).getResult();
-    mlir::Value r =
-        mlir::arith::IndexCastOp::create(builder, builder.getI64Type(), rIdx)
-            .getResult();
-
-    // Dummy auxiliary segment structures.
+    // r = length of data (= m*n), as i64 -- static whenever m is (the
+    // only case this function currently reaches; see its header
+    // comment).
+    if (mlir::ShapedType::isDynamic(mn))
+      Undefined("ragged_dot_nonuniform: dynamic m (data length)");
     auto i64Ty = builder.getI64Type();
+    mlir::Value r = hlo::ConstantOp::create(
+        builder, mlir::DenseElementsAttr::get(
+                     mlir::RankedTensorType::get({}, i64Ty),
+                     builder.getI64IntegerAttr(mn)));
+
+    // Dummy auxiliary segment structures -- see matmul_nonuniform_bb's
+    // own callers: nothing downstream of this blackbox ever reads them.
     auto gI64Ty = mlir::RankedTensorType::get({g}, i64Ty);
-    auto zeros = mlir::DenseElementsAttr::get(gI64Ty, static_cast<int64_t>(0));
-    mlir::Value sizes = mlir::arith::ConstantOp::create(builder, zeros);
-    mlir::Value offsets = mlir::arith::ConstantOp::create(builder, zeros);
-    auto flagsTy = mlir::RankedTensorType::get({dyn}, builder.getI1Type());
-    auto flagsEmpty =
-        mlir::tensor::EmptyOp::create(builder, flagsTy, mlir::ValueRange{rIdx});
-    auto trueC =
-        mlir::arith::ConstantOp::create(builder, builder.getBoolAttr(true));
-    mlir::Value flags =
-        mlir::linalg::FillOp::create(
-            builder, mlir::ValueRange{trueC}, mlir::ValueRange{flagsEmpty})
-            .result();
+    mlir::Value sizes = hlo::ConstantOp::create(
+        builder,
+        mlir::DenseElementsAttr::get(gI64Ty, builder.getZeroAttr(i64Ty)));
+    mlir::Value offsets = sizes;
+    auto flagsTy = mlir::RankedTensorType::get({mn}, builder.getI1Type());
+    mlir::Value flags = hlo::ConstantOp::create(
+        builder, mlir::DenseElementsAttr::get(flagsTy, builder.getBoolAttr(true)));
 
     return {r, sizes, flags, offsets, data};
   }
@@ -1505,6 +1493,7 @@ struct FutharkCompiler {
               return ragged_unflatten::LowerDummyReplicate(
                   builder, tensorTy.getElementType());
             Undefined("replicate: dynamic shape");
+          }
           auto original = tensorTy.getShape();
           before.insert(before.end(), original.begin(), original.end());
           auto resultTy =
