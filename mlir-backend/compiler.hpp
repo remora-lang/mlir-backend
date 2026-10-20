@@ -12,6 +12,7 @@
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/Matchers.h"
 #include "ragged_unflatten_gather.hpp"
+#include "size_env.hpp"
 #include "stablehlo/dialect/ChloOps.h"
 #include "stablehlo/dialect/StablehloOps.h"
 #include "utils.hpp"
@@ -52,6 +53,16 @@ public:
                       loc.file_name(),
                       loc.line(),
                       name));
+    return v->second;
+  }
+
+  // Non-throwing variant for call sites that genuinely expect a name may
+  // not (yet) be bound -- e.g. size_env.hpp's backfill, which only wants
+  // to know an argument's type *if* it's already been lowered.
+  std::optional<V> tryLookup(const K &name) const {
+    auto v = env.find(name);
+    if (v == env.end())
+      return std::nullopt;
     return v->second;
   }
 
@@ -403,6 +414,18 @@ struct FutharkCompiler {
               if (std::holds_alternative<IntValue>(c->v.v))
                 sizeEnv[param.name] = c->GetIntValue();
           }
+          // See size_env.hpp: a size that isn't itself passed as a
+          // literal (e.g. `a_k`, driving `a_data: [a_k]f32`) may still be
+          // recoverable from that *array* argument's own already-static
+          // type, if it's already been lowered.
+          size_env::BackfillFromArrayArgs(
+              fun.params, e.args,
+              [&](const std::string &name) -> std::optional<mlir::Type> {
+                if (auto v = ctx.subexps.tryLookup(name))
+                  return v->getType();
+                return std::nullopt;
+              },
+              sizeEnv);
           auto returns = match(
               LowerFunction(fun, sizeEnv),
               [&](mlir::func::FuncOp func) -> Values {
