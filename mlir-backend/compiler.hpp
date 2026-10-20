@@ -3,6 +3,7 @@
 #include "blackbox.hpp"
 #include "cpu_dev_fallbacks.hpp"
 #include "debug.hpp"
+#include "exclusive_scan.hpp"
 #include "ir/core.hpp"
 #include "ir/segop.hpp"
 #include "ir/syntax.hpp"
@@ -2209,6 +2210,36 @@ struct FutharkCompiler {
     int64_t rank = std::ssize(iterSpace);
     if (rank == 0)
       Undefined("segscan: rank 0");
+
+    // See exclusive_scan.hpp: Futhark's canonical exclusive-scan source
+    // idiom isn't expressible through LowerSegMap at all (an offset,
+    // branch-nested read), so it's recognized and handled directly here
+    // instead of falling through to the general mapped-scan path below.
+    if (rank == 1) {
+      if (auto match =
+              exclusive_scan::TryMatch(iterSpace[0].id, pSegScan.body)) {
+        mlir::Value arrFull = ctx.subexps.lookup(match->array.name);
+        Values shiftNeutral;
+        for (auto &e : segBinOp.neutral)
+          shiftNeutral.push_back(LowerSubExp(e, ctx));
+        int64_t scanDim = rank - 1;
+        Values inclusive = LowerSegScanReduceWindow(
+            {arrFull}, shiftNeutral, scanDim, segBinOp, ctx);
+        mlir::Value inc = inclusive[0];
+        auto incTy = getRankedType(inc.getType());
+        int64_t n = incTy.getShape()[scanDim];
+        mlir::Value fill = LowerSubExp(match->fillValue, ctx);
+        mlir::Value fillVec = hlo::ReshapeOp::create(
+            builder, mlir::RankedTensorType::get({1}, incTy.getElementType()),
+            fill);
+        mlir::Value head = hlo::SliceOp::create(
+            builder, inc, mlir::SmallVector<int64_t>{0},
+            mlir::SmallVector<int64_t>{n - 1}, mlir::SmallVector<int64_t>{1});
+        mlir::Value shifted = hlo::ConcatenateOp::create(
+            builder, mlir::ValueRange{fillVec, head}, (uint64_t)scanDim);
+        return LowerElementwiseLambda(pSegScan.post_op.lambda, {shifted}, ctx);
+      }
+    }
 
     Values mapped = LowerSegMap(
         pSegScan.lvl, pSegScan.space, pSegScan.body, pSegScan.ret, ctx);
