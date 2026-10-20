@@ -56,8 +56,19 @@ int main(int argc, char *argv[]) {
   FutharkCompiler compiler(prog, ctx, builder);
   compiler.precision = precision;
   compiler.raggedDotCpuFallback = raggedDotCpuFallback;
-  for (auto fun : prog.funs) {
-    compiler.LowerFunction(fun);
+  // Only the entry point is lowered eagerly. Every other top-level function
+  // (blackboxes always, and now also a plain #[noinline] helper whose own
+  // declared param types are named-size-dependent, e.g. a custom-flattening
+  // flatten target) is pulled in lazily, from whichever call site actually
+  // reaches it -- see LowerFunction's sizeEnv comment for why a plain
+  // helper specifically needs that call-site context, and ExpApply for
+  // where it's supplied. A function nothing calls (e.g. a now-dead
+  // original callee the flattening rewrite replaced) is simply never
+  // visited, which is correct: it has no business appearing in the
+  // module at all.
+  for (auto &fun : prog.funs) {
+    if (fun.entry)
+      compiler.LowerFunction(fun);
   }
 
   compiler.module.print(llvm::outs());

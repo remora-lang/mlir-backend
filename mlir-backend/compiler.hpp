@@ -111,11 +111,25 @@ struct GatherRead {
   std::vector<VName> indexNames;
 };
 
-inline int64_t toShapeType(SubExp dim) {
+// sizeEnv resolves a dim that's a *named* size (a VarSubExp referring to an
+// earlier i64 function parameter, e.g. `[b][n][k]f32` where `b` is itself a
+// param) to a concrete value known at a specific call site -- see
+// ExpApply's handling of a plain (non-blackbox) function call in LowerExp,
+// which is the only place that ever builds a non-empty sizeEnv. Every other
+// caller passes the default empty map, so an unresolved name still falls
+// back to kDynamic exactly as before.
+inline int64_t
+toShapeType(SubExp dim,
+            const std::unordered_map<std::string, int64_t> &sizeEnv = {}) {
   return match(
       dim,
       [&](const ConstantSubExp &c) { return c.GetIntValue(); },
-      [&](const VarSubExp &) { return mlir::ShapedType::kDynamic; });
+      [&](const VarSubExp &v) {
+        auto it = sizeEnv.find(v.v.name);
+        if (it != sizeEnv.end())
+          return it->second;
+        return mlir::ShapedType::kDynamic;
+      });
 }
 
 inline bool IsUnitType(const Type &type) {
@@ -134,10 +148,12 @@ concept Iterable = std::ranges::input_range<R> &&
                    std::same_as<std::ranges::range_value_t<R>, V>;
 
 template <Iterable<SubExp> R>
-inline std::vector<int64_t> toShapeType(const R &dims) {
+inline std::vector<int64_t>
+toShapeType(const R &dims,
+            const std::unordered_map<std::string, int64_t> &sizeEnv = {}) {
   std::vector<int64_t> dimsTy;
   for (auto &d : dims)
-    dimsTy.push_back(toShapeType(d));
+    dimsTy.push_back(toShapeType(d, sizeEnv));
   return dimsTy;
 }
 
@@ -197,7 +213,19 @@ struct FutharkCompiler {
     builder.setInsertionPointToStart(module.getBody());
   }
 
-  std::variant<mlir::func::FuncOp, BlackBox> LowerFunction(const FunDef &fun) {
+  // sizeEnv lets a call to a plain (non-blackbox, non-entry) function whose
+  // own declared param/result types are named-size-dependent (e.g.
+  // `[b][n][k]f32` where `b` is itself an earlier i64 param) resolve those
+  // names to the concrete values known at THIS call -- see ExpApply, the
+  // only caller that ever passes a non-empty map. Every FunDef is only ever
+  // emitted once per distinct call site in this backend's GPU IR input (a
+  // genuinely polymorphic function reused with different concrete sizes at
+  // two call sites would need a different design -- not a case seen so
+  // far), so caching the resulting FuncOp by `fun` alone (ignoring sizeEnv
+  // on a cache hit) is safe.
+  std::variant<mlir::func::FuncOp, BlackBox>
+  LowerFunction(const FunDef &fun,
+                const std::unordered_map<std::string, int64_t> &sizeEnv = {}) {
     if (auto blackbox = MaybeBlackBox(fun.attrs))
       return blackbox.value();
 
@@ -209,7 +237,7 @@ struct FutharkCompiler {
 
     std::vector<mlir::Type> retTypes;
     for (const auto &t : fun.retType) {
-      retTypes.push_back(LowerTy(t.first.v));
+      retTypes.push_back(LowerTy(t.first.v, sizeEnv));
     }
     // Unit-typed params carry no runtime data, so they're dropped from
     // @main's actual signature rather than lowered to some placeholder type.
@@ -218,7 +246,7 @@ struct FutharkCompiler {
                          });
     std::vector<mlir::Type> inputTypes;
     for (const auto &param : runtimeParams) {
-      inputTypes.push_back(LowerTy(param.dec.v));
+      inputTypes.push_back(LowerTy(param.dec.v, sizeEnv));
     }
 
     // XLA requires every shape in the module to be static.
@@ -338,8 +366,27 @@ struct FutharkCompiler {
           for (auto ty : std::views::elements<0>(e.retTypes)) {
             retTypes.push_back(LowerTy(ty.v));
           }
+          // The custom-flattening feature's #[noinline] flatten targets
+          // (e.g. batched_matmul's dummy wrapper) are the first case this
+          // backend has seen of a plain (non-blackbox) function whose own
+          // declared param types are named-size-dependent (`[b][n][k]f32`)
+          // rather than already-literal -- see LowerFunction's sizeEnv
+          // comment. Resolve those names from whichever of THIS call's
+          // actual arguments are themselves compile-time literals (the
+          // size arguments always are, in the GPU IR this backend parses:
+          // Futhark passes a function's array dims as explicit leading
+          // i64 arguments).
+          std::unordered_map<std::string, int64_t> sizeEnv;
+          for (auto [param, argDiet] : llvm::zip_equal(fun.params, e.args)) {
+            if (auto *c = std::get_if<ConstantSubExp>(&argDiet.first.v))
+              // Only an integer literal is ever a *size* -- a bool/float
+              // constant argument (e.g. argsort's is_stable) is not, and
+              // PrimValue::GetIntValue() throws on one.
+              if (std::holds_alternative<IntValue>(c->v.v))
+                sizeEnv[param.name] = c->GetIntValue();
+          }
           auto returns = match(
-              LowerFunction(fun),
+              LowerFunction(fun, sizeEnv),
               [&](mlir::func::FuncOp func) -> Values {
                 // Calling a function that takes a dynamically shaped tensor
                 // with a statically shaped one is a type error.
@@ -2900,11 +2947,15 @@ struct FutharkCompiler {
     return nullptr;
   }
 
-  std::vector<int64_t> LowerShape(const Shape &shape) {
-    return toShapeType(shape.dims);
+  std::vector<int64_t>
+  LowerShape(const Shape &shape,
+             const std::unordered_map<std::string, int64_t> &sizeEnv = {}) {
+    return toShapeType(shape.dims, sizeEnv);
   }
 
-  mlir::Type LowerTy(Type t) {
+  mlir::Type
+  LowerTy(Type t,
+          const std::unordered_map<std::string, int64_t> &sizeEnv = {}) {
     auto baseTy = &t.t.v;
     if (auto *val = std::get_if<TypePrim<Shape, NoUniqueness>>(baseTy)) {
       // Scalars are 0-d tensors (a hard XLA requirement), unlike an array's
@@ -2914,7 +2965,7 @@ struct FutharkCompiler {
     }
 
     if (auto *val = std::get_if<TypeArray<Shape, NoUniqueness>>(baseTy)) {
-      return LowerTypeArray(*val);
+      return LowerTypeArray(*val, sizeEnv);
     }
 
     Undefined();
@@ -2953,8 +3004,10 @@ struct FutharkCompiler {
     return builder.getIntegerType(1);
   }
 
-  mlir::Type LowerTypeArray(TypeArray<Shape, NoUniqueness> typeArray) {
-    return mlir::RankedTensorType::get(LowerShape(typeArray.shape),
+  mlir::Type
+  LowerTypeArray(TypeArray<Shape, NoUniqueness> typeArray,
+                 const std::unordered_map<std::string, int64_t> &sizeEnv = {}) {
+    return mlir::RankedTensorType::get(LowerShape(typeArray.shape, sizeEnv),
                                        LowerPrimType(typeArray.elem));
   }
 
