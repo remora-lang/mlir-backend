@@ -114,7 +114,7 @@ inline mlir::Value LowerRaggedDotCpuFallback(
     llvm::ArrayRef<int64_t> lhsBatchingDimensions,
     llvm::ArrayRef<int64_t> lhsContractingDimensions, int64_t lhsRaggedDim,
     llvm::ArrayRef<int64_t> rhsGroupDimensions,
-    llvm::ArrayRef<int64_t> resultShape) {
+    llvm::ArrayRef<int64_t> resultShape, mlir::ArrayAttr precisionConfig) {
   auto lhsTy = mlir::cast<mlir::RankedTensorType>(lhs.getType());
   auto rhsTy = mlir::cast<mlir::RankedTensorType>(rhs.getType());
   mlir::Type elemTy = lhsTy.getElementType();
@@ -191,7 +191,7 @@ inline mlir::Value LowerRaggedDotCpuFallback(
       /*lhsContractingDimensions=*/{0, 2}, /*rhsContractingDimensions=*/{0, 1});
   auto resultTy = mlir::RankedTensorType::get(resultShape, elemTy);
   auto dot = hlo::DotGeneralOp::create(builder, resultTy, masked, rhs,
-                                       dotDims, {}, {});
+                                       dotDims, precisionConfig, {});
   (void)n;
   return dot->getResult(0);
 }

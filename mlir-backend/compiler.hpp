@@ -200,6 +200,19 @@ struct FutharkCompiler {
     return builder.getArrayAttr({attr, attr});
   }
 
+  // Same, for chlo.ragged_dot, whose precision_config uses CHLO's own
+  // Precision enum (same cases as StableHLO's). Without it XLA:GPU runs
+  // ragged_dot at default precision (TF32 on Ampere+) even under
+  // --precision highest.
+  mlir::ArrayAttr ChloPrecisionConfig() {
+    if (precision == hlo::Precision::DEFAULT)
+      return {};
+    auto attr = mlir::chlo::PrecisionAttr::get(
+        &context, *mlir::chlo::symbolizePrecision(
+                      hlo::stringifyPrecision(precision)));
+    return builder.getArrayAttr({attr, attr});
+  }
+
   // Set from the command line (mlir-backend's --ragged-dot-cpu-fallback
   // flag) before lowering starts. Default false (the real, performance-
   // relevant chlo.RaggedDotOp path, used by LowerRaggedDot below); only
@@ -843,7 +856,7 @@ struct FutharkCompiler {
 
   Values LowerRaggedDot(mlir::ValueRange args, mlir::TypeRange retTypes,
                         Ctx &ctx) {
-    // CHLO ragged_dot (without support for precision parameters)
+    // CHLO ragged_dot (precision from --precision, see ChloPrecisionConfig)
     //
     // RaggedDot takes three tensor arguments (lhs, rhs, and group_sizes).
     //
@@ -958,7 +971,7 @@ struct FutharkCompiler {
       mlir::Value result = cpu_dev_fallbacks::LowerRaggedDotCpuFallback(
           builder, context, lhs, rhs, groupSizes, lhsBatchingDimensions,
           lhsContractingDimensions, lhsRaggedDim, rhsGroupDimensions,
-          resultShape);
+          resultShape, PrecisionConfig());
       return {result};
     }
 
@@ -975,7 +988,7 @@ struct FutharkCompiler {
                                                        rhsContractingDimensions,
                                                        {lhsRaggedDim},
                                                        rhsGroupDimensions),
-        {});
+        ChloPrecisionConfig());
 
     return op->getResults();
   }
@@ -1094,7 +1107,7 @@ struct FutharkCompiler {
               rhsGroup)) {
         resultMN = cpu_dev_fallbacks::LowerRaggedDotCpuFallback(
             builder, context, lhs, rhs, ms, noBatch, lhsContracting,
-            /*lhsRaggedDim=*/0, rhsGroup, resultShape);
+            /*lhsRaggedDim=*/0, rhsGroup, resultShape, PrecisionConfig());
       } else {
         resultMN = mlir::chlo::RaggedDotOp::create(
                        builder,
@@ -1110,7 +1123,7 @@ struct FutharkCompiler {
                            mlir::SmallVector<int64_t>{1},
                            mlir::SmallVector<int64_t>{0},
                            rhsGroup),
-                       {})
+                       ChloPrecisionConfig())
                        ->getResult(0);
       }
     } else {
