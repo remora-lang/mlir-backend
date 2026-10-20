@@ -1628,7 +1628,21 @@ struct FutharkCompiler {
         },
         [](const BasicOpFlatIndex &) -> mlir::Value { Undefined(); },
         [](const BasicOpUpdate &) -> mlir::Value { Undefined(); },
-        [](const BasicOpAssert &) -> mlir::Value { Undefined(); },
+        // Always `unit`-typed (a Futhark-internal proof certificate for a
+        // runtime safety check, e.g. a `:>` size coercion or an
+        // unflatten's divisibility check -- confirmed from the GPU IR:
+        // `assert(cond, {msg}) : unit`), never an actual data value --
+        // same "unit carries no runtime data" convention IsUnitType
+        // already applies to params. This backend never implements
+        // runtime safety checks at all (every test already relies on
+        // `#[unsafe]` for that elsewhere), so this is a no-op returning
+        // an arbitrary scalar; nothing ever looks at it meaningfully.
+        [&](const BasicOpAssert &) -> mlir::Value {
+          return hlo::ConstantOp::create(
+              builder, mlir::DenseElementsAttr::get(
+                           mlir::RankedTensorType::get({}, builder.getI1Type()),
+                           builder.getBoolAttr(true)));
+        },
         [](const BasicOpFlatUpdate &) -> mlir::Value { Undefined(); },
         [](const BasicOpManifest &) -> mlir::Value { Undefined(); },
         [](const BasicOpUpdateAcc &) -> mlir::Value { Undefined(); });
