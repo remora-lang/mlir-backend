@@ -19,7 +19,7 @@ pAttr: '#' '[' ID ('(' (ID (',' ID)*)? ')')? ']';
 
 pEntry: ('entry') LPARAM STRING_LITERAL COMMA OPEN_BRACKET pEntryPointInput? (COMMA pEntryPointInput)* CLOSE_BRACKET COMMA (OPAQUE STRING_LITERAL | '*'? pType) RPARAM;
 
-pEntryPointInput: ID ':' pType;
+pEntryPointInput: STRING_LITERAL ':' pType;
 
 fParam: ID ':' pType;
 
