@@ -22,8 +22,10 @@
 // test needs repiota's real result for something that *isn't* replaced
 // this way, this dummy would silently produce a wrong answer instead of
 // failing loudly -- which is why every op this file builds is tagged with
-// the kDummyAttr attribute. mlir-backend.cpp asserts none survive the
-// post-lowering DCE pass before the module is considered final.
+// the kDummyAttr attribute (shared with ragged_unflatten_gather.hpp's own,
+// separately-defined, same-value marker). mlir-backend.cpp asserts none
+// survive the post-lowering DCE pass before the module is considered
+// final.
 #include "mlir/IR/ImplicitLocOpBuilder.h"
 #include "stablehlo/dialect/StablehloOps.h"
 
@@ -31,7 +33,7 @@ namespace builtin_repiota {
 
 namespace hlo = mlir::stablehlo;
 
-inline constexpr char kDummyAttr[] = "futhark.dummy_repiota";
+inline constexpr char kDummyAttr[] = "futhark.dummy";
 
 // `g` is the (already-known-static) number of groups, from the call's own
 // first argument. Returns repiota's 4 outputs in order: m (existential

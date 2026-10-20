@@ -11,6 +11,7 @@
 #include "mlir/Dialect/Arith/Utils/Utils.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/Matchers.h"
+#include "ragged_unflatten_gather.hpp"
 #include "stablehlo/dialect/ChloOps.h"
 #include "stablehlo/dialect/StablehloOps.h"
 #include "utils.hpp"
@@ -1483,7 +1484,14 @@ struct FutharkCompiler {
           if (!tensorTy.hasStaticShape())
             Undefined("replicate: dynamic element shape");
           std::vector<int64_t> before = toShapeType(val.shape.dims);
-          if (llvm::any_of(before, mlir::ShapedType::isDynamic))
+          if (llvm::any_of(before, mlir::ShapedType::isDynamic)) {
+            // See ragged_unflatten_gather.hpp: a dynamically-shaped
+            // replicate has no valid StableHLO representation here at
+            // all, used or not, so it's given a cheap, DCE-and-safety-
+            // net-backed placeholder rather than failing outright.
+            if (tensorTy.getRank() == 0)
+              return ragged_unflatten::LowerDummyReplicate(
+                  builder, tensorTy.getElementType());
             Undefined("replicate: dynamic shape");
           auto original = tensorTy.getShape();
           before.insert(before.end(), original.begin(), original.end());
@@ -1696,6 +1704,26 @@ struct FutharkCompiler {
   }
 
   Values LowerSegMap(const SegMap &pSegMap, Ctx &ctx) {
+    // See ragged_unflatten_gather.hpp: this one shape (a ragged layout's
+    // flatten/unflatten gather) has no valid lowering through the normal
+    // path below at all (the array it reads is a free variable the
+    // stablehlo.map region can't capture) -- recognized and replaced
+    // directly with a plain reshape of the source array, bailing to the
+    // normal path on anything that doesn't match exactly.
+    if (pSegMap.space.dims.size() == 1) {
+      if (auto match = ragged_unflatten::TryMatchGather(
+              std::get<0>(pSegMap.space.dims[0]), pSegMap.body)) {
+        mlir::Value arr = ctx.subexps.lookup(match->array.name);
+        auto arrTy = getRankedType(arr.getType());
+        if (arrTy.getRank() == 2 && arrTy.hasStaticShape() &&
+            arrTy.getShape()[1] == match->k) {
+          int64_t total = arrTy.getShape()[0] * arrTy.getShape()[1];
+          auto flatTy =
+              mlir::RankedTensorType::get({total}, arrTy.getElementType());
+          return {hlo::ReshapeOp::create(builder, flatTy, arr)};
+        }
+      }
+    }
     return LowerSegMap(
         pSegMap.lvl, pSegMap.space, pSegMap.body, pSegMap.ret, ctx);
   }
