@@ -2,6 +2,8 @@
 #include "ir/parser.hpp"
 #include "ir/syntax.hpp"
 #include "mlir/IR/Verifier.h"
+#include "mlir/Pass/PassManager.h"
+#include "mlir/Transforms/Passes.h"
 #include "llvm/Support/SourceMgr.h"
 #include <cctype>
 #include <config.h>
@@ -70,6 +72,34 @@ int main(int argc, char *argv[]) {
     if (fun.entry)
       compiler.LowerFunction(fun);
   }
+
+  // builtin_repiota.hpp/ragged_unflatten_gather.hpp's dummy placeholders
+  // (tagged with their shared kDummyAttr) have no valid StableHLO
+  // representation of their *real* semantics -- they're only ever correct
+  // because the one thing that actually consumes them gets replaced
+  // separately (see those files' own comments) and leaves the dummy
+  // itself unused. Run the real dead-code-elimination pass StableHLO ops
+  // (side-effect-free) already support to confirm that, rather than
+  // trusting it -- if a dummy survives, something unexpected depended on
+  // it, which would otherwise be a silently wrong result.
+  mlir::PassManager pm(&ctx);
+  pm.addPass(mlir::createCanonicalizerPass());
+  if (mlir::failed(pm.run(compiler.module))) {
+    llvm::errs() << "error: post-lowering cleanup pass failed\n";
+    return 1;
+  }
+  bool dummySurvived = false;
+  compiler.module.walk([&](mlir::Operation *op) {
+    if (op->hasAttr(ragged_unflatten::kDummyAttr)) {
+      dummySurvived = true;
+      op->emitError("a compiler-generated placeholder survived dead-code "
+                    "elimination -- its result was actually needed by "
+                    "something live, which would otherwise be a silently "
+                    "wrong answer");
+    }
+  });
+  if (dummySurvived)
+    return 1;
 
   compiler.module.print(llvm::outs());
 
