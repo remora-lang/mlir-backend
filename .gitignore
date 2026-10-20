@@ -250,3 +250,5 @@ third-party/mlir-src
 
 build.log
 tests.log
+
+/tmp/
