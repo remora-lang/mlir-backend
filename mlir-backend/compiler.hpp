@@ -1,6 +1,7 @@
 #pragma once
 // Represents the state of a Futhark function
 #include "blackbox.hpp"
+#include "builtin_repiota.hpp"
 #include "cpu_dev_fallbacks.hpp"
 #include "debug.hpp"
 #include "exclusive_scan.hpp"
@@ -355,6 +356,21 @@ struct FutharkCompiler {
         [&](const ExpSubExp &e) { return Values{LowerSubExp(e.subExp, ctx)}; },
         [&](const ExpHostOp &e) { return LowerHostOp(e.op, ctx); },
         [&](const ExpApply &e) -> Values {
+          // See builtin_repiota.hpp: repiota's real result size is
+          // data-dependent and has no valid StableHLO representation
+          // here, used or not, so it's intercepted unconditionally by
+          // name rather than going through the normal (always-failing)
+          // path below. Only applied when `g` (the call's first
+          // argument) is itself a literal -- if it isn't, fall through to
+          // the normal path's honest failure rather than guessing.
+          if (e.fname == "builtin/repiota") {
+            if (auto *gLit =
+                    std::get_if<ConstantSubExp>(&e.args[0].first.v)) {
+              auto vals =
+                  builtin_repiota::LowerDummy(builder, gLit->GetIntValue());
+              return Values(vals.begin(), vals.end());
+            }
+          }
           const FunDef *pFun = FindFunction(prog, e.fname);
           if (!pFun) {
             Values args;
