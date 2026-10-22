@@ -499,6 +499,24 @@ struct FutharkCompiler {
           for (auto &t : e.retType)
             resultTypes.push_back(LowerTy(t));
 
+          // Both branches only forward already-computed values (e.g. an
+          // argmax reduce operator `if x > y then (x, i) else (y, j)`):
+          // emit stablehlo.select instead of stablehlo.if. Nothing is
+          // evaluated eagerly that wasn't already, and XLA:GPU can't fuse a
+          // conditional inside a reduce body (its emitter has no indexing
+          // map for `conditional` and CHECK-fails). A 0-d pred is valid
+          // for any result shape.
+          if (e.then_body->stms.empty() && e.else_body->stms.empty()) {
+            Values results;
+            for (auto [t, f, ty] :
+                 llvm::zip_equal(e.then_body->result, e.else_body->result,
+                                 resultTypes))
+              results.push_back(hlo::SelectOp::create(
+                  builder, cond, castToType(LowerSubExp(t, ctx), ty),
+                  castToType(LowerSubExp(f, ctx), ty)));
+            return results;
+          }
+
           auto op = hlo::IfOp::create(builder, resultTypes, cond);
 
           auto buildBranch = [&](mlir::Region &region,
